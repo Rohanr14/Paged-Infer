@@ -138,3 +138,25 @@ This produces a CSV with:
 - `peak_rss_mb`
 
 Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back to `ps -o rss=` for platforms like macOS, so RSS should no longer show `0.00` unless collection genuinely fails.
+
+## Local E2E Sweep Results (TinyLlama 1.1B, user-provided)
+
+| batch | steps | total_tokens | throughput_tok_s | avg_token_latency_ms | p50_us | p95_us | peak_rss_mb |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 64  | 64   | 4.28 | 233.416 | 198181 | 262967 | 5234.39 |
+| 1 | 128 | 128  | 3.87 | 258.206 | 247382 | 288431 | 4922.09 |
+| 1 | 256 | 256  | 3.71 | 269.629 | 253601 | 296986 | 5208.28 |
+| 2 | 64  | 128  | 3.90 | 256.486 | 245933 | 302792 | 5433.16 |
+| 2 | 128 | 256  | 3.76 | 265.657 | 249403 | 311337 | 5318.77 |
+| 2 | 256 | 512  | 3.66 | 273.450 | 253876 | 314387 | 5226.61 |
+| 4 | 64  | 256  | 3.72 | 268.742 | 250367 | 323788 | 5137.52 |
+| 4 | 128 | 512  | 3.83 | 261.184 | 247273 | 285391 | 5269.30 |
+| 4 | 256 | 1024 | 3.76 | 265.742 | 252306 | 299577 | 5162.23 |
+| 8 | 64  | 512  | 3.76 | 265.823 | 249151 | 300425 | 5069.22 |
+| 8 | 128 | 1024 | 3.59 | 278.215 | 251924 | 347618 | 5106.17 |
+| 8 | 256 | 2048 | 3.60 | 277.696 | 254201 | 348173 | 5277.98 |
+
+### What this indicates
+- **Throughput stabilizes around ~3.6–3.9 tok/s** across medium/large sweeps, peaking at **4.28 tok/s** for the shortest run (`batch=1`, `steps=64`).
+- **Latency increases with longer contexts and larger batches**, especially p95 (up to ~348 ms at `batch=8`, long runs), which is expected from growing attention history.
+- **Peak RSS is consistently ~4.9–5.4 GB**, suggesting the memory footprint is stable under sweep load and compatible with the paged KV design.
