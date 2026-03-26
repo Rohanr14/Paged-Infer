@@ -1,4 +1,7 @@
-use paged_infer::math::{apply_rope, matmul, rms_norm, silu, swiglu};
+use paged_infer::math::{
+    apply_rope, matmul, matvec_f32_weight_transposed_parallel, matvec_i8_weight_parallel,
+    quantize_rows_i8, rms_norm, silu, swiglu,
+};
 
 // Helper function to compare f32 slices with a small tolerance
 fn assert_f32_slice_eq(actual: &[f32], expected: &[f32], epsilon: f32) {
@@ -136,6 +139,70 @@ fn test_matvec_bf16_weight_transposed_matches_reference() {
 
     assert!((out[0] - 4.0).abs() < 1e-3);
     assert!((out[1] - (-0.5)).abs() < 1e-3);
+}
+
+#[test]
+fn test_quantize_rows_i8_roundtrip() {
+    let rows = 4;
+    let cols = 8;
+    // Create a known weight matrix with values in [-1.0, 1.0]
+    let weight: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) / (rows * cols) as f32) * 2.0 - 1.0)
+        .collect();
+
+    let max_abs = weight
+        .iter()
+        .map(|x| x.abs())
+        .fold(0.0_f32, f32::max);
+
+    let (quant, scales) = quantize_rows_i8(&weight, rows, cols);
+
+    // Dequantize manually and check round-trip error
+    let epsilon = 0.01 * max_abs;
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c;
+            let dequant = quant[idx] as f32 * scales[r];
+            assert!(
+                (dequant - weight[idx]).abs() < epsilon.max(1e-4),
+                "Roundtrip error too large at [{r},{c}]: original={}, dequant={}, diff={}",
+                weight[idx],
+                dequant,
+                (dequant - weight[idx]).abs()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_matvec_i8_matches_f32() {
+    let rows = 16;
+    let cols = 32;
+    let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 0.15).collect();
+    let weight: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i % 37) as f32) * 0.01 - 0.18)
+        .collect();
+
+    let (quant, scales) = quantize_rows_i8(&weight, rows, cols);
+
+    let mut out_f32 = vec![0.0_f32; rows];
+    let mut out_i8 = vec![0.0_f32; rows];
+
+    matvec_f32_weight_transposed_parallel(&mut out_f32, &x, &weight, rows, cols);
+    matvec_i8_weight_parallel(&mut out_i8, &x, &quant, &scales, rows, cols);
+
+    // Allow up to 2% relative error (int8 per-row symmetric quantization)
+    for (r, (&f, &i)) in out_f32.iter().zip(out_i8.iter()).enumerate() {
+        let rel_err = if f.abs() > 1e-6 {
+            (f - i).abs() / f.abs()
+        } else {
+            (f - i).abs()
+        };
+        assert!(
+            rel_err < 0.02,
+            "Relative error too large at row {r}: f32={f}, i8={i}, rel_err={rel_err}"
+        );
+    }
 }
 
 #[test]

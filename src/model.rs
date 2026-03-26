@@ -61,6 +61,43 @@ impl PackedLinear {
 }
 
 #[derive(Debug, Clone)]
+pub struct QuantizedLinear {
+    pub rows: usize,
+    pub cols: usize,
+    pub weight: Vec<i8>,
+    pub scales: Vec<f32>,
+}
+
+impl QuantizedLinear {
+    pub fn from_packed(packed: &PackedLinear) -> Self {
+        let (weight, scales) =
+            crate::math::quantize_rows_i8(&packed.weight, packed.rows, packed.cols);
+        Self {
+            rows: packed.rows,
+            cols: packed.cols,
+            weight,
+            scales,
+        }
+    }
+
+    pub fn apply_parallel(&self, out: &mut [f32], x: &[f32]) {
+        crate::math::matvec_i8_weight_parallel(
+            out,
+            x,
+            &self.weight,
+            &self.scales,
+            self.rows,
+            self.cols,
+        );
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        self.weight.len() * std::mem::size_of::<i8>()
+            + self.scales.len() * std::mem::size_of::<f32>()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AttentionWeights {
     pub wq: PackedLinear,
     pub wk: PackedLinear,
@@ -181,6 +218,21 @@ fn kv_cache_index(
 }
 
 impl<'a> LlamaWeights<'a> {
+    pub fn weight_bytes_f32(&self) -> usize {
+        let mut total = 0;
+        for layer in &self.layers {
+            total += layer.attention.wq.weight.len() * 4;
+            total += layer.attention.wk.weight.len() * 4;
+            total += layer.attention.wv.weight.len() * 4;
+            total += layer.attention.wo.weight.len() * 4;
+            total += layer.feed_forward.w1.weight.len() * 4;
+            total += layer.feed_forward.w2.weight.len() * 4;
+            total += layer.feed_forward.w3.weight.len() * 4;
+        }
+        total += self.lm_head.weight.len() * 4;
+        total
+    }
+
     pub fn forward(
         &self,
         token_id: u32,
