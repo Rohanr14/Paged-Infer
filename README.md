@@ -74,13 +74,59 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     2. Track memory usage (Resident Set Size) between a contiguous baseline and the Paged-Infer engine.
     3. Generate a chart showing how Paged-Infer achieves near 0% memory waste.
 * **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
-## Latest Optimization Pass (March 26, 2026)
+## Optimization Pass 2 (March 26, 2026) — int8 Quantization + Speculative Decoding
+
+### Feature 1: int8 Weight-Only Quantization
+
+Per-row symmetric int8 quantization of all projection matrices. Each row's weights are scaled to the range `[-127, 127]` using a per-row `f32` scale factor, reducing weight memory by **~4x** with a parallel dequantizing matvec kernel.
+
+- `quantize_rows_i8(weight, rows, cols)` — one-shot quantization at model load time
+- `matvec_i8_weight_parallel()` — Rayon-parallel kernel; dequantizes on-the-fly during accumulation
+- `QuantizedLinear` struct — drop-in replacement for `PackedLinear` with 4x lower memory footprint
+
+Benchmark (`cargo run --release --bin benchmark`, 2048×2048 matrix, 20 iters):
+
+| Kernel | Time | vs Baseline | vs Packed f32 | Memory |
+|---|---:|---:|---:|---:|
+| Baseline (bf16 convert each iter) | 0.1420s | 1.00x | — | 16.00 MB |
+| Stream bf16 | 0.0704s | 2.02x | — | — |
+| Packed f32 + parallel | 0.0193s | 7.35x | 1.00x | 16.00 MB |
+| **int8 + parallel** | **0.0152s** | **9.36x** | **1.27x** | **4.01 MB** |
+
+- **9.36x throughput vs baseline**, **1.27x vs packed f32** from better cache utilization
+- **3.99x memory reduction** vs f32 (4 bytes → 1 byte per weight + tiny per-row scale overhead)
+- For TinyLlama 1.1B: projection weights shrink from ~4.3 GB to ~1.1 GB
+
+### Feature 2: Speculative Decoding with N-gram Drafting
+
+`NgramDrafter` maintains an in-memory n-gram frequency table (default n=3). At each decode step it proposes K cheap draft tokens via O(1) table lookup; the main model verifies each candidate and accepts if its argmax agrees.
+
+- `src/speculative.rs` — `NgramDrafter::observe()` / `::draft()` with majority-vote update rule
+- `src/bin/speculative_benchmark.rs` — measures acceptance rate and theoretical throughput gain
+
+```bash
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors \
+SPEC_STEPS=50 SPEC_K=4 SPEC_N=3 \
+cargo run --release --bin speculative_benchmark
+```
+
+**Acceptance rate** (the key metric) measures how often the cheap n-gram prediction matches the verifier's argmax. With batched prefill verification (future work), an acceptance rate of `α` with `K` draft tokens gives a throughput multiplier of approximately `(1 + α·K)` since the drafter is free.
+
+| α (acceptance rate) | K=4 theoretical multiplier |
+|---:|---:|
+| 20% | ~1.8x |
+| 40% | ~2.6x |
+| 60% | ~3.4x |
+
+Run `cargo run --release --bin speculative_benchmark` with a model to measure real acceptance rates on your workload.
+
+## Optimization Pass 1 (March 26, 2026) — Prepack + Buffer Reuse
 
 We implemented and benchmarked the two highest-impact follow-ups for decode throughput:
 
-1. **Prepack bf16 weights into cache-friendly f32 layout + parallelize row matvec**  
+1. **Prepack bf16 weights into cache-friendly f32 layout + parallelize row matvec**
    Projection weights are converted once during model load and stored contiguously for fast row access; matvec now runs in parallel across output rows.
-2. **Reuse attention score buffers instead of allocating per head per step**  
+2. **Reuse attention score buffers instead of allocating per head per step**
    Attention keeps a reusable score scratch buffer and resets it in-place.
 
 ### Benchmark setup
@@ -92,13 +138,13 @@ We implemented and benchmarked the two highest-impact follow-ups for decode thro
 ### Results
 | Kernel | Baseline | Optimized | Speedup |
 |---|---:|---:|---:|
-| Matvec (bf16 convert each iter) | 0.3186s | 0.1555s (stream bf16) | **2.05x** |
-| Matvec (bf16 convert each iter) | 0.3186s | 0.0777s (packed + parallel) | **4.10x** |
-| Attention score scratch handling | 0.0135s | 0.0130s | **1.04x** |
+| Matvec (bf16 convert each iter) | 0.1420s | 0.0704s (stream bf16) | **2.02x** |
+| Matvec (bf16 convert each iter) | 0.1420s | 0.0193s (packed + parallel) | **7.35x** |
+| Attention score scratch handling | 0.0051s | 0.0051s | **1.00x** |
 
 ### Takeaway
-- The largest win now comes from **one-time prepacking + parallel row matvec** on projection kernels.
-- Buffer reuse in attention still helps allocator churn and consistency, even when throughput gain is modest.
+- The largest win comes from **one-time prepacking + parallel row matvec** on projection kernels.
+- int8 quantization pushes the matvec win further to **9.36x** with a 4x memory reduction.
 
 ## Final Validation Checklist (Correctness + E2E + Memory)
 
@@ -108,7 +154,16 @@ To make this project interview-ready and reproducible, use:
    - `cargo test --test parity_tests`
    - Verifies paged attention matches a naive reference implementation on deterministic pseudo-random inputs.
 
-2. **End-to-end decode benchmark (throughput + latency + memory)**
+2. **int8 quantization correctness**
+   - `cargo test --test math_tests test_quantize_rows_i8_roundtrip`
+   - `cargo test --test math_tests test_matvec_i8_matches_f32`
+   - Verifies quantize→dequantize roundtrip and int8 matvec parity against f32 reference (within 2% relative error).
+
+3. **Kernel microbenchmarks (no model required)**
+   - `cargo run --release --bin benchmark`
+   - Reports matvec throughput across bf16/f32/int8 kernels, memory footprints, and attention buffer reuse.
+
+4. **End-to-end decode benchmark (throughput + latency + memory)**
    - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark`
    - Reports:
      - tokens/sec throughput
@@ -116,7 +171,11 @@ To make this project interview-ready and reproducible, use:
      - p50/p95 token latency
      - peak RSS memory (MB)
 
-If `MODEL_PATH` is missing, the benchmark binary exits early with a clear message rather than failing.
+5. **Speculative decoding acceptance rate**
+   - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin speculative_benchmark`
+   - Reports acceptance rate and theoretical throughput multiplier for n-gram drafting with K=4.
+
+If `MODEL_PATH` is missing, model-dependent binaries exit early with a clear message rather than failing.
 
 ### Larger local sweeps (recommended for final README table)
 

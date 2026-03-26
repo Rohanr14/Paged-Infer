@@ -1,6 +1,6 @@
 use paged_infer::math::{
-    matvec_bf16_weight_transposed, matvec_f32_weight_transposed_parallel, pack_bf16_to_f32,
-    softmax_in_place,
+    matvec_bf16_weight_transposed, matvec_f32_weight_transposed_parallel, matvec_i8_weight_parallel,
+    pack_bf16_to_f32, quantize_rows_i8, softmax_in_place,
 };
 use std::time::Instant;
 
@@ -112,4 +112,28 @@ fn main() {
     println!("ATTN baseline(per-iter alloc):  {:.4}s", attn_alloc);
     println!("ATTN optimized(buffer reuse):   {:.4}s", attn_reuse);
     println!("ATTN speedup: {:.2}x", attn_alloc / attn_reuse.max(1e-9));
+
+    // --- int8 weight quantization benchmark ---
+    let (i8_weight, i8_scales) = quantize_rows_i8(&packed, rows, cols);
+    let t3 = Instant::now();
+    for _ in 0..iters {
+        matvec_i8_weight_parallel(&mut out, &x, &i8_weight, &i8_scales, rows, cols);
+    }
+    let int8_parallel = t3.elapsed().as_secs_f64();
+
+    let f32_mem = rows * cols * 4;
+    let i8_mem = rows * cols * std::mem::size_of::<i8>() + rows * std::mem::size_of::<f32>();
+
+    println!("MATVEC int8(packed+parallel):      {:.4}s", int8_parallel);
+    println!(
+        "MATVEC speedup (int8 vs baseline): {:.2}x",
+        baseline / int8_parallel.max(1e-9)
+    );
+    println!(
+        "MATVEC speedup (int8 vs packed+parallel): {:.2}x",
+        packed_parallel / int8_parallel.max(1e-9)
+    );
+    println!("Memory f32: {} bytes ({:.2} MB)", f32_mem, f32_mem as f64 / 1_048_576.0);
+    println!("Memory i8:  {} bytes ({:.2} MB)", i8_mem, i8_mem as f64 / 1_048_576.0);
+    println!("Memory reduction: {:.2}x", f32_mem as f64 / i8_mem as f64);
 }

@@ -191,6 +191,49 @@ pub fn paged_attention(
     }
 }
 
+/// Quantize a row-major f32 weight matrix to per-row symmetric int8.
+/// Returns (quantized_weights: Vec<i8>, scales: Vec<f32>) where scales[r] = max_abs_of_row / 127.0
+pub fn quantize_rows_i8(weight: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut quant = Vec::with_capacity(rows * cols);
+    let mut scales = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = &weight[r * cols..(r + 1) * cols];
+        let max_abs = row.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        scales.push(scale);
+        for &w in row {
+            quant.push((w / scale).round().clamp(-127.0, 127.0) as i8);
+        }
+    }
+    (quant, scales)
+}
+
+/// Parallel matvec with int8 weights (weight-only quantization, f32 activations).
+/// weight[r * cols + c] is i8, dequantized on-the-fly: w_f32 = weight[r][c] as f32 * scales[r]
+pub fn matvec_i8_weight_parallel(
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[i8],
+    scales: &[f32],
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(x.len(), cols);
+    assert_eq!(out.len(), rows);
+    assert_eq!(weight.len(), rows * cols);
+    assert_eq!(scales.len(), rows);
+
+    out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+        let base = r * cols;
+        let scale = scales[r];
+        let mut acc = 0.0_f32;
+        for c in 0..cols {
+            acc += weight[base + c] as f32 * x[c];
+        }
+        *out_r = acc * scale;
+    });
+}
+
 pub fn matmul(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), k * n);
