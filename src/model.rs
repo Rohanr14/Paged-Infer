@@ -17,6 +17,7 @@ pub struct LlamaConfig {
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub attention_window: Option<usize>,
 }
 
 impl Default for LlamaConfig {
@@ -30,6 +31,7 @@ impl Default for LlamaConfig {
             vocab_size: 32000,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            attention_window: Some(256),
         }
     }
 }
@@ -195,6 +197,7 @@ impl<'a> LlamaWeights<'a> {
         let kv_group = num_heads / config.num_key_value_heads;
         let total_blocks = kv_cache.len()
             / (config.num_hidden_layers * block_size * config.num_key_value_heads * 2 * head_dim);
+        let attn_window = config.attention_window.unwrap_or(pos + 1);
 
         let token = (token_id as usize) % config.vocab_size;
         let embed_bytes =
@@ -274,7 +277,8 @@ impl<'a> LlamaWeights<'a> {
                 let out_slice = &mut attn_out[q_start..q_start + head_dim];
                 attn_scores.fill(0.0);
 
-                for t in 0..=pos {
+                let start_t = (pos + 1).saturating_sub(attn_window);
+                for t in start_t..=pos {
                     if let Some((phys_block, token_offset)) =
                         block_table.get_physical_location(t, block_size)
                     {
@@ -298,9 +302,9 @@ impl<'a> LlamaWeights<'a> {
                     }
                 }
 
-                crate::math::softmax_in_place(&mut attn_scores);
+                crate::math::softmax_in_place(&mut attn_scores[start_t..=pos]);
 
-                for t in 0..=pos {
+                for t in start_t..=pos {
                     if let Some((phys_block, token_offset)) =
                         block_table.get_physical_location(t, block_size)
                     {

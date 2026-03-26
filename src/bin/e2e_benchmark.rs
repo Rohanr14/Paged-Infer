@@ -53,6 +53,10 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
+    let attention_window: usize = std::env::var("BENCH_WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
     let block_size = 16;
     let total_blocks = 1024;
 
@@ -66,7 +70,8 @@ fn main() -> anyhow::Result<()> {
     let file = File::open(&model_path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let loader = ModelLoader::new(&mmap)?;
-    let config = LlamaConfig::default();
+    let mut config = LlamaConfig::default();
+    config.attention_window = Some(attention_window);
     let weights = loader.load_weights(&config)?;
 
     let head_dim = config.hidden_size / config.num_attention_heads;
@@ -132,7 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("E2E benchmark complete");
     println!(
-        "batch_size={batch_size}, steps={steps}, total_tokens={}",
+        "batch_size={batch_size}, steps={steps}, attention_window={attention_window}, total_tokens={}",
         total_tokens as usize
     );
     println!("throughput_tok_s={:.2}", total_tokens / elapsed.max(1e-9));

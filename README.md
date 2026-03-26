@@ -160,3 +160,96 @@ Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back
 - **Throughput stabilizes around ~3.6–3.9 tok/s** across medium/large sweeps, peaking at **4.28 tok/s** for the shortest run (`batch=1`, `steps=64`).
 - **Latency increases with longer contexts and larger batches**, especially p95 (up to ~348 ms at `batch=8`, long runs), which is expected from growing attention history.
 - **Peak RSS is consistently ~4.9–5.4 GB**, suggesting the memory footprint is stable under sweep load and compatible with the paged KV design.
+
+## Scaling Behavior Summary
+
+### 1→32 batch scaling (currently measured 1→8)
+
+| batch | throughput_tok_s | avg_latency_ms | p95_us | peak_rss_mb |
+|---:|---:|---:|---:|---:|
+| 1 | 3.95 | 253.75 | 282795 | 5121.59 |
+| 2 | 3.77 | 265.20 | 309505 | 5326.18 |
+| 4 | 3.77 | 265.22 | 302919 | 5189.68 |
+| 8 | 3.65 | 273.91 | 332072 | 5151.12 |
+
+```mermaid
+xychart-beta
+    title "Throughput vs Batch"
+    x-axis "batch" [1, 2, 4, 8]
+    y-axis "tok/s" 0 --> 5
+    line [3.95, 3.77, 3.77, 3.65]
+```
+
+### Throughput vs context length
+
+| steps | throughput_tok_s | avg_latency_ms | p95_us |
+|---:|---:|---:|---:|
+| 64 | 3.92 | 256.12 | 297493 |
+| 128 | 3.76 | 265.82 | 308194 |
+| 256 | 3.68 | 271.63 | 314781 |
+
+### Memory vs sequence length
+
+| steps | peak_rss_mb |
+|---:|---:|
+| 64 | 5218.57 |
+| 128 | 5154.08 |
+| 256 | 5218.77 |
+
+You can regenerate these summaries from CSV using:
+- `./scripts/analyze_sweep.py e2e_sweep.csv`
+
+## Product Mode: Simple OpenAI-Compatible HTTP API
+
+Run:
+
+```bash
+HOST=0.0.0.0 PORT=8080 \
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors \
+TOKENIZER_PATH=models/tinyllama-1.1b/tokenizer.json \
+cargo run --release --bin http_server
+```
+
+Health check:
+
+```bash
+curl http://localhost:8080/health
+```
+
+Chat completion (OpenAI-style path):
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tinyllama-1.1b",
+    "messages": [{"role":"user","content":"Explain paged attention in one paragraph."}],
+    "max_tokens": 64
+  }'
+```
+
+If model/tokenizer files are unavailable, the server still runs in a `dry-run` mode for API integration tests.
+
+## Killer Feature: KV Cache Eviction (LRU)
+
+`KvCacheManager` introduces an eviction-aware KV allocator policy:
+- Tracks per-sequence KV ownership and `last_used_tick`
+- On allocation pressure, evicts the least-recently-used sequence (excluding current requester)
+- Keeps the allocator from hard-failing under contention-heavy workloads
+
+Run benchmark:
+
+```bash
+cargo run --release --bin eviction_benchmark
+```
+
+Latest result on this branch:
+
+| Policy | completed | dropped | active_end |
+|---|---:|---:|---:|
+| No eviction | 11 | 93 | 8 |
+| LRU eviction | 104 | 0 | 8 |
+
+`completed_gain_pct = 845.45%`
+
+This benchmark simulates long-running and short-running requests under tight KV block pressure; LRU prevents starvation and dramatically improves request completion throughput.

@@ -5,6 +5,7 @@ MODEL_PATH="${MODEL_PATH:-models/tinyllama-1.1b/model.safetensors}"
 OUT_CSV="${OUT_CSV:-e2e_sweep.csv}"
 STEPS_LIST="${STEPS_LIST:-64 128 256}"
 BATCH_LIST="${BATCH_LIST:-1 2 4 8}"
+WINDOW="${WINDOW:-256}"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
   echo "MODEL_PATH not found: $MODEL_PATH"
@@ -17,7 +18,7 @@ echo "batch,steps,total_tokens,throughput_tok_s,avg_token_latency_ms,p50_token_l
 for b in $BATCH_LIST; do
   for s in $STEPS_LIST; do
     echo "Running batch=$b steps=$s"
-    out=$(MODEL_PATH="$MODEL_PATH" BENCH_BATCH="$b" BENCH_STEPS="$s" cargo run --release --bin e2e_benchmark)
+    out=$(MODEL_PATH="$MODEL_PATH" BENCH_BATCH="$b" BENCH_STEPS="$s" BENCH_WINDOW="$WINDOW" cargo run --release --bin e2e_benchmark)
 
     total_tokens=$(echo "$out" | awk -F'=' '/total_tokens=/{print $NF}')
     throughput=$(echo "$out" | awk -F'=' '/throughput_tok_s=/{print $2}')
