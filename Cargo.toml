@@ -19,3 +19,4 @@ anyhow = "1.0.8"
 
 # For half-precision (f16/bf16) floats commonly used in LLMs
 half = "2.4.0"
+rayon = "1.10"
