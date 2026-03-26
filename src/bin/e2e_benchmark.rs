@@ -7,9 +7,30 @@ use std::fs::File;
 use std::time::Instant;
 
 fn read_rss_kb() -> Option<usize> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    line.split_whitespace().nth(1)?.parse::<usize>().ok()
+    // Linux fast path: /proc exposes VmRSS in kB.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
+            if let Some(val) = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                return Some(val);
+            }
+        }
+    }
+
+    // Cross-platform fallback (macOS + Linux): `ps` rss column in kB.
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rss = String::from_utf8_lossy(&output.stdout);
+    rss.trim().parse::<usize>().ok()
 }
 
 fn percentile_us(mut data: Vec<u128>, p: f32) -> u128 {

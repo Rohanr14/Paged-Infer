@@ -117,3 +117,24 @@ To make this project interview-ready and reproducible, use:
      - peak RSS memory (MB)
 
 If `MODEL_PATH` is missing, the benchmark binary exits early with a clear message rather than failing.
+
+### Larger local sweeps (recommended for final README table)
+
+Use the helper script:
+
+```bash
+MODEL_PATH=/absolute/path/to/model.safetensors \
+STEPS_LIST="64 128 256" \
+BATCH_LIST="1 2 4 8" \
+OUT_CSV=e2e_sweep.csv \
+./scripts/run_e2e_sweep.sh
+```
+
+This produces a CSV with:
+- `batch`, `steps`, `total_tokens`
+- `throughput_tok_s`
+- `avg_token_latency_ms`
+- `p50_token_latency_us`, `p95_token_latency_us`
+- `peak_rss_mb`
+
+Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back to `ps -o rss=` for platforms like macOS, so RSS should no longer show `0.00` unless collection genuinely fails.
