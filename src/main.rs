@@ -4,6 +4,9 @@ use paged_infer::memory::block_table::BlockTable;
 use std::collections::VecDeque;
 use std::time::Instant;
 use tokenizers::Tokenizer;
+use paged_infer::model::{LlamaConfig, LlamaWeights, ModelLoader};
+use std::fs::File;
+use memmap2::MmapOptions;
 
 const LLAMA3_BOS_TOKEN: u32 = 128000; // <|begin_of_text|>
 const LLAMA3_EOS_TOKEN: u32 = 128009; // <|eot_id|>
@@ -31,6 +34,7 @@ pub struct Engine {
     waiting_queue: VecDeque<Request>,
     active_batch: Vec<Sequence>,
     next_request_id: usize,
+    mmap: memmap2::Mmap,
 }
 
 impl Engine {
