@@ -1,0 +1,21 @@
+[package]
+name = "paged-infer"
+version = "0.1.0"
+edition = "2021"
+description = "A Bare-Metal Rust Inference Engine with PagedAttention"
+
+[dependencies]
+# For memory-mapping the model weights directly from disk
+memmap2 = "0.9.0"
+
+# To parse Llama 3.2 1B .safetensors files
+safetensors = "0.4.1"
+
+# To handle the Llama BPE tokenizer
+tokenizers = "0.19.1"
+
+# Error handling
+anyhow = "1.0.8"
+
+# For half-precision (f16/bf16) floats commonly used in LLMs
+half = "2.4.0"
