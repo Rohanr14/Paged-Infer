@@ -397,6 +397,7 @@ dependencies = [
  "anyhow",
  "half",
  "memmap2",
+ "rayon",
  "safetensors",
  "tokenizers",
 ]

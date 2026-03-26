@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 /// A bare-metal tensor implementation to hold memory-mapped weights.
 #[derive(Debug, Clone)]
 pub struct Tensor<'data> {
