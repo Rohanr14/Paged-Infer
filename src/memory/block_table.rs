@@ -2,7 +2,7 @@ use super::allocator::PhysicalBlock;
 
 /// Maps a sequence's logical blocks to the scattered physical blocks in the allocator.
 pub struct BlockTable {
-    /// Each index represents a logical block in a sequence, 
+    /// Each index represents a logical block in a sequence,
     /// containing the corresponding physical block.
     logical_to_physical: Vec<PhysicalBlock>,
 }
@@ -20,7 +20,11 @@ impl BlockTable {
     }
 
     /// Given a logical token index, returns the physical block and the offset within that block.
-    pub fn get_physical_location(&self, logical_token_idx: usize, block_size: usize) -> Option<(PhysicalBlock, usize)> {
+    pub fn get_physical_location(
+        &self,
+        logical_token_idx: usize,
+        block_size: usize,
+    ) -> Option<(PhysicalBlock, usize)> {
         let logical_block_idx = logical_token_idx / block_size;
         let token_offset = logical_token_idx % block_size;
 
@@ -30,7 +34,7 @@ impl BlockTable {
             None
         }
     }
-    
+
     pub fn mapped_blocks(&self) -> &[PhysicalBlock] {
         &self.logical_to_physical
     }
