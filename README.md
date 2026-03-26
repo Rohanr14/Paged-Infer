@@ -74,3 +74,67 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     2. Track memory usage (Resident Set Size) between a contiguous baseline and the Paged-Infer engine.
     3. Generate a chart showing how Paged-Infer achieves near 0% memory waste.
 * **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
+## Latest Optimization Pass (March 26, 2026)
+
+We implemented and benchmarked the two highest-impact follow-ups for decode throughput:
+
+1. **Prepack bf16 weights into cache-friendly f32 layout + parallelize row matvec**  
+   Projection weights are converted once during model load and stored contiguously for fast row access; matvec now runs in parallel across output rows.
+2. **Reuse attention score buffers instead of allocating per head per step**  
+   Attention keeps a reusable score scratch buffer and resets it in-place.
+
+### Benchmark setup
+- Command: `cargo run --release --bin benchmark`
+- CPU benchmark is synthetic and isolates kernel behavior:
+  - Matvec: hidden=2048, rows=2048, 20 iterations
+  - Attention score path: head_dim=64, seq_len=1024, 200 iterations
+
+### Results
+| Kernel | Baseline | Optimized | Speedup |
+|---|---:|---:|---:|
+| Matvec (bf16 convert each iter) | 0.3186s | 0.1555s (stream bf16) | **2.05x** |
+| Matvec (bf16 convert each iter) | 0.3186s | 0.0777s (packed + parallel) | **4.10x** |
+| Attention score scratch handling | 0.0135s | 0.0130s | **1.04x** |
+
+### Takeaway
+- The largest win now comes from **one-time prepacking + parallel row matvec** on projection kernels.
+- Buffer reuse in attention still helps allocator churn and consistency, even when throughput gain is modest.
+
+## Final Validation Checklist (Correctness + E2E + Memory)
+
+To make this project interview-ready and reproducible, use:
+
+1. **Kernel / attention correctness parity**
+   - `cargo test --test parity_tests`
+   - Verifies paged attention matches a naive reference implementation on deterministic pseudo-random inputs.
+
+2. **End-to-end decode benchmark (throughput + latency + memory)**
+   - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark`
+   - Reports:
+     - tokens/sec throughput
+     - avg token latency
+     - p50/p95 token latency
+     - peak RSS memory (MB)
+
+If `MODEL_PATH` is missing, the benchmark binary exits early with a clear message rather than failing.
+
+### Larger local sweeps (recommended for final README table)
+
+Use the helper script:
+
+```bash
+MODEL_PATH=/absolute/path/to/model.safetensors \
+STEPS_LIST="64 128 256" \
+BATCH_LIST="1 2 4 8" \
+OUT_CSV=e2e_sweep.csv \
+./scripts/run_e2e_sweep.sh
+```
+
+This produces a CSV with:
+- `batch`, `steps`, `total_tokens`
+- `throughput_tok_s`
+- `avg_token_latency_ms`
+- `p50_token_latency_us`, `p95_token_latency_us`
+- `peak_rss_mb`
+
+Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back to `ps -o rss=` for platforms like macOS, so RSS should no longer show `0.00` unless collection genuinely fails.
