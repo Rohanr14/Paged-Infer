@@ -98,27 +98,30 @@ Added a GPU compute path for matrix-vector multiplication using `wgpu` (Metal on
 
 ### WGSL Kernel Design (`src/shaders/matvec.wgsl`)
 
-Each output row is handled by **one workgroup of 256 threads**. Threads stride over the column dimension to accumulate partial dot products, then an **8-step binary tree reduction** collapses all 256 partial sums to a single result using `var<workgroup>` shared memory — no global memory round-trips for intermediates:
+Each output row is handled by **one workgroup of 256 threads**. The kernel uses **`vec4<f32>` loads** — Metal's SIMD units process 4 floats per instruction, so packing reads into `vec4` gives 4x fewer memory transactions and replaces 4 multiply-adds with a single `dot(vec4, vec4)` MAD-4 instruction. After accumulation, an **8-step binary tree reduction** collapses 256 partial sums using `var<workgroup>` shared memory:
 
 ```wgsl
-// Each workgroup → one output row
+// weight and x_vec are typed as array<vec4<f32>> — same bytes, 4x wider loads
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(workgroup_id) wg_id, @builtin(local_invocation_id) local_id) {
     let row = wg_id.x;
-    var acc = 0.0;
-    // Each thread strides: lid, lid+256, lid+512, …
-    for c = lid; c < cols; c += 256 { acc += weight[row*cols+c] * x[c]; }
+    let cols4 = dims.cols / 4u;  // e.g. 2048/4 = 512 vec4 groups
+    var acc: f32 = 0.0;
+    // 4x fewer iterations vs scalar; dot() is a single MAD-4 instruction
+    for c = lid; c < cols4; c += 256 {
+        acc += dot(weight[row * cols4 + c], x_vec[c]);
+    }
     partial_sums[lid] = acc;
     // Tree reduce: 256→128→64→32→16→8→4→2→1 (8 barrier stages)
     if lid == 0 { output[row] = partial_sums[0]; }
 }
 ```
 
-This is the GPU parallel-reduction pattern — identical algorithm to a CUDA atomicAdd-free reduction kernel, implemented in WGSL for cross-platform support (Metal/Vulkan/DX12).
+This is the GPU parallel-reduction pattern — identical algorithm to a CUDA atomicAdd-free reduction kernel, implemented in WGSL for cross-platform support (Metal/Vulkan/DX12). No changes to the Rust buffer creation are needed: the `f32` bytes are reinterpreted as `vec4<f32>` purely in the shader.
 
 ### Apple Silicon advantage: Unified Memory
 
-On M3, CPU and GPU share the **same physical memory pool** — no PCIe bus. Weights loaded with `mmap` at startup are directly accessible by the Metal command queue. Per-token inference moves only the 8 KB activation vector (`hidden=2048 × f32`), not the 4+ GB weight tensors.
+On M2/M3, CPU and GPU share the **same physical memory pool** — no PCIe bus. Weights loaded with `mmap` at startup are directly accessible by the Metal command queue. Per-token inference moves only the 8 KB activation vector (`hidden=2048 × f32`), not the 4+ GB weight tensors.
 
 ### Running the benchmark
 
@@ -128,33 +131,36 @@ cargo run --release --bin gpu_benchmark
 
 Exits gracefully with a CPU reference number on headless/no-GPU systems.
 
-### Results (TBD — run on Apple M3)
+### Results (Apple M2, Metal)
 
+Scalar kernel (initial):
 ```
 GPU Matvec Benchmark
 ====================
-Adapter : Apple M3 (Metal)
+Adapter : Apple M2 (Metal)
 Matrix  : 2048×2048 f32, 5 warm-up + 20 timed iters
 
 Results
 -------
-CPU packed+parallel : X.XXXXs total  (X.XXXms / iter)
-GPU wgpu/Metal      : X.XXXXs total  (X.XXXms / iter)
-GPU speedup         : XX.Xx
+CPU packed+parallel : 0.0308s total  (1.541ms / iter)
+GPU wgpu/Metal      : 0.0079s total  (0.394ms / iter)
+GPU speedup         : 3.9x
 
-Correctness: max |CPU - GPU| = X.XXe-XX  ✓
-
-Note: GPU time excludes readback (weights stay on GPU in production).
-      M3 Unified Memory means no PCIe transfer — CPU/GPU share physical memory.
+Correctness: max |CPU - GPU| = 1.53e-4  ✓
 ```
 
-Run `cargo run --release --bin gpu_benchmark` on Apple Silicon and update this table.
+vec4 kernel (current — re-run to update):
+```
+GPU speedup         : TBD (expected ~8–12x)
+```
 
-### Expected performance (M3)
-- Weight data read per iter: 2048×2048×4 = **16 MB**
-- M3 GPU memory bandwidth: ~100 GB/s → theoretical floor **~0.16 ms/iter**
-- CPU rayon baseline: ~1.2 ms/iter (measured on M3)
-- Expected GPU speedup: **~7–15x** depending on kernel occupancy and dispatch overhead
+Run `cargo run --release --bin gpu_benchmark` after pulling to measure the vec4 improvement.
+
+### Bandwidth analysis (M2)
+- Weight data per iter: 2048×2048×4 = **16 MB**
+- M2 GPU memory bandwidth: ~100 GB/s → theoretical floor **~0.16 ms/iter**
+- Scalar kernel: 0.394 ms/iter = 41% of peak bandwidth
+- vec4 kernel: reduces loop iterations 4x and uses wider SIMD loads — expected to close the gap significantly
 
 ## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
 
