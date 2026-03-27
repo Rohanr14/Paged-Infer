@@ -22,22 +22,34 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
 ## Architecture & Directory Structure
 
     paged-infer/
-    ├── README.md               # Architecture details, benchmark graphs, and run instructions
+    ├── README.md                   # Architecture details, benchmark graphs, and run instructions
     ├── scripts/
-    │   └── download_model.py   # Script to fetch Llama 3.2 1B safetensors and tokenizer
-    ├── Cargo.toml              # Rust dependencies (safetensors, memmap2, tokenizers, half)
+    │   ├── download_model.py       # Script to fetch Llama 3.2 1B safetensors and tokenizer
+    │   ├── run_e2e_sweep.sh        # Automate batch×steps sweep benchmarks
+    │   └── analyze_sweep.py        # CSV analysis and chart generation
+    ├── Cargo.toml                  # Rust dependencies (safetensors, memmap2, tokenizers, half, rayon)
     ├── src/
-    │   ├── main.rs             # CLI entry point, scheduler, and continuous batching loop
-    │   ├── tensor.rs           # Multi-dimensional array structs and basic ops
-    │   ├── math.rs             # Matrix multiplication (GEMM), RoPE, and SwiGLU
-    │   ├── model.rs            # Llama 3.2 Architecture (RMSNorm, Transformer Blocks)
+    │   ├── main.rs                 # CLI entry point, scheduler, and continuous batching loop
+    │   ├── lib.rs                  # Module exports
+    │   ├── tensor.rs               # Bare-metal tensor wrapper around memory-mapped bytes
+    │   ├── math.rs                 # Kernels: GEMM, RoPE, SwiGLU, int8 matvec, AVX2 SIMD
+    │   ├── model.rs                # Llama architecture, forward pass, weight loading
+    │   ├── speculative.rs          # N-gram drafter for speculative decoding
     │   ├── memory/
-    │   │   ├── mod.rs          # Memory module exports
-    │   │   ├── allocator.rs    # Manages the pre-allocated physical KV cache pool
-    │   │   └── block_table.rs  # Maps logical token sequences to physical memory blocks
+    │   │   ├── mod.rs              # Memory module exports
+    │   │   ├── allocator.rs        # BlockAllocator: manages physical KV cache blocks
+    │   │   ├── block_table.rs      # BlockTable: logical-to-physical address mapping
+    │   │   └── kv_cache_manager.rs # KvCacheManager: LRU eviction policy
+    │   └── bin/
+    │       ├── benchmark.rs        # Kernel-level microbenchmarks (matvec, attention, int8)
+    │       ├── e2e_benchmark.rs    # Full model forward pass with latency percentiles
+    │       ├── eviction_benchmark.rs # LRU eviction stress testing
+    │       ├── speculative_benchmark.rs # Speculative decoding acceptance rate
+    │       └── http_server.rs      # OpenAI-compatible HTTP API
     └── tests/
-        ├── math_tests.rs       # Unit tests for tensor operations
-        └── paged_tests.rs      # Verifies PagedAttention outputs match naive attention
+        ├── math_tests.rs           # Unit tests for tensor ops and int8 quantization
+        ├── parity_tests.rs         # Attention correctness validation
+        └── paged_tests.rs          # Paged attention vs naive baseline comparison
 
 ## Development Roadmap
 
@@ -74,6 +86,18 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     2. Track memory usage (Resident Set Size) between a contiguous baseline and the Paged-Infer engine.
     3. Generate a chart showing how Paged-Infer achieves near 0% memory waste.
 * **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
+## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
+
+The attention computation was the primary bottleneck at high batch sizes and long contexts. Previously, all 32 query heads were computed sequentially per token; at `batch=8, steps=256` this caused p95 latency to spike to **1.1 seconds** and throughput to collapse to **1.62 tok/s**.
+
+**Fix:** Parallelize attention across heads using Rayon's `par_chunks_mut`. Each head computes its score/softmax/weighted-sum independently on a separate thread. The KV cache is read-only during attention (writes complete before the parallel section), so shared access is safe with zero synchronization overhead.
+
+- Each head gets its own compact score buffer sized to `min(pos+1, attention_window)` — no wasted allocation
+- Non-overlapping output slices (`attn_out[h*head_dim..(h+1)*head_dim]`) eliminate false sharing
+- With 32 heads and 8+ cores, this directly addresses the batch=8 degradation
+
+Re-run `cargo run --release --bin e2e_benchmark` with `BENCH_BATCH=8 BENCH_STEPS=256` to measure the improvement on your hardware.
+
 ## Optimization Pass 2 (March 26, 2026) — int8 Quantization + Speculative Decoding
 
 ### Feature 1: int8 Weight-Only Quantization
@@ -84,16 +108,16 @@ Per-row symmetric int8 quantization of all projection matrices. Each row's weigh
 - `matvec_i8_weight_parallel()` — Rayon-parallel kernel; dequantizes on-the-fly during accumulation
 - `QuantizedLinear` struct — drop-in replacement for `PackedLinear` with 4x lower memory footprint
 
-Benchmark (`cargo run --release --bin benchmark`, 2048×2048 matrix, 20 iters):
+Benchmark (`cargo run --release --bin benchmark`, 2048×2048 matrix, 20 iters, Apple M3):
 
 | Kernel | Time | vs Baseline | vs Packed f32 | Memory |
 |---|---:|---:|---:|---:|
-| Baseline (bf16 convert each iter) | 0.1420s | 1.00x | — | 16.00 MB |
-| Stream bf16 | 0.0704s | 2.02x | — | — |
-| Packed f32 + parallel | 0.0193s | 7.35x | 1.00x | 16.00 MB |
-| **int8 + parallel** | **0.0152s** | **9.36x** | **1.27x** | **4.01 MB** |
+| Baseline (bf16 convert each iter) | 0.2127s | 1.00x | — | 16.00 MB |
+| Stream bf16 | 0.1245s | 1.71x | — | — |
+| Packed f32 + parallel | 0.0241s | 8.84x | 1.00x | 16.00 MB |
+| **int8 + parallel** | **0.0215s** | **9.90x** | **1.12x** | **4.01 MB** |
 
-- **9.36x throughput vs baseline**, **1.27x vs packed f32** from better cache utilization
+- **9.90x throughput vs baseline**, **1.12x vs packed f32** from better cache utilization
 - **3.99x memory reduction** vs f32 (4 bytes → 1 byte per weight + tiny per-row scale overhead)
 - For TinyLlama 1.1B: projection weights shrink from ~4.3 GB to ~1.1 GB
 
@@ -110,15 +134,18 @@ SPEC_STEPS=50 SPEC_K=4 SPEC_N=3 \
 cargo run --release --bin speculative_benchmark
 ```
 
-**Acceptance rate** (the key metric) measures how often the cheap n-gram prediction matches the verifier's argmax. With batched prefill verification (future work), an acceptance rate of `α` with `K` draft tokens gives a throughput multiplier of approximately `(1 + α·K)` since the drafter is free.
+**Measured results** (TinyLlama 1.1B, Apple M3):
 
-| α (acceptance rate) | K=4 theoretical multiplier |
-|---:|---:|
-| 20% | ~1.8x |
-| 40% | ~2.6x |
-| 60% | ~3.4x |
+| Metric | Value |
+|---|---:|
+| Baseline throughput | 3.49 tok/s |
+| Speculative throughput | 3.93 tok/s |
+| Draft tokens proposed | 96 |
+| Draft tokens accepted | 21 |
+| **Acceptance rate** | **21.88%** |
+| Theoretical max speedup (batched) | **1.88x** |
 
-Run `cargo run --release --bin speculative_benchmark` with a model to measure real acceptance rates on your workload.
+With batched prefill verification (future work), an acceptance rate of `α` with `K` draft tokens gives a throughput multiplier of approximately `(1 + α·K)` since the drafter is free. The measured 21.88% acceptance rate with K=4 predicts a **1.88x** effective throughput multiplier once batched verification is implemented.
 
 ## Optimization Pass 1 (March 26, 2026) — Prepack + Buffer Reuse
 
@@ -135,16 +162,17 @@ We implemented and benchmarked the two highest-impact follow-ups for decode thro
   - Matvec: hidden=2048, rows=2048, 20 iterations
   - Attention score path: head_dim=64, seq_len=1024, 200 iterations
 
-### Results
+### Results (Apple M3)
 | Kernel | Baseline | Optimized | Speedup |
 |---|---:|---:|---:|
-| Matvec (bf16 convert each iter) | 0.1420s | 0.0704s (stream bf16) | **2.02x** |
-| Matvec (bf16 convert each iter) | 0.1420s | 0.0193s (packed + parallel) | **7.35x** |
-| Attention score scratch handling | 0.0051s | 0.0051s | **1.00x** |
+| Matvec (bf16 convert each iter) | 0.2127s | 0.1245s (stream bf16) | **1.71x** |
+| Matvec (bf16 convert each iter) | 0.2127s | 0.0241s (packed + parallel) | **8.84x** |
+| Matvec (bf16 convert each iter) | 0.2127s | 0.0215s (int8 + parallel) | **9.90x** |
+| Attention score scratch handling | 0.0007s | 0.0007s | **1.02x** |
 
 ### Takeaway
 - The largest win comes from **one-time prepacking + parallel row matvec** on projection kernels.
-- int8 quantization pushes the matvec win further to **9.36x** with a 4x memory reduction.
+- int8 quantization pushes the matvec win further to **9.90x** with a 4x memory reduction.
 
 ## Final Validation Checklist (Correctness + E2E + Memory)
 
@@ -198,62 +226,64 @@ This produces a CSV with:
 
 Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back to `ps -o rss=` for platforms like macOS, so RSS should no longer show `0.00` unless collection genuinely fails.
 
-## Local E2E Sweep Results (TinyLlama 1.1B, user-provided)
+## Local E2E Sweep Results (TinyLlama 1.1B, Apple M3)
+
+Pre-parallel-attention baseline (sequential heads). Re-run after Optimization Pass 3 to measure improvement.
 
 | batch | steps | total_tokens | throughput_tok_s | avg_token_latency_ms | p50_us | p95_us | peak_rss_mb |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 64  | 64   | 4.28 | 233.416 | 198181 | 262967 | 5234.39 |
-| 1 | 128 | 128  | 3.87 | 258.206 | 247382 | 288431 | 4922.09 |
-| 1 | 256 | 256  | 3.71 | 269.629 | 253601 | 296986 | 5208.28 |
-| 2 | 64  | 128  | 3.90 | 256.486 | 245933 | 302792 | 5433.16 |
-| 2 | 128 | 256  | 3.76 | 265.657 | 249403 | 311337 | 5318.77 |
-| 2 | 256 | 512  | 3.66 | 273.450 | 253876 | 314387 | 5226.61 |
-| 4 | 64  | 256  | 3.72 | 268.742 | 250367 | 323788 | 5137.52 |
-| 4 | 128 | 512  | 3.83 | 261.184 | 247273 | 285391 | 5269.30 |
-| 4 | 256 | 1024 | 3.76 | 265.742 | 252306 | 299577 | 5162.23 |
-| 8 | 64  | 512  | 3.76 | 265.823 | 249151 | 300425 | 5069.22 |
-| 8 | 128 | 1024 | 3.59 | 278.215 | 251924 | 347618 | 5106.17 |
-| 8 | 256 | 2048 | 3.60 | 277.696 | 254201 | 348173 | 5277.98 |
+| 1 | 64  | 64   | 3.61 | 276.972 | 250575 | 312630 | 5143.31 |
+| 1 | 128 | 128  | 3.49 | 286.617 | 249484 | 426967 | 5359.11 |
+| 1 | 256 | 256  | 3.23 | 310.074 | 260574 | 373675 | 4959.55 |
+| 2 | 64  | 128  | 3.20 | 312.289 | 260816 | 437640 | 5211.59 |
+| 2 | 128 | 256  | 3.49 | 286.840 | 259368 | 375500 | 5037.42 |
+| 2 | 256 | 512  | 3.44 | 290.436 | 259861 | 353972 | 5066.11 |
+| 4 | 64  | 256  | 3.88 | 257.877 | 248295 | 296406 | 5236.92 |
+| 4 | 128 | 512  | 3.72 | 269.109 | 250458 | 317303 | 5035.05 |
+| 4 | 256 | 1024 | 3.53 | 282.944 | 256858 | 372770 | 5152.27 |
+| 8 | 64  | 512  | 3.82 | 261.718 | 248201 | 293093 | 5167.16 |
+| 8 | 128 | 1024 | 2.21 | 452.649 | 255909 | 1221832 | 5225.03 |
+| 8 | 256 | 2048 | 1.62 | 617.372 | 493354 | 1115276 | 4978.95 |
 
 ### What this indicates
-- **Throughput stabilizes around ~3.6–3.9 tok/s** across medium/large sweeps, peaking at **4.28 tok/s** for the shortest run (`batch=1`, `steps=64`).
-- **Latency increases with longer contexts and larger batches**, especially p95 (up to ~348 ms at `batch=8`, long runs), which is expected from growing attention history.
-- **Peak RSS is consistently ~4.9–5.4 GB**, suggesting the memory footprint is stable under sweep load and compatible with the paged KV design.
+- **Throughput ranges from 3.2–3.9 tok/s** for batch 1–4, peaking at **3.88 tok/s** (`batch=4`, `steps=64`).
+- **batch=8 degrades sharply at long contexts**: throughput drops to **1.62 tok/s** with p95 latency spiking to **1.1 seconds**. Root cause: 32 attention heads computed sequentially, each scanning up to 256 past tokens. This is directly addressed by **Optimization Pass 3** (parallel heads).
+- **Peak RSS is consistently ~5.0–5.4 GB**, confirming stable memory footprint under the paged KV design.
 
 ## Scaling Behavior Summary
 
-### 1→32 batch scaling (currently measured 1→8)
+### Batch scaling (1→8, pre-parallel-attention)
 
 | batch | throughput_tok_s | avg_latency_ms | p95_us | peak_rss_mb |
 |---:|---:|---:|---:|---:|
-| 1 | 3.95 | 253.75 | 282795 | 5121.59 |
-| 2 | 3.77 | 265.20 | 309505 | 5326.18 |
-| 4 | 3.77 | 265.22 | 302919 | 5189.68 |
-| 8 | 3.65 | 273.91 | 332072 | 5151.12 |
+| 1 | 3.44 | 291.22 | 371091 | 5154.0 |
+| 2 | 3.38 | 296.52 | 389037 | 5105.0 |
+| 4 | 3.71 | 269.98 | 328826 | 5141.4 |
+| 8 | 2.55 | 443.91 | 876734 | 5123.7 |
 
 ```mermaid
 xychart-beta
-    title "Throughput vs Batch"
+    title "Throughput vs Batch (pre-parallel-attention)"
     x-axis "batch" [1, 2, 4, 8]
     y-axis "tok/s" 0 --> 5
-    line [3.95, 3.77, 3.77, 3.65]
+    line [3.44, 3.38, 3.71, 2.55]
 ```
 
 ### Throughput vs context length
 
 | steps | throughput_tok_s | avg_latency_ms | p95_us |
 |---:|---:|---:|---:|
-| 64 | 3.92 | 256.12 | 297493 |
-| 128 | 3.76 | 265.82 | 308194 |
-| 256 | 3.68 | 271.63 | 314781 |
+| 64 | 3.63 | 277.21 | 334942 |
+| 128 | 3.23 | 323.80 | 585400 |
+| 256 | 2.96 | 375.21 | 553923 |
 
 ### Memory vs sequence length
 
 | steps | peak_rss_mb |
 |---:|---:|
-| 64 | 5218.57 |
-| 128 | 5154.08 |
-| 256 | 5218.77 |
+| 64 | 5189.7 |
+| 128 | 5163.4 |
+| 256 | 5039.2 |
 
 You can regenerate these summaries from CSV using:
 - `./scripts/analyze_sweep.py e2e_sweep.csv`

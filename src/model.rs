@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use safetensors::SafeTensors;
 
+use rayon::prelude::*;
+
 use crate::math::{
     apply_rope, matmul, matvec_f32_weight_transposed_parallel, pack_bf16_to_f32, rms_norm, swiglu,
 };
@@ -267,7 +269,6 @@ impl<'a> LlamaWeights<'a> {
         let mut ff_gate = vec![0.0; config.intermediate_size];
         let mut ff_up = vec![0.0; config.intermediate_size];
         let mut ff_down = vec![0.0; hidden];
-        let mut attn_scores = vec![0.0; pos + 1];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xb.copy_from_slice(&x);
@@ -322,63 +323,72 @@ impl<'a> LlamaWeights<'a> {
                 }
             }
 
-            attn_out.fill(0.0);
-            for h in 0..num_heads {
-                let q_start = h * head_dim;
-                let kv_h = h / kv_group;
-                let out_slice = &mut attn_out[q_start..q_start + head_dim];
-                attn_scores.fill(0.0);
+            // Parallel attention across heads: each head computes its own
+            // score/softmax/weighted-sum independently on a separate Rayon thread.
+            // KV cache is read-only here (writes completed above), so shared access is safe.
+            let kv_ref: &[f32] = &*kv_cache;
+            let q_ref: &[f32] = &q;
+            let start_t = (pos + 1).saturating_sub(attn_window);
 
-                let start_t = (pos + 1).saturating_sub(attn_window);
-                for t in start_t..=pos {
-                    if let Some((phys_block, token_offset)) =
-                        block_table.get_physical_location(t, block_size)
-                    {
-                        let k_idx = kv_cache_index(
-                            layer_idx,
-                            phys_block.index,
-                            token_offset,
-                            kv_h,
-                            false,
-                            block_size,
-                            head_dim,
-                            config.num_key_value_heads,
-                            total_blocks,
-                        );
-                        let k_cached = &kv_cache[k_idx..k_idx + head_dim];
-                        let mut score = 0.0;
-                        for d in 0..head_dim {
-                            score += q[q_start + d] * k_cached[d];
-                        }
-                        attn_scores[t] = score / (head_dim as f32).sqrt();
-                    }
-                }
+            attn_out
+                .par_chunks_mut(head_dim)
+                .enumerate()
+                .for_each(|(h, out_slice)| {
+                    let kv_h = h / kv_group;
+                    let q_start = h * head_dim;
+                    let window_len = pos + 1 - start_t;
+                    let mut scores = vec![0.0_f32; window_len];
 
-                crate::math::softmax_in_place(&mut attn_scores[start_t..=pos]);
-
-                for t in start_t..=pos {
-                    if let Some((phys_block, token_offset)) =
-                        block_table.get_physical_location(t, block_size)
-                    {
-                        let v_idx = kv_cache_index(
-                            layer_idx,
-                            phys_block.index,
-                            token_offset,
-                            kv_h,
-                            true,
-                            block_size,
-                            head_dim,
-                            config.num_key_value_heads,
-                            total_blocks,
-                        );
-                        let v_cached = &kv_cache[v_idx..v_idx + head_dim];
-                        let wt = attn_scores[t];
-                        for d in 0..head_dim {
-                            out_slice[d] += wt * v_cached[d];
+                    for (si, t) in (start_t..=pos).enumerate() {
+                        if let Some((phys_block, token_offset)) =
+                            block_table.get_physical_location(t, block_size)
+                        {
+                            let k_idx = kv_cache_index(
+                                layer_idx,
+                                phys_block.index,
+                                token_offset,
+                                kv_h,
+                                false,
+                                block_size,
+                                head_dim,
+                                config.num_key_value_heads,
+                                total_blocks,
+                            );
+                            let k_cached = &kv_ref[k_idx..k_idx + head_dim];
+                            let mut score = 0.0;
+                            for d in 0..head_dim {
+                                score += q_ref[q_start + d] * k_cached[d];
+                            }
+                            scores[si] = score / (head_dim as f32).sqrt();
                         }
                     }
-                }
-            }
+
+                    crate::math::softmax_in_place(&mut scores);
+
+                    out_slice.fill(0.0);
+                    for (si, t) in (start_t..=pos).enumerate() {
+                        if let Some((phys_block, token_offset)) =
+                            block_table.get_physical_location(t, block_size)
+                        {
+                            let v_idx = kv_cache_index(
+                                layer_idx,
+                                phys_block.index,
+                                token_offset,
+                                kv_h,
+                                true,
+                                block_size,
+                                head_dim,
+                                config.num_key_value_heads,
+                                total_blocks,
+                            );
+                            let v_cached = &kv_ref[v_idx..v_idx + head_dim];
+                            let wt = scores[si];
+                            for d in 0..head_dim {
+                                out_slice[d] += wt * v_cached[d];
+                            }
+                        }
+                    }
+                });
 
             layer.attention.wo.apply_parallel(&mut proj_out, &attn_out);
             for i in 0..hidden {
