@@ -1,3 +1,4 @@
+pub mod gpu;
 pub mod math;
 pub mod memory;
 pub mod model;

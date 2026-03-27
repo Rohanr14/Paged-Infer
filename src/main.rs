@@ -158,6 +158,7 @@ impl<'a> Engine<'a> {
                 &seq.block_table,
                 &mut self.kv_cache,
                 self.allocator.block_size,
+                None,
             );
 
             // Argmax Sampling (Find the index of the highest logit)

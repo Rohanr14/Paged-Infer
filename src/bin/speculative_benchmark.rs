@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
 
         let t0 = Instant::now();
         for _ in 0..steps {
-            let logits = weights.forward(token, pos, &config, &bt, &mut kv_cache, block_size);
+            let logits = weights.forward(token, pos, &config, &bt, &mut kv_cache, block_size, None);
             token = argmax(&logits);
             pos += 1;
             if pos.is_multiple_of(block_size) {
@@ -108,6 +108,7 @@ fn main() -> anyhow::Result<()> {
                 &bt2,
                 &mut kv_cache2,
                 block_size,
+                None,
             );
             let verifier_token = argmax(&logits);
 
