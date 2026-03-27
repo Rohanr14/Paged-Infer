@@ -37,8 +37,12 @@ impl GpuContext {
             .await
             .ok()?;
 
+        let required_limits = adapter.limits(); // use Metal/Vulkan native caps
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits,
+                ..wgpu::DeviceDescriptor::default()
+            })
             .await
             .ok()?;
 
