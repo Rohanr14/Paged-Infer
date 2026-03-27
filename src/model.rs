@@ -3,6 +3,7 @@ use safetensors::SafeTensors;
 
 use rayon::prelude::*;
 
+use crate::gpu::{GpuContext, GpuLinear};
 use crate::math::{
     apply_rope, matmul, matvec_f32_weight_transposed_parallel, pack_bf16_to_f32, rms_norm, swiglu,
 };
@@ -98,6 +99,54 @@ impl QuantizedLinear {
             + self.scales.len() * std::mem::size_of::<f32>()
     }
 }
+
+// ── GPU-resident projection weights ──────────────────────────────────────────
+
+/// GPU copies of all seven projection matrices for one transformer layer.
+pub struct GpuLayerWeights {
+    pub wq: GpuLinear,
+    pub wk: GpuLinear,
+    pub wv: GpuLinear,
+    pub wo: GpuLinear,
+    pub w1: GpuLinear,
+    pub w2: GpuLinear,
+    pub w3: GpuLinear,
+}
+
+/// Holds a `GpuContext` plus all GPU-resident projection weights for a full
+/// forward pass.  Create once via `GpuForwardContext::from_weights`, then pass
+/// as `Some(&ctx)` to `LlamaWeights::forward`.
+pub struct GpuForwardContext {
+    pub ctx:     GpuContext,
+    pub layers:  Vec<GpuLayerWeights>,
+    pub lm_head: GpuLinear,
+}
+
+impl GpuForwardContext {
+    /// Upload all projection weights to GPU.  Returns `None` if no GPU adapter
+    /// is available.
+    pub fn from_weights(weights: &LlamaWeights<'_>) -> Option<Self> {
+        let ctx = GpuContext::new()?;
+        let layers = weights
+            .layers
+            .iter()
+            .map(|l| GpuLayerWeights {
+                wq: GpuLinear::new(&ctx, l.attention.wq.rows, l.attention.wq.cols, &l.attention.wq.weight),
+                wk: GpuLinear::new(&ctx, l.attention.wk.rows, l.attention.wk.cols, &l.attention.wk.weight),
+                wv: GpuLinear::new(&ctx, l.attention.wv.rows, l.attention.wv.cols, &l.attention.wv.weight),
+                wo: GpuLinear::new(&ctx, l.attention.wo.rows, l.attention.wo.cols, &l.attention.wo.weight),
+                w1: GpuLinear::new(&ctx, l.feed_forward.w1.rows, l.feed_forward.w1.cols, &l.feed_forward.w1.weight),
+                w2: GpuLinear::new(&ctx, l.feed_forward.w2.rows, l.feed_forward.w2.cols, &l.feed_forward.w2.weight),
+                w3: GpuLinear::new(&ctx, l.feed_forward.w3.rows, l.feed_forward.w3.cols, &l.feed_forward.w3.weight),
+            })
+            .collect();
+        let lm = &weights.lm_head;
+        let lm_head = GpuLinear::new(&ctx, lm.rows, lm.cols, &lm.weight);
+        Some(Self { ctx, layers, lm_head })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct AttentionWeights {
@@ -243,6 +292,7 @@ impl<'a> LlamaWeights<'a> {
         block_table: &BlockTable,
         kv_cache: &mut [f32],
         block_size: usize,
+        gpu: Option<&GpuForwardContext>,
     ) -> Vec<f32> {
         let hidden = config.hidden_size;
         let head_dim = hidden / config.num_attention_heads;
@@ -274,9 +324,16 @@ impl<'a> LlamaWeights<'a> {
             xb.copy_from_slice(&x);
             rms_norm(&mut xb, &layer.attention_norm, config.rms_norm_eps);
 
-            layer.attention.wq.apply_parallel(&mut q, &xb);
-            layer.attention.wk.apply_parallel(&mut k, &xb);
-            layer.attention.wv.apply_parallel(&mut v, &xb);
+            if let Some(g) = gpu {
+                let gl = &g.layers[layer_idx];
+                gl.wq.apply(&g.ctx, &mut q, &xb);
+                gl.wk.apply(&g.ctx, &mut k, &xb);
+                gl.wv.apply(&g.ctx, &mut v, &xb);
+            } else {
+                layer.attention.wq.apply_parallel(&mut q, &xb);
+                layer.attention.wk.apply_parallel(&mut k, &xb);
+                layer.attention.wv.apply_parallel(&mut v, &xb);
+            }
 
             for h in 0..num_heads {
                 let q_start = h * head_dim;
@@ -390,7 +447,11 @@ impl<'a> LlamaWeights<'a> {
                     }
                 });
 
-            layer.attention.wo.apply_parallel(&mut proj_out, &attn_out);
+            if let Some(g) = gpu {
+                g.layers[layer_idx].wo.apply(&g.ctx, &mut proj_out, &attn_out);
+            } else {
+                layer.attention.wo.apply_parallel(&mut proj_out, &attn_out);
+            }
             for i in 0..hidden {
                 x[i] += proj_out[i];
             }
@@ -398,10 +459,20 @@ impl<'a> LlamaWeights<'a> {
             xb.copy_from_slice(&x);
             rms_norm(&mut xb, &layer.ffn_norm, config.rms_norm_eps);
 
-            layer.feed_forward.w1.apply_parallel(&mut ff_gate, &xb);
-            layer.feed_forward.w3.apply_parallel(&mut ff_up, &xb);
+            if let Some(g) = gpu {
+                let gl = &g.layers[layer_idx];
+                gl.w1.apply(&g.ctx, &mut ff_gate, &xb);
+                gl.w3.apply(&g.ctx, &mut ff_up, &xb);
+            } else {
+                layer.feed_forward.w1.apply_parallel(&mut ff_gate, &xb);
+                layer.feed_forward.w3.apply_parallel(&mut ff_up, &xb);
+            }
             swiglu(&mut ff_gate, &ff_up);
-            layer.feed_forward.w2.apply_parallel(&mut ff_down, &ff_gate);
+            if let Some(g) = gpu {
+                g.layers[layer_idx].w2.apply(&g.ctx, &mut ff_down, &ff_gate);
+            } else {
+                layer.feed_forward.w2.apply_parallel(&mut ff_down, &ff_gate);
+            }
             for i in 0..hidden {
                 x[i] += ff_down[i];
             }
@@ -410,7 +481,11 @@ impl<'a> LlamaWeights<'a> {
         rms_norm(&mut x, &self.final_norm, config.rms_norm_eps);
 
         let mut logits = vec![0.0; config.vocab_size];
-        self.lm_head.apply_parallel(&mut logits, &x);
+        if let Some(g) = gpu {
+            g.lm_head.apply(&g.ctx, &mut logits, &x);
+        } else {
+            self.lm_head.apply_parallel(&mut logits, &x);
+        }
 
         let _ = matmul as fn(&mut [f32], &[f32], &[f32], usize, usize, usize);
         logits

@@ -108,6 +108,7 @@ fn main() -> anyhow::Result<()> {
                 &block_tables[i],
                 &mut kv_cache,
                 block_size,
+                None,
             );
             token_lat_us.push(start.elapsed().as_micros());
 
