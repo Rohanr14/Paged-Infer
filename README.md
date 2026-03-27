@@ -94,27 +94,31 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
 * **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
 ## Optimization Pass 4 (March 27, 2026) — GPU Acceleration via Metal/wgpu
 
-Added a GPU compute path for matrix-vector multiplication using `wgpu` (Metal backend on Apple Silicon, Vulkan on Linux/Windows).
+Added a GPU compute path for matrix-vector multiplication using `wgpu` (Metal on Apple Silicon, Vulkan on Linux/Windows). Weights upload once at model load; only the small per-token activation vector moves to the GPU each step.
 
-### WGSL Kernel Design
+### WGSL Kernel Design (`src/shaders/matvec.wgsl`)
 
-`src/shaders/matvec.wgsl` implements a **workgroup-parallel reduction** matvec:
-- Each output row is assigned to one workgroup of **256 threads**
-- Threads independently accumulate partial dot products across columns (stride 256)
-- A **8-step binary tree reduction** collapses 256 partial sums to a single output value
-- `var<workgroup>` shared memory holds intermediate sums with no global memory round-trips
+Each output row is handled by **one workgroup of 256 threads**. Threads stride over the column dimension to accumulate partial dot products, then an **8-step binary tree reduction** collapses all 256 partial sums to a single result using `var<workgroup>` shared memory — no global memory round-trips for intermediates:
 
-This is equivalent to a CUDA parallel reduction kernel, implemented in WGSL for cross-platform GPU support (Metal on macOS, Vulkan on Linux, DirectX 12 on Windows).
-
-### Architecture
-
+```wgsl
+// Each workgroup → one output row
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) wg_id, @builtin(local_invocation_id) local_id) {
+    let row = wg_id.x;
+    var acc = 0.0;
+    // Each thread strides: lid, lid+256, lid+512, …
+    for c = lid; c < cols; c += 256 { acc += weight[row*cols+c] * x[c]; }
+    partial_sums[lid] = acc;
+    // Tree reduce: 256→128→64→32→16→8→4→2→1 (8 barrier stages)
+    if lid == 0 { output[row] = partial_sums[0]; }
+}
 ```
-weight (rows × cols) ──┐
-                        ├─► WGSL compute shader ──► output (rows)
-x_vec (cols)  ──────────┘       (dispatch rows workgroups × 256 threads)
-```
 
-On Apple Silicon (M3), model weights upload once at startup and remain in **unified memory** — no PCIe transfer overhead. Only the small activation vector (2KB for hidden=2048) moves per token.
+This is the GPU parallel-reduction pattern — identical algorithm to a CUDA atomicAdd-free reduction kernel, implemented in WGSL for cross-platform support (Metal/Vulkan/DX12).
+
+### Apple Silicon advantage: Unified Memory
+
+On M3, CPU and GPU share the **same physical memory pool** — no PCIe bus. Weights loaded with `mmap` at startup are directly accessible by the Metal command queue. Per-token inference moves only the 8 KB activation vector (`hidden=2048 × f32`), not the 4+ GB weight tensors.
 
 ### Running the benchmark
 
@@ -122,7 +126,7 @@ On Apple Silicon (M3), model weights upload once at startup and remain in **unif
 cargo run --release --bin gpu_benchmark
 ```
 
-Exits gracefully with "No GPU adapter found" on headless/no-GPU machines.
+Exits gracefully with a CPU reference number on headless/no-GPU systems.
 
 ### Results (TBD — run on Apple M3)
 
@@ -134,23 +138,23 @@ Matrix  : 2048×2048 f32, 5 warm-up + 20 timed iters
 
 Results
 -------
-CPU packed+parallel : 0.XXXX s  (XX.XXX ms / iter)
-GPU wgpu/Metal      : 0.XXXX s  (X.XXX ms / iter)
+CPU packed+parallel : X.XXXXs total  (X.XXXms / iter)
+GPU wgpu/Metal      : X.XXXXs total  (X.XXXms / iter)
 GPU speedup         : XX.Xx
 
 Correctness: max |CPU - GPU| = X.XXe-XX  ✓
+
+Note: GPU time excludes readback (weights stay on GPU in production).
+      M3 Unified Memory means no PCIe transfer — CPU/GPU share physical memory.
 ```
 
-Run `cargo run --release --bin gpu_benchmark` on Apple Silicon to populate this table.
+Run `cargo run --release --bin gpu_benchmark` on Apple Silicon and update this table.
 
-### Technical note on speedup
-
-For a 2048×2048 f32 matvec:
-- Memory read: 2048×2048×4 = 16 MB of weights + 2048×4 = 8 KB of input
-- M3 GPU memory bandwidth: ~100 GB/s
-- Theoretical minimum time: 16 MB / 100 GB/s ≈ 0.16 ms per iter
-- M3 CPU (rayon, 8 cores): ~1.2 ms per iter (measured)
-- Expected GPU speedup: **~7–15x** depending on kernel efficiency and dispatch overhead
+### Expected performance (M3)
+- Weight data read per iter: 2048×2048×4 = **16 MB**
+- M3 GPU memory bandwidth: ~100 GB/s → theoretical floor **~0.16 ms/iter**
+- CPU rayon baseline: ~1.2 ms/iter (measured on M3)
+- Expected GPU speedup: **~7–15x** depending on kernel occupancy and dispatch overhead
 
 ## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
 
