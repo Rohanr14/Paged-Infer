@@ -14,6 +14,9 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     * Memory-mapped weight loading (`mmap`).
     * Paged KV Cache Allocation & Iteration-Level Scheduling (Continuous Batching).
     * **Block Size:** 16 tokens per physical block.
+    * int8 weight-only quantization (4x memory reduction, ~10x matvec speedup vs naive).
+    * GPU compute via `wgpu` (Metal/Vulkan) with WGSL workgroup-parallel reduction kernel.
+    * Speculative decoding with n-gram drafting (21.88% acceptance rate, 1.88x theoretical speedup).
 * **Core Exclusions:** No PyTorch, No TensorFlow, No HuggingFace `transformers` library for inference. All forward passes and attention mechanisms are written entirely from scratch.
 * **Engineering Tradeoffs & Realities:**
     * **Floating Point Precision:** Llama 3.2 1B weights are natively `bfloat16`. To balance memory footprint with compute simplicity, weights are memory-mapped as `bf16` (via the `half` crate) and cast to `f32` upon entering the CPU cache for the forward pass.
@@ -27,7 +30,7 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     │   ├── download_model.py       # Script to fetch Llama 3.2 1B safetensors and tokenizer
     │   ├── run_e2e_sweep.sh        # Automate batch×steps sweep benchmarks
     │   └── analyze_sweep.py        # CSV analysis and chart generation
-    ├── Cargo.toml                  # Rust dependencies (safetensors, memmap2, tokenizers, half, rayon)
+    ├── Cargo.toml                  # Rust dependencies (safetensors, memmap2, tokenizers, half, rayon, wgpu)
     ├── src/
     │   ├── main.rs                 # CLI entry point, scheduler, and continuous batching loop
     │   ├── lib.rs                  # Module exports
@@ -35,6 +38,8 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     │   ├── math.rs                 # Kernels: GEMM, RoPE, SwiGLU, int8 matvec, AVX2 SIMD
     │   ├── model.rs                # Llama architecture, forward pass, weight loading
     │   ├── speculative.rs          # N-gram drafter for speculative decoding
+    │   ├── shaders/
+    │   │   └── matvec.wgsl         # WGSL compute shader: workgroup-parallel row matvec
     │   ├── memory/
     │   │   ├── mod.rs              # Memory module exports
     │   │   ├── allocator.rs        # BlockAllocator: manages physical KV cache blocks
@@ -44,6 +49,7 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     │       ├── benchmark.rs        # Kernel-level microbenchmarks (matvec, attention, int8)
     │       ├── e2e_benchmark.rs    # Full model forward pass with latency percentiles
     │       ├── eviction_benchmark.rs # LRU eviction stress testing
+    │       ├── gpu_benchmark.rs    # GPU vs CPU matvec benchmark (Metal/Vulkan via wgpu)
     │       ├── speculative_benchmark.rs # Speculative decoding acceptance rate
     │       └── http_server.rs      # OpenAI-compatible HTTP API
     └── tests/
@@ -86,6 +92,66 @@ This project demonstrates deep expertise in low-level systems engineering, Rust 
     2. Track memory usage (Resident Set Size) between a contiguous baseline and the Paged-Infer engine.
     3. Generate a chart showing how Paged-Infer achieves near 0% memory waste.
 * **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
+## Optimization Pass 4 (March 27, 2026) — GPU Acceleration via Metal/wgpu
+
+Added a GPU compute path for matrix-vector multiplication using `wgpu` (Metal backend on Apple Silicon, Vulkan on Linux/Windows).
+
+### WGSL Kernel Design
+
+`src/shaders/matvec.wgsl` implements a **workgroup-parallel reduction** matvec:
+- Each output row is assigned to one workgroup of **256 threads**
+- Threads independently accumulate partial dot products across columns (stride 256)
+- A **8-step binary tree reduction** collapses 256 partial sums to a single output value
+- `var<workgroup>` shared memory holds intermediate sums with no global memory round-trips
+
+This is equivalent to a CUDA parallel reduction kernel, implemented in WGSL for cross-platform GPU support (Metal on macOS, Vulkan on Linux, DirectX 12 on Windows).
+
+### Architecture
+
+```
+weight (rows × cols) ──┐
+                        ├─► WGSL compute shader ──► output (rows)
+x_vec (cols)  ──────────┘       (dispatch rows workgroups × 256 threads)
+```
+
+On Apple Silicon (M3), model weights upload once at startup and remain in **unified memory** — no PCIe transfer overhead. Only the small activation vector (2KB for hidden=2048) moves per token.
+
+### Running the benchmark
+
+```bash
+cargo run --release --bin gpu_benchmark
+```
+
+Exits gracefully with "No GPU adapter found" on headless/no-GPU machines.
+
+### Results (TBD — run on Apple M3)
+
+```
+GPU Matvec Benchmark
+====================
+Adapter : Apple M3 (Metal)
+Matrix  : 2048×2048 f32, 5 warm-up + 20 timed iters
+
+Results
+-------
+CPU packed+parallel : 0.XXXX s  (XX.XXX ms / iter)
+GPU wgpu/Metal      : 0.XXXX s  (X.XXX ms / iter)
+GPU speedup         : XX.Xx
+
+Correctness: max |CPU - GPU| = X.XXe-XX  ✓
+```
+
+Run `cargo run --release --bin gpu_benchmark` on Apple Silicon to populate this table.
+
+### Technical note on speedup
+
+For a 2048×2048 f32 matvec:
+- Memory read: 2048×2048×4 = 16 MB of weights + 2048×4 = 8 KB of input
+- M3 GPU memory bandwidth: ~100 GB/s
+- Theoretical minimum time: 16 MB / 100 GB/s ≈ 0.16 ms per iter
+- M3 CPU (rayon, 8 cores): ~1.2 ms per iter (measured)
+- Expected GPU speedup: **~7–15x** depending on kernel efficiency and dispatch overhead
+
 ## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
 
 The attention computation was the primary bottleneck at high batch sizes and long contexts. Previously, all 32 query heads were computed sequentially per token; at `batch=8, steps=256` this caused p95 latency to spike to **1.1 seconds** and throughput to collapse to **1.62 tok/s**.
@@ -202,6 +268,10 @@ To make this project interview-ready and reproducible, use:
 5. **Speculative decoding acceptance rate**
    - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin speculative_benchmark`
    - Reports acceptance rate and theoretical throughput multiplier for n-gram drafting with K=4.
+
+6. **GPU matmul benchmark (Metal/Vulkan)**
+   - `cargo run --release --bin gpu_benchmark`
+   - Exits gracefully if no GPU found; reports adapter name, GPU vs CPU throughput, and correctness check.
 
 If `MODEL_PATH` is missing, model-dependent binaries exit early with a clear message rather than failing.
 
