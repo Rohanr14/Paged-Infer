@@ -149,18 +149,20 @@ GPU speedup         : 3.9x
 Correctness: max |CPU - GPU| = 1.53e-4  ✓
 ```
 
-vec4 kernel (current — re-run to update):
+vec4 kernel (current):
 ```
-GPU speedup         : TBD (expected ~8–12x)
-```
+CPU packed+parallel : 0.0311s total  (1.555ms / iter)
+GPU wgpu/Metal      : 0.0066s total  (0.330ms / iter)
+GPU speedup         : 4.7x
 
-Run `cargo run --release --bin gpu_benchmark` after pulling to measure the vec4 improvement.
+Correctness: max |CPU - GPU| = 1.60e-4  ✓
+```
 
 ### Bandwidth analysis (M2)
 - Weight data per iter: 2048×2048×4 = **16 MB**
 - M2 GPU memory bandwidth: ~100 GB/s → theoretical floor **~0.16 ms/iter**
 - Scalar kernel: 0.394 ms/iter = 41% of peak bandwidth
-- vec4 kernel: reduces loop iterations 4x and uses wider SIMD loads — expected to close the gap significantly
+- vec4 kernel: 0.330 ms/iter = **48% of peak bandwidth** — 4.7x over CPU (up from 3.9x scalar)
 
 ## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
 
