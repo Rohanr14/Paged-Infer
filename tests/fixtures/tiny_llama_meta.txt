@@ -1,0 +1,10 @@
+hidden_size=96
+num_hidden_layers=2
+num_attention_heads=4
+num_key_value_heads=2
+intermediate_size=192
+vocab_size=112
+rms_norm_eps=1e-05
+rope_theta=10000.0
+seq_len=40
+tokens=94,87,60,29,75,85,18,15,47,102,105,36,63,49,54,76,47,36,34,19,22,81,55,102,57,62,59,51,68,62,68,74,89,13,45,77,37,41,72,33

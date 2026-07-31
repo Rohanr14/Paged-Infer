@@ -125,22 +125,91 @@ pub fn swiglu(x: &mut [f32], x_w3: &[f32]) {
     }
 }
 
-pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, rope_theta: f32) {
-    for i in (0..head_dim).step_by(2) {
-        let freq = 1.0 / rope_theta.powf((i as f32) / (head_dim as f32));
-        let val = (pos as f32) * freq;
-        let (sin, cos) = val.sin_cos();
+/// Which pairs of dimensions a rotary embedding rotates together.
+///
+/// The two conventions are numerically different and are *not* interchangeable:
+/// a checkpoint stores its Q/K projections already arranged for one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeStyle {
+    /// HuggingFace / GPT-NeoX `rotate_half`: dimension `j` rotates against
+    /// `j + head_dim/2`.
+    ///
+    /// This is the convention every HF `.safetensors` Llama checkpoint needs.
+    /// `convert_llama_weights_to_hf.py` permutes `q_proj` and `k_proj` at
+    /// conversion time precisely so that `rotate_half` reproduces what the
+    /// original interleaved kernel computed. Feeding HF weights through the
+    /// interleaved path silently corrupts every attention score.
+    #[default]
+    Neox,
+    /// GPT-J / original Meta layout: adjacent dimensions `(2i, 2i+1)` rotate
+    /// together. Correct only for un-permuted original-format checkpoints.
+    Interleaved,
+}
 
-        let q0 = q[i];
-        let q1 = q[i + 1];
-        q[i] = q0 * cos - q1 * sin;
-        q[i + 1] = q0 * sin + q1 * cos;
-
-        let k0 = k[i];
-        let k1 = k[i + 1];
-        k[i] = k0 * cos - k1 * sin;
-        k[i + 1] = k0 * sin + k1 * cos;
+/// Precompute `(cos, sin)` for one position: `head_dim / 2` entries, indexed by
+/// rotation pair rather than by dimension.
+///
+/// Worth hoisting — a naive implementation recomputes these inside the head
+/// loop of every layer, which for TinyLlama is ~25k transcendental calls per
+/// token instead of 32.
+pub fn rope_table(pos: usize, head_dim: usize, rope_theta: f32, cos: &mut [f32], sin: &mut [f32]) {
+    let half = head_dim / 2;
+    assert_eq!(cos.len(), half);
+    assert_eq!(sin.len(), half);
+    for j in 0..half {
+        let freq = 1.0 / rope_theta.powf((2 * j) as f32 / head_dim as f32);
+        let (s, c) = ((pos as f32) * freq).sin_cos();
+        cos[j] = c;
+        sin[j] = s;
     }
+}
+
+/// Rotate a single head's vector in place using a precomputed table.
+pub fn rope_rotate(x: &mut [f32], cos: &[f32], sin: &[f32], style: RopeStyle) {
+    let half = x.len() / 2;
+    debug_assert_eq!(cos.len(), half);
+    match style {
+        RopeStyle::Neox => {
+            for j in 0..half {
+                let (c, s) = (cos[j], sin[j]);
+                let a = x[j];
+                let b = x[j + half];
+                x[j] = a * c - b * s;
+                x[j + half] = b * c + a * s;
+            }
+        }
+        RopeStyle::Interleaved => {
+            for j in 0..half {
+                let (c, s) = (cos[j], sin[j]);
+                let a = x[2 * j];
+                let b = x[2 * j + 1];
+                x[2 * j] = a * c - b * s;
+                x[2 * j + 1] = b * c + a * s;
+            }
+        }
+    }
+}
+
+/// Rotate a query head and a key head that share the same rotation table.
+///
+/// Under grouped-query attention several query heads map onto one key head, so
+/// callers must not drive this from the query-head loop — that would rotate the
+/// shared key head once per group member. Rotate queries and keys separately
+/// with [`rope_rotate`]; see `LlamaWeights::forward`.
+pub fn apply_rope(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    style: RopeStyle,
+) {
+    let half = head_dim / 2;
+    let mut cos = vec![0.0_f32; half];
+    let mut sin = vec![0.0_f32; half];
+    rope_table(pos, head_dim, rope_theta, &mut cos, &mut sin);
+    rope_rotate(q, &cos, &sin, style);
+    rope_rotate(k, &cos, &sin, style);
 }
 
 #[inline]
@@ -149,11 +218,27 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// `out += weight * v`, the attention value accumulation.
+#[inline]
+pub fn axpy(out: &mut [f32], weight: f32, v: &[f32]) {
+    debug_assert_eq!(out.len(), v.len());
+    for (o, x) in out.iter_mut().zip(v.iter()) {
+        *o += weight * x;
+    }
+}
+
 pub fn softmax_in_place(x: &mut [f32]) {
     if x.is_empty() {
         return;
     }
     let max_v = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // Every entry masked out: `exp(-inf - -inf)` is NaN, so bail to all-zero
+    // weights instead. Contributes nothing to the attention output, which is
+    // the right answer when there is nothing to attend to.
+    if !max_v.is_finite() {
+        x.fill(0.0);
+        return;
+    }
     let mut sum = 0.0;
     for v in x.iter_mut() {
         *v = (*v - max_v).exp();

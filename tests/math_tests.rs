@@ -1,6 +1,6 @@
 use paged_infer::math::{
     apply_rope, matmul, matvec_f32_weight_transposed_parallel, matvec_i8_weight_parallel,
-    quantize_rows_i8, rms_norm, silu, swiglu,
+    quantize_rows_i8, rms_norm, silu, swiglu, RopeStyle,
 };
 
 // Helper function to compare f32 slices with a small tolerance
@@ -72,7 +72,7 @@ fn test_swiglu() {
 }
 
 #[test]
-fn test_apply_rope() {
+fn test_apply_rope_interleaved() {
     // 4-dimensional embeddings (head_dim = 4)
     let mut q = vec![1.0, 0.0, 1.0, 0.0];
     let mut k = vec![1.0, 0.0, 1.0, 0.0];
@@ -81,18 +81,100 @@ fn test_apply_rope() {
     let head_dim = 4;
     let rope_theta = 10000.0;
 
-    apply_rope(&mut q, &mut k, pos, head_dim, rope_theta);
+    apply_rope(&mut q, &mut k, pos, head_dim, rope_theta, RopeStyle::Interleaved);
 
-    // For i=0 (dim 0,1): freq = 1.0. val = 1.0. sin=0.84147, cos=0.54030
+    // Pair 0 (dims 0,1): freq = 1.0. val = 1.0. sin=0.84147, cos=0.54030
     // q[0] = 1*cos - 0*sin = 0.54030
-    // q[1] = 1*sin + 0*cos = 0.84147
-    // For i=2 (dim 2,3): freq = 1/sqrt(10000) = 0.01. val = 0.01. sin=0.0099998, cos=0.99995
+    // q[1] = 0*cos + 1*sin = 0.84147
+    // Pair 1 (dims 2,3): freq = 1/sqrt(10000) = 0.01. sin=0.0099998, cos=0.99995
     // q[2] = 1*cos - 0*sin = 0.99995
-    // q[3] = 1*sin + 0*cos = 0.0099998
+    // q[3] = 0*cos + 1*sin = 0.0099998
 
     let expected = vec![0.540302, 0.841470, 0.999950, 0.0099998];
     assert_f32_slice_eq(&q, &expected, 1e-5);
     assert_f32_slice_eq(&k, &expected, 1e-5); // K should match Q in this exact scenario
+}
+
+#[test]
+fn test_apply_rope_neox_pairs_across_the_halves() {
+    // Same angles as the interleaved case, but dimension j rotates against
+    // j + head_dim/2 instead of against j+1. This is the convention HF
+    // checkpoints are permuted for.
+    let mut q = vec![1.0, 1.0, 0.0, 0.0];
+    let mut k = q.clone();
+
+    apply_rope(&mut q, &mut k, 1, 4, 10000.0, RopeStyle::Neox);
+
+    // Pair 0 = (dim 0, dim 2), angle 1.0 rad: cos=0.54030, sin=0.84147
+    //   q[0] = 1*cos - 0*sin = 0.54030 ; q[2] = 0*cos + 1*sin = 0.84147
+    // Pair 1 = (dim 1, dim 3), angle 0.01 rad: cos=0.99995, sin=0.0099998
+    //   q[1] = 1*cos - 0*sin = 0.99995 ; q[3] = 0*cos + 1*sin = 0.0099998
+    let expected = vec![0.540302, 0.999950, 0.841470, 0.0099998];
+    assert_f32_slice_eq(&q, &expected, 1e-5);
+    assert_f32_slice_eq(&k, &expected, 1e-5);
+}
+
+#[test]
+fn test_rope_conventions_are_not_interchangeable() {
+    // Guards the bug this API exists to prevent: feeding HF-permuted weights
+    // through the interleaved path is silently wrong, not approximately right.
+    let base: Vec<f32> = (0..8).map(|i| (i as f32 + 1.0) * 0.3).collect();
+    let mut a = base.clone();
+    let mut b = base.clone();
+    let mut scratch = base.clone();
+
+    apply_rope(&mut a, &mut scratch, 5, 8, 10000.0, RopeStyle::Neox);
+    apply_rope(&mut b, &mut scratch, 5, 8, 10000.0, RopeStyle::Interleaved);
+
+    let spread = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(spread > 0.1, "conventions should differ materially, got {spread}");
+}
+
+#[test]
+fn test_rope_preserves_norm() {
+    // A rotation cannot change a vector's length under either convention.
+    for style in [RopeStyle::Neox, RopeStyle::Interleaved] {
+        let base: Vec<f32> = (0..16).map(|i| ((i * 7 % 5) as f32) - 2.0).collect();
+        let before: f32 = base.iter().map(|v| v * v).sum();
+        let mut q = base.clone();
+        let mut k = base.clone();
+        apply_rope(&mut q, &mut k, 13, 16, 10000.0, style);
+        let after: f32 = q.iter().map(|v| v * v).sum();
+        assert!(
+            (before - after).abs() < 1e-4,
+            "{style:?} changed the norm: {before} -> {after}"
+        );
+    }
+}
+
+#[test]
+fn test_softmax_all_masked_yields_zero_weights() {
+    // Every position masked out must produce zero weights, not NaN.
+    let mut scores = vec![f32::NEG_INFINITY; 4];
+    paged_infer::math::softmax_in_place(&mut scores);
+    assert!(scores.iter().all(|s| *s == 0.0), "got {scores:?}");
+}
+
+#[test]
+fn test_masked_position_gets_no_weight() {
+    // A -inf score must contribute nothing, unlike a 0.0 score which would take
+    // a full share of the softmax mass.
+    let mut scores = vec![1.0, f32::NEG_INFINITY, 1.0];
+    paged_infer::math::softmax_in_place(&mut scores);
+    assert_eq!(scores[1], 0.0);
+    assert!((scores[0] - 0.5).abs() < 1e-6);
+    assert!((scores[2] - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn test_axpy_accumulates() {
+    let mut out = vec![1.0_f32, 2.0, 3.0];
+    paged_infer::math::axpy(&mut out, 2.0, &[0.5, -1.0, 4.0]);
+    assert_f32_slice_eq(&out, &[2.0, 0.0, 11.0], 1e-6);
 }
 
 #[test]
