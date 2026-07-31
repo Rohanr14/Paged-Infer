@@ -1,6 +1,6 @@
 # Paged-Infer
 
-**An LLM inference engine written from scratch in Rust: PagedAttention, automatic prefix caching, copy-on-write forking, and hand-written SIMD kernels.**
+**An LLM inference engine written from scratch in Rust: PagedAttention, automatic prefix caching, copy-on-write forking, batched decode, and hand-written SIMD kernels.**
 
 No PyTorch, no TensorFlow, no `transformers`. The forward pass, the attention
 kernels, the KV-cache allocator, the scheduler, and the HTTP server are all in
@@ -54,8 +54,9 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 83 tests, incl. golden parity
+cargo test                                        # 89 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
+cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
 ```
 
@@ -66,7 +67,10 @@ pip install huggingface_hub
 python3 scripts/download_model.py                 # TinyLlama 1.1B, ~2.2 GB
 
 cargo run --release                               # CLI demo
-QUANT=int8 cargo run --release                    # 4x less weight memory
+QUANT=int8 cargo run --release                    # ~4x less weight memory
+
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin batch_benchmark
 
 MODEL_PATH=models/tinyllama-1.1b/model.safetensors \
 TOKENIZER_PATH=models/tinyllama-1.1b/tokenizer.json \
@@ -146,6 +150,67 @@ siblings both write to is split lazily, on first write — so a sample that stop
 early never pays for a copy at all.
 
 ---
+
+## End-to-end decode
+
+TinyLlama 1.1B, full causal attention (no sliding window), greedy decode, on an
+**Apple Silicon MacBook Air** with the NEON kernels. `e2e_benchmark` walks the
+batch one sequence at a time, so this is the *sequential* path — see
+[batched decode](#batched-decode) below for what running them together buys:
+
+| batch | steps | throughput | avg latency | p50 | p95 | peak RSS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 24 | **11.37 tok/s** | 88.0 ms | 74.0 ms | 83.7 ms | 5,870 MB |
+
+```bash
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark
+```
+
+That 5,870 MB is the honest cost of the current design: weights are widened from
+bf16 to f32 once at load, so a 1.1B-parameter model carries ~4.2 GB of
+projections plus the KV pool. `QUANT=int8` stores them per-row int8 instead and
+takes roughly a quarter of that.
+
+### Batched decode
+
+Decoding is memory-bound — each step streams every weight matrix to do one
+multiply-add per element — so running `B` sequences one at a time reads the
+weights `B` times. `decode_batch_into` runs the active batch through the model
+together, streaming each matrix once and reusing every row across the batch.
+
+Measured on **4-core x86_64 (AVX2+FMA)**, 0.77 GB of weights, 128 tokens of
+context:
+
+| batch | sequential | batched | speedup | weight GB/s |
+|---:|---:|---:|---:|---:|
+| 1 | 32.22 tok/s | 32.03 tok/s | 0.99x | 24.7 |
+| 2 | 34.36 tok/s | 53.66 tok/s | 1.56x | 20.7 |
+| 4 | 34.38 tok/s | 86.20 tok/s | **2.51x** | 16.6 |
+| 8 | 33.37 tok/s | 105.68 tok/s | **3.17x** | 10.2 |
+
+Sequential throughput is flat in batch size, which is the point: it is doing `B`
+times the work for `B` times the traffic. Batch 1 costs nothing (0.99x), so
+single-sequence decode is not penalized.
+
+The speedup is sublinear, and the bandwidth column explains why — it *falls* as
+batch grows, meaning the kernel stops being bandwidth-bound and the parts that
+do not batch take over: attention (each sequence has its own KV, position and
+block table) plus per-sequence RMSNorm, RoPE and SwiGLU. Context length moves
+this less than batch size does: at batch 8, 3.8x at 32 tokens of context against
+3.3x at 512.
+
+Batched and sequential decode are **bit-identical** on the fixture model
+(`max|Δ| = 0.00000000`), including ragged batches, block-boundary crossings and
+per-sequence sliding windows. Only the loop nesting changed.
+
+```bash
+cargo run --release --bin batch_benchmark          # synthetic weights, no download
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin batch_benchmark
+```
+
+The synthetic default is sized to exceed last-level cache on purpose. A
+cache-resident model shows almost no benefit from batching and would make the
+feature look worthless; a real 1B+ model never fits.
 
 ## What prefix caching is worth
 
@@ -272,12 +337,13 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-83 tests, no model download required.
+89 tests, no model download required.
 
 | suite | covers |
 |---|---|
 | `golden_parity_tests` | full forward pass vs the NumPy reference: decode, prefill, resumed prefill |
 | `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
+| `batched_decode_tests` | batched decode is bit-identical to sequential: ragged batches, block boundaries, per-sequence windows |
 | `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
@@ -293,14 +359,15 @@ byte for byte.
 
 ## Honest limitations
 
-- **Decode is one sequence at a time.** Iteration-level scheduling is real —
-  requests are admitted and retired continuously, and they share KV — but each
-  sequence's forward pass runs separately rather than as a batched GEMM. Batching
-  the projections across the active set is the single biggest remaining
-  throughput win.
-- **Prefill is a loop over positions**, not a batched GEMM. It skips the LM head
-  for all but the last token, which is most of the easy saving, but a real
-  prefill would process the prompt as a matrix.
+- **Prefill is still a loop over positions**, not a batched GEMM. It skips the LM
+  head for all but the last token, which is most of the easy saving, but a real
+  prefill would push the whole prompt through as a matrix — the same trick decode
+  now uses, applied across positions instead of across sequences. This is the
+  biggest remaining throughput win.
+- **Attention does not batch.** Each sequence has its own block table, position
+  and KV history, so there is no shared operand to amortize. It is parallelized
+  across (sequence, head) pairs instead. This is what caps the batched-decode
+  speedup below the batch size.
 - **The GPU path covers matvec only.** Attention, RMSNorm and SwiGLU stay on the
   CPU, and every call round-trips through a blocking readback — so it is
   currently a demonstration of a WGSL reduction kernel, not a fast end-to-end
@@ -337,6 +404,7 @@ src/
   bin/
     http_server.rs         OpenAI-shaped API over the real engine
     benchmark.rs           kernel attribution ladder
+    batch_benchmark.rs     batched vs sequential decode
     prefix_cache_benchmark.rs
     e2e_benchmark.rs  eviction_benchmark.rs  gpu_benchmark.rs
 scripts/

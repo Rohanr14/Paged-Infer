@@ -78,3 +78,8 @@ jobs:
 
       - name: Prefix cache benchmark
         run: cargo run --release --bin prefix_cache_benchmark
+
+      # Small batch/step counts: CI checks it runs and that batching is not a
+      # regression, not the wall-clock figures, which are noise on a shared runner.
+      - name: Batched decode benchmark
+        run: BENCH_LAYERS=2 BENCH_VOCAB=2048 BENCH_STEPS=2 BENCH_BATCHES="1 4" cargo run --release --bin batch_benchmark
