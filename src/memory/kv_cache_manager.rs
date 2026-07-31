@@ -208,7 +208,9 @@ impl KvCacheManager {
     ) -> bool {
         self.touch(seq_id, now_tick);
         if self.allocator.available_blocks() == 0
-            && !self.prefix_cache.evict_until_available(&mut self.allocator, 1)
+            && !self
+                .prefix_cache
+                .evict_until_available(&mut self.allocator, 1)
         {
             return false;
         }
@@ -237,7 +239,12 @@ impl KvCacheManager {
     /// This is how n samples from one prompt cost one prompt's worth of KV. No
     /// data moves here — divergence is handled later, and only for the one block
     /// both sequences actually write to.
-    pub fn fork(&mut self, parent_table: &BlockTable, child_seq: usize, now_tick: u64) -> BlockTable {
+    pub fn fork(
+        &mut self,
+        parent_table: &BlockTable,
+        child_seq: usize,
+        now_tick: u64,
+    ) -> BlockTable {
         let mut child = BlockTable::new();
         for slot in parent_table.slots() {
             self.allocator.incref(slot.block);
@@ -275,7 +282,9 @@ impl KvCacheManager {
             return false;
         }
         if self.allocator.available_blocks() == 0
-            && !self.prefix_cache.evict_until_available(&mut self.allocator, 1)
+            && !self
+                .prefix_cache
+                .evict_until_available(&mut self.allocator, 1)
         {
             // Nothing to clone into. The caller has to preempt something.
             return false;
@@ -415,7 +424,10 @@ mod tests {
 
         // The two sequences map the same physical blocks for the shared prefix.
         for i in 0..3 {
-            assert_eq!(a.block_table.slots()[i].block, b.block_table.slots()[i].block);
+            assert_eq!(
+                a.block_table.slots()[i].block,
+                b.block_table.slots()[i].block
+            );
         }
         assert_eq!(mgr.prefix_stats().tokens_saved, 12);
     }
@@ -423,7 +435,9 @@ mod tests {
     #[test]
     fn test_reuse_stops_at_the_first_divergent_block() {
         let mut mgr = KvCacheManager::new(32, BS);
-        let a = mgr.admit(1, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 1).unwrap();
+        let a = mgr
+            .admit(1, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 1)
+            .unwrap();
         mgr.publish_prompt_blocks(&a.block_table);
 
         // Same first block, different second block, then identical third.
@@ -434,7 +448,10 @@ mod tests {
             b.reused_blocks, 1,
             "the third block has a different history and must not be reused"
         );
-        assert_ne!(a.block_table.slots()[2].block, b.block_table.slots()[2].block);
+        assert_ne!(
+            a.block_table.slots()[2].block,
+            b.block_table.slots()[2].block
+        );
     }
 
     #[test]
@@ -471,7 +488,13 @@ mod tests {
         assert_eq!(mgr.available_blocks(), 2);
 
         // Needs 4 fresh blocks; the two cached ones must be given up.
-        let b = mgr.admit(2, &[90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105], 2);
+        let b = mgr.admit(
+            2,
+            &[
+                90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+            ],
+            2,
+        );
         assert!(b.is_some(), "should reclaim cache rather than reject");
         assert!(mgr.prefix_stats().evictions >= 2);
     }
@@ -504,7 +527,7 @@ mod tests {
         let mut mgr = KvCacheManager::new(8, BS);
 
         let parent = mgr.admit(1, &[1, 2, 3, 4, 5, 6], 1).unwrap();
-        let mut parent_table = parent.block_table;
+        let parent_table = parent.block_table;
         // Two blocks: one full, one holding two tokens.
         assert_eq!(parent_table.len(), 2);
 

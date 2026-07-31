@@ -164,8 +164,8 @@ pub struct GpuLayerWeights {
 /// forward pass.  Create once via `GpuForwardContext::from_weights`, then pass
 /// as `Some(&ctx)` to `LlamaWeights::forward`.
 pub struct GpuForwardContext {
-    pub ctx:     GpuContext,
-    pub layers:  Vec<GpuLayerWeights>,
+    pub ctx: GpuContext,
+    pub layers: Vec<GpuLayerWeights>,
     pub lm_head: GpuLinear,
 }
 
@@ -178,18 +178,57 @@ impl GpuForwardContext {
             .layers
             .iter()
             .map(|l| GpuLayerWeights {
-                wq: GpuLinear::new(&ctx, l.attention.wq.rows, l.attention.wq.cols, &l.attention.wq.weight),
-                wk: GpuLinear::new(&ctx, l.attention.wk.rows, l.attention.wk.cols, &l.attention.wk.weight),
-                wv: GpuLinear::new(&ctx, l.attention.wv.rows, l.attention.wv.cols, &l.attention.wv.weight),
-                wo: GpuLinear::new(&ctx, l.attention.wo.rows, l.attention.wo.cols, &l.attention.wo.weight),
-                w1: GpuLinear::new(&ctx, l.feed_forward.w1.rows, l.feed_forward.w1.cols, &l.feed_forward.w1.weight),
-                w2: GpuLinear::new(&ctx, l.feed_forward.w2.rows, l.feed_forward.w2.cols, &l.feed_forward.w2.weight),
-                w3: GpuLinear::new(&ctx, l.feed_forward.w3.rows, l.feed_forward.w3.cols, &l.feed_forward.w3.weight),
+                wq: GpuLinear::new(
+                    &ctx,
+                    l.attention.wq.rows,
+                    l.attention.wq.cols,
+                    &l.attention.wq.weight,
+                ),
+                wk: GpuLinear::new(
+                    &ctx,
+                    l.attention.wk.rows,
+                    l.attention.wk.cols,
+                    &l.attention.wk.weight,
+                ),
+                wv: GpuLinear::new(
+                    &ctx,
+                    l.attention.wv.rows,
+                    l.attention.wv.cols,
+                    &l.attention.wv.weight,
+                ),
+                wo: GpuLinear::new(
+                    &ctx,
+                    l.attention.wo.rows,
+                    l.attention.wo.cols,
+                    &l.attention.wo.weight,
+                ),
+                w1: GpuLinear::new(
+                    &ctx,
+                    l.feed_forward.w1.rows,
+                    l.feed_forward.w1.cols,
+                    &l.feed_forward.w1.weight,
+                ),
+                w2: GpuLinear::new(
+                    &ctx,
+                    l.feed_forward.w2.rows,
+                    l.feed_forward.w2.cols,
+                    &l.feed_forward.w2.weight,
+                ),
+                w3: GpuLinear::new(
+                    &ctx,
+                    l.feed_forward.w3.rows,
+                    l.feed_forward.w3.cols,
+                    &l.feed_forward.w3.weight,
+                ),
             })
             .collect();
         let lm = &weights.lm_head;
         let lm_head = GpuLinear::new(&ctx, lm.rows, lm.cols, &lm.weight);
-        Some(Self { ctx, layers, lm_head })
+        Some(Self {
+            ctx,
+            layers,
+            lm_head,
+        })
     }
 }
 
@@ -366,6 +405,7 @@ impl<'a> LlamaWeights<'a> {
     ///
     /// Allocates a fresh [`ForwardScratch`] per call; hot loops should hold one
     /// and use [`LlamaWeights::forward_into`] instead.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         token_id: u32,
@@ -392,6 +432,8 @@ impl<'a> LlamaWeights<'a> {
 
     /// [`LlamaWeights::forward`] against caller-owned scratch. Leaves the logits
     /// in `scratch.logits`.
+    // Wide by design: weights, config, block table, cache, and scratch are
+    // separate borrows so the caller controls their lifetimes independently.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_into(
         &self,
@@ -556,9 +598,18 @@ impl<'a> LlamaWeights<'a> {
                 gl.wk.apply(&g.ctx, &mut scratch.k, &scratch.xb);
                 gl.wv.apply(&g.ctx, &mut scratch.v, &scratch.xb);
             } else {
-                layer.attention.wq.apply_parallel(&mut scratch.q, &scratch.xb);
-                layer.attention.wk.apply_parallel(&mut scratch.k, &scratch.xb);
-                layer.attention.wv.apply_parallel(&mut scratch.v, &scratch.xb);
+                layer
+                    .attention
+                    .wq
+                    .apply_parallel(&mut scratch.q, &scratch.xb);
+                layer
+                    .attention
+                    .wk
+                    .apply_parallel(&mut scratch.k, &scratch.xb);
+                layer
+                    .attention
+                    .wv
+                    .apply_parallel(&mut scratch.v, &scratch.xb);
             }
 
             // Queries and keys are rotated in separate loops on purpose. Under

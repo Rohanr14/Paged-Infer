@@ -39,7 +39,10 @@ fn load_config() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         attention_window: None,
         rope_style: Default::default(),
     };
-    let tokens: Vec<u32> = kv["tokens"].split(',').map(|t| t.parse().unwrap()).collect();
+    let tokens: Vec<u32> = kv["tokens"]
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
     let weights = std::fs::read(dir.join("tiny_llama.safetensors")).unwrap();
     (config, tokens, weights)
 }
@@ -203,15 +206,7 @@ fn test_forked_samples_do_not_corrupt_each_other() {
         let mut mgr = KvCacheManager::new(TOTAL_BLOCKS, BLOCK_SIZE).with_prefix_cache(false);
         let adm = mgr.admit(0, prompt, 0).unwrap();
         let mut table = adm.block_table;
-        weights.prefill(
-            prompt,
-            0,
-            &config,
-            &table,
-            &mut cache,
-            BLOCK_SIZE,
-            None,
-        );
+        weights.prefill(prompt, 0, &config, &table, &mut cache, BLOCK_SIZE, None);
         if prompt.len() >= table.len() * BLOCK_SIZE {
             assert!(mgr.append_block(0, &mut table, 1));
         }
@@ -254,7 +249,10 @@ fn test_forked_samples_do_not_corrupt_each_other() {
     let got_a = decode(0, &mut table_a, branch_a);
     let got_b = decode(1, &mut table_b, branch_b);
 
-    assert!(mgr.cow_copies() > 0, "the shared partial block should have split");
+    assert!(
+        mgr.cow_copies() > 0,
+        "the shared partial block should have split"
+    );
     assert!(
         max_abs(&got_a, &ref_a) < 1e-5,
         "branch A was corrupted by its sibling"

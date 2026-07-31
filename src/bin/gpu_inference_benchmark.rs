@@ -37,7 +37,11 @@ fn bench_config() -> LlamaConfig {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn make_packed(rows: usize, cols: usize, val: f32) -> PackedLinear {
-    PackedLinear { rows, cols, weight: vec![val; rows * cols] }
+    PackedLinear {
+        rows,
+        cols,
+        weight: vec![val; rows * cols],
+    }
 }
 
 /// Build synthetic LlamaWeights for the given config.
@@ -45,10 +49,9 @@ fn make_packed(rows: usize, cols: usize, val: f32) -> PackedLinear {
 fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
     let embed_bytes: &'static [u8] =
         Box::leak(vec![0u8; config.vocab_size * config.hidden_size * 2].into_boxed_slice());
-    let token_embeddings =
-        Tensor::new(embed_bytes, vec![config.vocab_size, config.hidden_size]);
+    let token_embeddings = Tensor::new(embed_bytes, vec![config.vocab_size, config.hidden_size]);
 
-    let h  = config.hidden_size;
+    let h = config.hidden_size;
     let kv = config.num_key_value_heads * (h / config.num_attention_heads);
     let ff = config.intermediate_size;
 
@@ -56,16 +59,16 @@ fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
         .map(|_| LayerWeights {
             attention_norm: vec![1.0f32; h],
             attention: AttentionWeights {
-                wq: make_packed(h,  h,  0.001),
-                wk: make_packed(kv, h,  0.001),
-                wv: make_packed(kv, h,  0.001),
-                wo: make_packed(h,  h,  0.001),
+                wq: make_packed(h, h, 0.001),
+                wk: make_packed(kv, h, 0.001),
+                wv: make_packed(kv, h, 0.001),
+                wo: make_packed(h, h, 0.001),
             },
             ffn_norm: vec![1.0f32; h],
             feed_forward: FeedForwardWeights {
-                w1: make_packed(ff, h,  0.001),
-                w2: make_packed(h,  ff, 0.001),
-                w3: make_packed(ff, h,  0.001),
+                w1: make_packed(ff, h, 0.001),
+                w2: make_packed(h, ff, 0.001),
+                w3: make_packed(ff, h, 0.001),
             },
         })
         .collect();
@@ -84,12 +87,15 @@ fn run_forward(
     config: &LlamaConfig,
     iters: usize,
 ) -> std::time::Duration {
-    let block_size   = 16usize;
+    let block_size = 16usize;
     let total_blocks = 64usize;
-    let head_dim     = config.hidden_size / config.num_attention_heads;
+    let head_dim = config.hidden_size / config.num_attention_heads;
     let kv_cache_size = config.num_hidden_layers
-        * total_blocks * block_size
-        * config.num_key_value_heads * 2 * head_dim;
+        * total_blocks
+        * block_size
+        * config.num_key_value_heads
+        * 2
+        * head_dim;
     let mut kv_cache = vec![0.0f32; kv_cache_size];
     let mut allocator = BlockAllocator::new(total_blocks, block_size);
     let mut bt = BlockTable::new();
@@ -98,8 +104,10 @@ fn run_forward(
     let t = Instant::now();
     for i in 0..iters {
         let pos = i % (block_size * total_blocks - 1);
-        if pos > 0 && pos % block_size == 0 {
-            if let Some(pb) = allocator.allocate() { bt.append_block(pb); }
+        if pos > 0 && pos.is_multiple_of(block_size) {
+            if let Some(pb) = allocator.allocate() {
+                bt.append_block(pb);
+            }
         }
         let _ = weights.forward(1u32, pos, config, &bt, &mut kv_cache, block_size, gpu);
     }
@@ -122,11 +130,10 @@ fn main() {
     println!();
 
     // ── estimate GPU weight footprint ─────────────────────────────────────────
-    let h  = config.hidden_size;
+    let h = config.hidden_size;
     let kv = config.num_key_value_heads * (h / config.num_attention_heads);
     let ff = config.intermediate_size;
-    let bytes_per_layer =
-        (h * h + kv * h + kv * h + h * h + ff * h + h * ff + ff * h) * 4;
+    let bytes_per_layer = (h * h + kv * h + kv * h + h * h + ff * h + h * ff + ff * h) * 4;
     let total_gpu_mb =
         (config.num_hidden_layers * bytes_per_layer + config.vocab_size * h * 4) / (1024 * 1024);
     println!("GPU weight upload : ~{total_gpu_mb} MB  (full 22-layer f32 would be ~3.9 GB)");
@@ -135,15 +142,17 @@ fn main() {
     let weights = synthetic_weights(&config);
 
     let warmup = 2usize;
-    let iters  = 8usize;
+    let iters = 8usize;
 
     // ── CPU baseline ──────────────────────────────────────────────────────────
     println!("Warming up CPU ({warmup} iters)...");
     run_forward(&weights, None, &config, warmup);
     println!("Timing CPU ({iters} iters)...");
-    let cpu_ms = run_forward(&weights, None, &config, iters)
-        .as_secs_f64() * 1000.0 / iters as f64;
-    println!("CPU  : {cpu_ms:.2} ms/token  ({:.1} tok/s)", 1000.0 / cpu_ms);
+    let cpu_ms = run_forward(&weights, None, &config, iters).as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "CPU  : {cpu_ms:.2} ms/token  ({:.1} tok/s)",
+        1000.0 / cpu_ms
+    );
     println!();
 
     // ── GPU ───────────────────────────────────────────────────────────────────
@@ -163,9 +172,12 @@ fn main() {
     println!("Warming up GPU ({warmup} iters)...");
     run_forward(&weights, Some(&gpu_ctx), &config, warmup);
     println!("Timing GPU ({iters} iters)...");
-    let gpu_ms = run_forward(&weights, Some(&gpu_ctx), &config, iters)
-        .as_secs_f64() * 1000.0 / iters as f64;
-    println!("GPU  : {gpu_ms:.2} ms/token  ({:.1} tok/s)", 1000.0 / gpu_ms);
+    let gpu_ms =
+        run_forward(&weights, Some(&gpu_ctx), &config, iters).as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "GPU  : {gpu_ms:.2} ms/token  ({:.1} tok/s)",
+        1000.0 / gpu_ms
+    );
     println!();
 
     // ── summary ───────────────────────────────────────────────────────────────
@@ -179,7 +191,10 @@ fn main() {
 
     let dispatches = config.num_hidden_layers * 7 + 1;
     println!("Architecture");
-    println!("  {} dispatches/token  ({} layers × 7 projections + 1 lm_head)", dispatches, config.num_hidden_layers);
+    println!(
+        "  {} dispatches/token  ({} layers × 7 projections + 1 lm_head)",
+        dispatches, config.num_hidden_layers
+    );
     println!("  RMS-norm, RoPE, attention, SwiGLU remain on CPU.");
     println!("  Each dispatch: write_buffer → workgroup kernel → copy → map_async → poll.");
     println!("  On Apple Silicon all steps operate in unified physical memory.");

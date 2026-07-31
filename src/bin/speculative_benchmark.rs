@@ -83,9 +83,7 @@ fn main() -> anyhow::Result<()> {
         println!("Baseline: {steps} tokens in {baseline_elapsed:.3}s => {baseline_toks_per_sec:.2} tok/s");
 
         // ---- Speculative decoding ----
-        println!(
-            "Running speculative decoding ({steps} steps, K={spec_k}, N-gram N={ngram_n})..."
-        );
+        println!("Running speculative decoding ({steps} steps, K={spec_k}, N-gram N={ngram_n})...");
         let mut allocator2 = BlockAllocator::new(total_blocks, block_size);
         let mut kv_cache2 = vec![0.0_f32; kv_cache_size];
         let mut bt2 = BlockTable::new();
@@ -151,11 +149,13 @@ fn main() -> anyhow::Result<()> {
         println!("\n=== Speculative Decoding Benchmark Results ===");
         println!(
             "{:<35} {:>12}",
-            "Baseline tok/s:", format!("{baseline_toks_per_sec:.2}")
+            "Baseline tok/s:",
+            format!("{baseline_toks_per_sec:.2}")
         );
         println!(
             "{:<35} {:>12}",
-            "Speculative tok/s:", format!("{spec_toks_per_sec:.2}")
+            "Speculative tok/s:",
+            format!("{spec_toks_per_sec:.2}")
         );
         println!(
             "{:<35} {:>12}",
@@ -167,19 +167,15 @@ fn main() -> anyhow::Result<()> {
         );
         println!(
             "{:<35} {:>12}",
-            "Acceptance rate:", format!("{:.2}%", acceptance_rate * 100.0)
+            "Acceptance rate:",
+            format!("{:.2}%", acceptance_rate * 100.0)
         );
+        println!("{:<35} {:>12}", "N-gram K:", spec_k);
+        println!("{:<35} {:>12}", "N-gram N:", ngram_n);
         println!(
             "{:<35} {:>12}",
-            "N-gram K:", spec_k
-        );
-        println!(
-            "{:<35} {:>12}",
-            "N-gram N:", ngram_n
-        );
-        println!(
-            "{:<35} {:>12}",
-            "Theoretical max speedup (batched):", format!("{theoretical_speedup:.2}x")
+            "Theoretical max speedup (batched):",
+            format!("{theoretical_speedup:.2}x")
         );
         println!(
             "\nNote: theoretical speedup = 1 + acceptance_rate * K = {:.2}x",

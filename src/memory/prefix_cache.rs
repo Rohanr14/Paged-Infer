@@ -229,7 +229,11 @@ mod tests {
 
         assert!(cache.lookup(42).is_none());
         cache.insert(42, block, &mut allocator);
-        assert_eq!(allocator.ref_count(block), 2, "cache should hold a reference");
+        assert_eq!(
+            allocator.ref_count(block),
+            2,
+            "cache should hold a reference"
+        );
         assert_eq!(cache.lookup(42), Some(block));
 
         let stats = cache.stats();
@@ -247,7 +251,11 @@ mod tests {
         // The producing sequence finishes and drops its reference.
         allocator.free(block);
         assert_eq!(allocator.ref_count(block), 1);
-        assert_eq!(allocator.available_blocks(), 1, "block must not be reclaimed");
+        assert_eq!(
+            allocator.available_blocks(),
+            1,
+            "block must not be reclaimed"
+        );
         assert_eq!(cache.lookup(1), Some(block));
     }
 

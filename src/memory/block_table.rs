@@ -37,7 +37,8 @@ impl BlockTable {
 
     /// Appends a new physical block to the sequence's mapping.
     pub fn append_block(&mut self, physical_block: PhysicalBlock) {
-        self.logical_to_physical.push(BlockSlot::fresh(physical_block));
+        self.logical_to_physical
+            .push(BlockSlot::fresh(physical_block));
     }
 
     /// Appends a slot carrying prefix-cache provenance.

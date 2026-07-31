@@ -1,7 +1,7 @@
 use anyhow::Result;
 use memmap2::MmapOptions;
-use paged_infer::memory::kv_cache_manager::KvCacheManager;
 use paged_infer::memory::block_table::BlockTable;
+use paged_infer::memory::kv_cache_manager::KvCacheManager;
 use paged_infer::memory::layout::KvLayout;
 use paged_infer::model::{ForwardScratch, LlamaConfig, LlamaWeights, ModelLoader};
 use paged_infer::sampling::Sampler;
@@ -275,13 +275,8 @@ impl<'a> Engine<'a> {
             // Forked siblings map the same partial block. Split it before
             // writing, so one sample cannot corrupt another's KV state.
             let mut table = std::mem::take(&mut self.active_batch[idx].block_table);
-            self.kv.ensure_writable(
-                seq_id,
-                &mut table,
-                pos,
-                &mut self.kv_cache,
-                &self.layout,
-            );
+            self.kv
+                .ensure_writable(seq_id, &mut table, pos, &mut self.kv_cache, &self.layout);
             self.active_batch[idx].block_table = table;
 
             let current_token = *self.active_batch[idx].token_ids.last().unwrap();
@@ -349,7 +344,10 @@ impl<'a> Engine<'a> {
         let prefix = self.kv.prefix_stats();
         let s = &self.stats;
         let recomputed = s.prompt_tokens_prefilled;
-        println!("\nEngine run completed in {elapsed:.2?} over {} steps.", s.steps);
+        println!(
+            "\nEngine run completed in {elapsed:.2?} over {} steps.",
+            s.steps
+        );
         println!(
             "  prompt tokens        : {} ({recomputed} prefilled, {} served from cache)",
             s.prompt_tokens,

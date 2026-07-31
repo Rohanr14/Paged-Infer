@@ -13,10 +13,10 @@ use wgpu::util::DeviceExt;
 // ── GPU pipeline context ──────────────────────────────────────────────────────
 
 pub struct GpuContext {
-    pub device:       wgpu::Device,
-    pub queue:        wgpu::Queue,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
     pub(crate) pipeline: wgpu::ComputePipeline,
-    pub(crate) bgl:      wgpu::BindGroupLayout,
+    pub(crate) bgl: wgpu::BindGroupLayout,
 }
 
 impl GpuContext {
@@ -48,9 +48,7 @@ impl GpuContext {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/matvec.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/matvec.wgsl").into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -99,24 +97,27 @@ impl GpuContext {
             ],
         });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
 
-        let pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("matvec"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matvec"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
 
-        Some(Self { device, queue, pipeline, bgl })
+        Some(Self {
+            device,
+            queue,
+            pipeline,
+            bgl,
+        })
     }
 }
 
@@ -136,21 +137,25 @@ pub struct GpuLinear {
     pub cols: usize,
     // kept alive so the bind_group reference stays valid
     _weight_buf: wgpu::Buffer,
-    _dims_buf:   wgpu::Buffer,
-    x_buf:       wgpu::Buffer,
-    output_buf:  wgpu::Buffer,
+    _dims_buf: wgpu::Buffer,
+    x_buf: wgpu::Buffer,
+    output_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
-    bind_group:  wgpu::BindGroup,
+    bind_group: wgpu::BindGroup,
 }
 
 impl GpuLinear {
     /// Upload `weight` (rows × cols f32 values) to a GPU storage buffer and
     /// prepare per-call buffers.  `cols` must be divisible by 4.
     pub fn new(ctx: &GpuContext, rows: usize, cols: usize, weight: &[f32]) -> Self {
-        assert!(cols % 4 == 0, "cols must be divisible by 4 for vec4 matvec shader");
+        assert!(
+            cols.is_multiple_of(4),
+            "cols must be divisible by 4 for vec4 matvec shader"
+        );
 
-        let weight_buf =
-            ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let weight_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("gpu_linear_weight"),
                 contents: bytemuck::cast_slice(weight),
                 usage: wgpu::BufferUsages::STORAGE,
@@ -177,9 +182,13 @@ impl GpuLinear {
             mapped_at_creation: false,
         });
 
-        let dims = ShaderDims { rows: rows as u32, cols: cols as u32 };
-        let dims_buf =
-            ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let dims = ShaderDims {
+            rows: rows as u32,
+            cols: cols as u32,
+        };
+        let dims_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("gpu_linear_dims"),
                 contents: bytemuck::bytes_of(&dims),
                 usage: wgpu::BufferUsages::UNIFORM,
@@ -224,26 +233,27 @@ impl GpuLinear {
     /// available in `out`.
     pub fn apply(&self, ctx: &GpuContext, out: &mut [f32], x: &[f32]) {
         // Stream the input vector.
-        ctx.queue.write_buffer(&self.x_buf, 0, bytemuck::cast_slice(x));
+        ctx.queue
+            .write_buffer(&self.x_buf, 0, bytemuck::cast_slice(x));
 
         // Dispatch: one workgroup per output row, 256 threads per workgroup.
-        let mut encoder = ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor::default(),
-        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut pass = encoder.begin_compute_pass(
-                &wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                },
-            );
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
             pass.set_pipeline(&ctx.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(self.rows as u32, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
-            &self.output_buf, 0,
-            &self.staging_buf, 0,
+            &self.output_buf,
+            0,
+            &self.staging_buf,
+            0,
             (self.rows * 4) as u64,
         );
         ctx.queue.submit(std::iter::once(encoder.finish()));
@@ -253,7 +263,10 @@ impl GpuLinear {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
         ctx.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
             .ok();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();

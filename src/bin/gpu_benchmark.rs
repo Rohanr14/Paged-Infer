@@ -207,8 +207,7 @@ async fn run() {
 
     // ── warmup ────────────────────────────────────────────────────────────────
     for _ in 0..warmup {
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
@@ -220,16 +219,17 @@ async fn run() {
         }
         queue.submit(std::iter::once(encoder.finish()));
     }
-    device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    }).ok();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
 
     // ── timed GPU iterations ──────────────────────────────────────────────────
     let t_gpu = Instant::now();
     for _ in 0..iters {
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
@@ -241,10 +241,12 @@ async fn run() {
         }
         queue.submit(std::iter::once(encoder.finish()));
     }
-    device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    }).ok();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
     let gpu_compute_total = t_gpu.elapsed().as_secs_f64();
 
     // ── one final run with readback for correctness check ────────────────────
@@ -264,10 +266,12 @@ async fn run() {
     let slice = staging_buf.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    }).ok();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
     rx.recv().unwrap().unwrap();
     let data = slice.get_mapped_range();
     let gpu_out: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -300,7 +304,11 @@ async fn run() {
     println!(
         "Correctness: max |CPU - GPU| = {:.2e}  {}",
         max_err,
-        if max_err < 1e-2 { "✓" } else { "✗ (check kernel)" }
+        if max_err < 1e-2 {
+            "✓"
+        } else {
+            "✗ (check kernel)"
+        }
     );
     println!();
     println!("Note: GPU time excludes readback (weights stay on GPU in production).");

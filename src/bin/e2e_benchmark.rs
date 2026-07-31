@@ -53,10 +53,13 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
-    let attention_window: usize = std::env::var("BENCH_WINDOW")
+    // Unset or 0 means full causal attention, which is what the model
+    // specifies. A window is an explicit accuracy-for-latency trade, so it has
+    // to be asked for rather than applied by default.
+    let attention_window: Option<usize> = std::env::var("BENCH_WINDOW")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|w| *w > 0);
     let block_size = 16;
     let total_blocks = 1024;
 
@@ -70,8 +73,10 @@ fn main() -> anyhow::Result<()> {
     let file = File::open(&model_path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let loader = ModelLoader::new(&mmap)?;
-    let mut config = LlamaConfig::default();
-    config.attention_window = Some(attention_window);
+    let config = LlamaConfig {
+        attention_window,
+        ..LlamaConfig::default()
+    };
     let weights = loader.load_weights(&config)?;
 
     let head_dim = config.hidden_size / config.num_attention_heads;
@@ -122,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             tokens[i] = next;
             positions[i] += 1;
 
-            if positions[i] % block_size == 0 {
+            if positions[i].is_multiple_of(block_size) {
                 if let Some(pb) = allocator.allocate() {
                     block_tables[i].append_block(pb);
                 }
@@ -138,7 +143,8 @@ fn main() -> anyhow::Result<()> {
 
     println!("E2E benchmark complete");
     println!(
-        "batch_size={batch_size}, steps={steps}, attention_window={attention_window}, total_tokens={}",
+        "batch_size={batch_size}, steps={steps}, attention_window={}, total_tokens={}",
+        attention_window.map_or("full".to_string(), |w| w.to_string()),
         total_tokens as usize
     );
     println!("throughput_tok_s={:.2}", total_tokens / elapsed.max(1e-9));

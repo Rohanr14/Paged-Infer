@@ -124,7 +124,9 @@ fn compare(actual: &[f32], expected: &[f32], vocab: usize) -> (f32, usize) {
 fn test_incremental_decode_matches_reference() {
     let fx = load_fixture();
     let loader = ModelLoader::new(&fx.weights).expect("parse fixture safetensors");
-    let weights = loader.load_weights(&fx.config).expect("load fixture weights");
+    let weights = loader
+        .load_weights(&fx.config)
+        .expect("load fixture weights");
 
     let total_blocks = 8;
     let mut allocator = BlockAllocator::new(total_blocks, BLOCK_SIZE);
@@ -153,7 +155,10 @@ fn test_incremental_decode_matches_reference() {
 
     let (max_abs, argmax_mismatch) = compare(&actual, &fx.golden, fx.config.vocab_size);
     println!("incremental decode: max|delta|={max_abs:.6}, argmax mismatches={argmax_mismatch}");
-    assert_eq!(argmax_mismatch, 0, "greedy token choice diverged from reference");
+    assert_eq!(
+        argmax_mismatch, 0,
+        "greedy token choice diverged from reference"
+    );
     assert!(
         max_abs < 5e-4,
         "logits diverged from reference: max|delta|={max_abs}"
@@ -167,7 +172,9 @@ fn test_incremental_decode_matches_reference() {
 fn test_prefill_matches_reference() {
     let fx = load_fixture();
     let loader = ModelLoader::new(&fx.weights).expect("parse fixture safetensors");
-    let weights = loader.load_weights(&fx.config).expect("load fixture weights");
+    let weights = loader
+        .load_weights(&fx.config)
+        .expect("load fixture weights");
 
     let total_blocks = 8;
     let mut allocator = BlockAllocator::new(total_blocks, BLOCK_SIZE);
@@ -192,7 +199,10 @@ fn test_prefill_matches_reference() {
     let expected = &fx.golden[(fx.tokens.len() - 1) * vocab..];
     let (max_abs, argmax_mismatch) = compare(&logits, expected, vocab);
     println!("prefill: max|delta|={max_abs:.6}");
-    assert_eq!(argmax_mismatch, 0, "greedy token choice diverged from reference");
+    assert_eq!(
+        argmax_mismatch, 0,
+        "greedy token choice diverged from reference"
+    );
     assert!(
         max_abs < 5e-4,
         "prefill logits diverged from reference: max|delta|={max_abs}"
@@ -206,7 +216,9 @@ fn test_prefill_matches_reference() {
 fn test_split_prefill_matches_whole_prefill() {
     let fx = load_fixture();
     let loader = ModelLoader::new(&fx.weights).expect("parse fixture safetensors");
-    let weights = loader.load_weights(&fx.config).expect("load fixture weights");
+    let weights = loader
+        .load_weights(&fx.config)
+        .expect("load fixture weights");
 
     let total_blocks = 8;
     let split = 16; // a block boundary, as the prefix cache would produce

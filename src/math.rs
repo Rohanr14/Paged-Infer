@@ -53,15 +53,13 @@ pub fn matvec_bf16_weight_transposed(
     assert_eq!(out.len(), rows);
     assert_eq!(weight_bf16.len(), rows * cols * 2);
 
-    for r in 0..rows {
-        let mut acc = 0.0;
-        let row_offset = r * cols * 2;
-        for c in 0..cols {
-            let idx = row_offset + c * 2;
-            let w = half::bf16::from_le_bytes([weight_bf16[idx], weight_bf16[idx + 1]]).to_f32();
-            acc += x[c] * w;
-        }
-        out[r] = acc;
+    for (r, out_r) in out.iter_mut().enumerate() {
+        let row = &weight_bf16[r * cols * 2..(r + 1) * cols * 2];
+        *out_r = row
+            .chunks_exact(2)
+            .zip(x.iter())
+            .map(|(b, xv)| half::bf16::from_le_bytes([b[0], b[1]]).to_f32() * xv)
+            .sum();
     }
 }
 
@@ -82,16 +80,16 @@ pub fn matvec_f32_weight_transposed(
     assert_eq!(x.len(), cols);
     assert_eq!(out.len(), rows);
     assert_eq!(weight.len(), rows * cols);
-    for r in 0..rows {
-        let mut acc = 0.0;
-        let base = r * cols;
-        for c in 0..cols {
-            acc += x[c] * weight[base + c];
-        }
-        out[r] = acc;
+    for (r, out_r) in out.iter_mut().enumerate() {
+        *out_r = crate::simd::dot_naive(&weight[r * cols..(r + 1) * cols], x);
     }
 }
 
+/// Row-parallel matvec against a pre-packed f32 weight matrix.
+///
+/// Two levels of parallelism: Rayon splits the output rows across cores, and
+/// each row's inner product runs on a vector kernel (AVX2+FMA / NEON, see
+/// [`crate::simd`]).
 pub fn matvec_f32_weight_transposed_parallel(
     out: &mut [f32],
     x: &[f32],
@@ -103,13 +101,30 @@ pub fn matvec_f32_weight_transposed_parallel(
     assert_eq!(out.len(), rows);
     assert_eq!(weight.len(), rows * cols);
 
+    // Resolve the kernel once, outside the row loop, rather than re-checking
+    // CPU features per row.
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::available() {
+        out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+            let base = r * cols;
+            *out_r = unsafe { crate::simd::x86::dot(&weight[base..base + cols], x) };
+        });
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+            let base = r * cols;
+            *out_r = unsafe { crate::simd::neon::dot(&weight[base..base + cols], x) };
+        });
+        return;
+    }
+
+    #[allow(unreachable_code)]
     out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-        let mut acc = 0.0;
         let base = r * cols;
-        for c in 0..cols {
-            acc += x[c] * weight[base + c];
-        }
-        *out_r = acc;
+        *out_r = crate::simd::dot_scalar(&weight[base..base + cols], x);
     });
 }
 
@@ -212,19 +227,18 @@ pub fn apply_rope(
     rope_rotate(k, &cos, &sin, style);
 }
 
+/// Inner product, dispatched to the best kernel for this CPU.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot product dimensions must match");
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    crate::simd::dot(a, b)
 }
 
 /// `out += weight * v`, the attention value accumulation.
 #[inline]
 pub fn axpy(out: &mut [f32], weight: f32, v: &[f32]) {
     debug_assert_eq!(out.len(), v.len());
-    for (o, x) in out.iter_mut().zip(v.iter()) {
-        *o += weight * x;
-    }
+    crate::simd::axpy(out, weight, v);
 }
 
 pub fn softmax_in_place(x: &mut [f32]) {
@@ -308,14 +322,31 @@ pub fn matvec_i8_weight_parallel(
     assert_eq!(weight.len(), rows * cols);
     assert_eq!(scales.len(), rows);
 
+    // Dequantization folds into the per-row scale applied once at the end,
+    // rather than per element inside the accumulation loop.
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::available() {
+        out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+            let base = r * cols;
+            *out_r = unsafe { crate::simd::x86::dot_i8(&weight[base..base + cols], x) } * scales[r];
+        });
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+            let base = r * cols;
+            *out_r =
+                unsafe { crate::simd::neon::dot_i8(&weight[base..base + cols], x) } * scales[r];
+        });
+        return;
+    }
+
+    #[allow(unreachable_code)]
     out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
         let base = r * cols;
-        let scale = scales[r];
-        let mut acc = 0.0_f32;
-        for c in 0..cols {
-            acc += weight[base + c] as f32 * x[c];
-        }
-        *out_r = acc * scale;
+        *out_r = crate::simd::dot_i8_scalar(&weight[base..base + cols], x) * scales[r];
     });
 }
 

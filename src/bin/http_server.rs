@@ -70,10 +70,8 @@ fn main() -> anyhow::Result<()> {
     println!("Paged-Infer demo server listening on http://{addr}");
     println!("Endpoints: GET /health, POST /v1/chat/completions (dry-run)");
 
-    for conn in listener.incoming() {
-        if let Ok(stream) = conn {
-            handle(stream);
-        }
+    for stream in listener.incoming().flatten() {
+        handle(stream);
     }
     Ok(())
 }

@@ -72,7 +72,10 @@ impl Sampler {
 
     /// Pick the next token. `logits` is consumed as scratch.
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
-        assert!(!logits.is_empty(), "cannot sample from an empty distribution");
+        assert!(
+            !logits.is_empty(),
+            "cannot sample from an empty distribution"
+        );
 
         if self.temperature <= 0.0 {
             return argmax(logits) as u32;
@@ -168,7 +171,7 @@ mod tests {
         let draw = |seed| {
             let mut s = Sampler::new(1.0, 1.0, 0, seed);
             (0..32)
-                .map(|_| s.sample(&mut vec![1.0, 2.0, 3.0, 0.5]))
+                .map(|_| s.sample(&mut [1.0, 2.0, 3.0, 0.5]))
                 .collect::<Vec<_>>()
         };
         assert_eq!(draw(11), draw(11));
@@ -181,7 +184,7 @@ mod tests {
         let mut s = Sampler::new(1.0, 1.0, 0, 3);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            seen.insert(s.sample(&mut vec![1.0, 1.0, 1.0, 1.0]));
+            seen.insert(s.sample(&mut [1.0, 1.0, 1.0, 1.0]));
         }
         assert!(seen.len() > 1, "uniform logits should reach several tokens");
     }
@@ -192,7 +195,7 @@ mod tests {
         // reach the others.
         let mut s = Sampler::new(1.0, 0.9, 0, 5);
         for _ in 0..200 {
-            assert_eq!(s.sample(&mut vec![10.0, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(s.sample(&mut [10.0, 0.0, 0.0, 0.0]), 0);
         }
     }
 
@@ -202,7 +205,7 @@ mod tests {
         let mut s = Sampler::new(1.0, 1.0, 0, 99);
         let mut hits = [0_u32; 2];
         for _ in 0..20_000 {
-            hits[s.sample(&mut vec![3.0_f32.ln(), 1.0_f32.ln()]) as usize] += 1;
+            hits[s.sample(&mut [3.0_f32.ln(), 1.0_f32.ln()]) as usize] += 1;
         }
         let ratio = hits[0] as f64 / (hits[0] + hits[1]) as f64;
         assert!((ratio - 0.75).abs() < 0.02, "got {ratio}");

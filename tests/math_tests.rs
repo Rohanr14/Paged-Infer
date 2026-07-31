@@ -81,7 +81,14 @@ fn test_apply_rope_interleaved() {
     let head_dim = 4;
     let rope_theta = 10000.0;
 
-    apply_rope(&mut q, &mut k, pos, head_dim, rope_theta, RopeStyle::Interleaved);
+    apply_rope(
+        &mut q,
+        &mut k,
+        pos,
+        head_dim,
+        rope_theta,
+        RopeStyle::Interleaved,
+    );
 
     // Pair 0 (dims 0,1): freq = 1.0. val = 1.0. sin=0.84147, cos=0.54030
     // q[0] = 1*cos - 0*sin = 0.54030
@@ -131,7 +138,10 @@ fn test_rope_conventions_are_not_interchangeable() {
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f32, f32::max);
-    assert!(spread > 0.1, "conventions should differ materially, got {spread}");
+    assert!(
+        spread > 0.1,
+        "conventions should differ materially, got {spread}"
+    );
 }
 
 #[test]
@@ -232,19 +242,16 @@ fn test_quantize_rows_i8_roundtrip() {
         .map(|i| ((i as f32) / (rows * cols) as f32) * 2.0 - 1.0)
         .collect();
 
-    let max_abs = weight
-        .iter()
-        .map(|x| x.abs())
-        .fold(0.0_f32, f32::max);
+    let max_abs = weight.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
 
     let (quant, scales) = quantize_rows_i8(&weight, rows, cols);
 
     // Dequantize manually and check round-trip error
     let epsilon = 0.01 * max_abs;
-    for r in 0..rows {
+    for (r, &scale) in scales.iter().enumerate() {
         for c in 0..cols {
             let idx = r * cols + c;
-            let dequant = quant[idx] as f32 * scales[r];
+            let dequant = quant[idx] as f32 * scale;
             assert!(
                 (dequant - weight[idx]).abs() < epsilon.max(1e-4),
                 "Roundtrip error too large at [{r},{c}]: original={}, dequant={}, diff={}",
