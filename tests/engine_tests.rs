@@ -36,8 +36,15 @@ fn fixture() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         rope_style: Default::default(),
         quantization: Default::default(),
     };
-    let tokens = kv["tokens"].split(',').map(|t| t.parse().unwrap()).collect();
-    (config, tokens, std::fs::read(dir.join("tiny_llama.safetensors")).unwrap())
+    let tokens = kv["tokens"]
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    (
+        config,
+        tokens,
+        std::fs::read(dir.join("tiny_llama.safetensors")).unwrap(),
+    )
 }
 
 fn engine_config() -> EngineConfig {
@@ -270,7 +277,10 @@ fn test_queued_requests_wait_for_memory_then_run() {
         "requests should not be truncated by memory pressure: {:?}",
         out.iter().map(|c| c.tokens.len()).collect::<Vec<_>>()
     );
-    assert!(engine.stats().steps > 1, "admission should have been staged");
+    assert!(
+        engine.stats().steps > 1,
+        "admission should have been staged"
+    );
 }
 
 #[test]
@@ -354,7 +364,10 @@ fn test_int8_weights_shrink_the_model_and_track_f32_output() {
         .zip(quantized.iter())
         .take_while(|(a, b)| a == b)
         .count();
-    println!("greedy tokens matching before divergence: {agree}/{}", baseline.len());
+    println!(
+        "greedy tokens matching before divergence: {agree}/{}",
+        baseline.len()
+    );
     assert!(
         agree >= baseline.len() / 2,
         "int8 diverged too early: {baseline:?} vs {quantized:?}"

@@ -32,7 +32,9 @@ impl Workload {
         };
         Self {
             system: tok(1_000, system_tokens),
-            documents: (0..docs).map(|d| tok(100_000 + d as u32 * 1_000, doc_tokens)).collect(),
+            documents: (0..docs)
+                .map(|d| tok(100_000 + d as u32 * 1_000, doc_tokens))
+                .collect(),
             requests,
             user_tokens: 48,
         }
@@ -136,14 +138,20 @@ fn main() {
     println!("Workload");
     println!("--------");
     println!("  {} requests", workload.requests);
-    println!("  {} token system prompt on every request", workload.system.len());
+    println!(
+        "  {} token system prompt on every request",
+        workload.system.len()
+    );
     println!(
         "  {} retrieved documents of {} tokens, round-robin",
         workload.documents.len(),
         workload.documents[0].len()
     );
     println!("  {} unique user tokens per request", workload.user_tokens);
-    println!("  {} prompt tokens in total", workload.total_prompt_tokens());
+    println!(
+        "  {} prompt tokens in total",
+        workload.total_prompt_tokens()
+    );
     println!();
 
     let cold = simulate(&workload, total_blocks, false);

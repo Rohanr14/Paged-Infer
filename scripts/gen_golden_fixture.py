@@ -260,6 +260,25 @@ def main() -> None:
     with open(os.path.join(FIXTURE_DIR, "tiny_llama_meta.txt"), "w") as f:
         f.write("\n".join(meta) + "\n")
 
+    # A HuggingFace-shaped config.json, so the fixture loads through the same
+    # LlamaConfig::from_hf_config path a real checkpoint does.
+    hf_config = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": LAYERS,
+        "num_attention_heads": HEADS,
+        "num_key_value_heads": KV_HEADS,
+        "intermediate_size": INTERMEDIATE,
+        "vocab_size": VOCAB,
+        "rms_norm_eps": EPS,
+        "rope_theta": THETA,
+        "torch_dtype": "bfloat16",
+    }
+    with open(os.path.join(FIXTURE_DIR, "config.json"), "w") as f:
+        json.dump(hf_config, f, indent=2)
+        f.write("\n")
+
     print(f"wrote fixtures to {os.path.normpath(FIXTURE_DIR)}")
     print(f"  tokens          : {list(int(t) for t in tokens)}")
     print(f"  logits          : {logits.shape}, range [{logits.min():.4f}, {logits.max():.4f}]")

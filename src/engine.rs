@@ -104,6 +104,8 @@ struct Request {
     tokens: Vec<u32>,
     max_tokens: usize,
     num_samples: usize,
+    /// Overrides the engine default when set.
+    temperature: Option<f32>,
 }
 
 struct Sequence {
@@ -194,6 +196,19 @@ impl<'a> Engine<'a> {
         max_tokens: usize,
         num_samples: usize,
     ) -> usize {
+        self.submit_tokens_with(tokens, max_tokens, num_samples, None)
+    }
+
+    /// [`Engine::submit_tokens`] with a per-request sampling temperature.
+    /// `None` uses the engine default. A server needs this: temperature is a
+    /// property of the request, not of the engine.
+    pub fn submit_tokens_with(
+        &mut self,
+        tokens: Vec<u32>,
+        max_tokens: usize,
+        num_samples: usize,
+        temperature: Option<f32>,
+    ) -> usize {
         assert!(!tokens.is_empty(), "cannot generate from an empty prompt");
         let id = self.next_request_id;
         self.next_request_id += 1;
@@ -206,6 +221,7 @@ impl<'a> Engine<'a> {
             tokens,
             max_tokens,
             num_samples: num_samples.max(1),
+            temperature,
         });
         id
     }
@@ -224,6 +240,20 @@ impl<'a> Engine<'a> {
 
     pub fn decode_text(&self, tokens: &[u32]) -> Option<String> {
         self.tokenizer.as_ref()?.decode(tokens, true).ok()
+    }
+
+    /// True while anything is queued or running.
+    pub fn has_work(&self) -> bool {
+        !self.waiting.is_empty() || !self.active.is_empty()
+    }
+
+    /// Take the completions finished since the last call.
+    ///
+    /// This is what lets a server interleave: submit whenever a client
+    /// connects, `step()` continuously, and hand back each completion as it
+    /// lands, rather than waiting for the whole batch to drain.
+    pub fn take_completed(&mut self) -> Vec<Completion> {
+        std::mem::take(&mut self.completed)
     }
 
     /// Drain both queues, returning every completion in finish order.
@@ -305,10 +335,11 @@ impl<'a> Engine<'a> {
                 // Siblings need distinct seeds, and greedy siblings would all
                 // replay the same continuation, so multi-sample requests get a
                 // non-zero temperature by default.
-                let temperature = if req.num_samples > 1 && self.engine.temperature <= 0.0 {
+                let requested = req.temperature.unwrap_or(self.engine.temperature);
+                let temperature = if req.num_samples > 1 && requested <= 0.0 {
                     0.8
                 } else {
-                    self.engine.temperature
+                    requested
                 };
                 let mut sampler = Sampler::new(
                     temperature,

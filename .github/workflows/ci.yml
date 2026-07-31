@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both SIMD backends get exercised: ubuntu is x86_64 (AVX2+FMA),
+        # macos-14 is Apple Silicon (NEON). A kernel that only works on the
+        # machine it was written on is caught here.
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --release --all-targets
+
+      - name: Report the SIMD backend actually selected
+        run: cargo test --release --test simd_tests test_reports_a_backend -- --nocapture
+
+  golden-fixture:
+    name: golden fixture is reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install numpy
+
+      # The committed fixture is the reference the whole test suite trusts.
+      # Regenerating it must reproduce the same bytes, or the reference has
+      # drifted from the generator that documents it.
+      - name: Regenerate and diff
+        run: |
+          python3 scripts/gen_golden_fixture.py
+          git diff --exit-code -- tests/fixtures/
+
+  benchmarks:
+    name: benchmarks run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Neither needs model weights, so both are smoke-testable in CI. Timings
+      # from a shared runner are noise; this checks they still run and report.
+      - name: Kernel microbenchmark
+        run: cargo run --release --bin benchmark
+
+      - name: Prefix cache benchmark
+        run: cargo run --release --bin prefix_cache_benchmark

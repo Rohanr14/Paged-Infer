@@ -17,7 +17,8 @@ fn main() -> Result<()> {
     let model_path = std::env::var("MODEL_PATH")
         .unwrap_or_else(|_| "models/tinyllama-1.1b/model.safetensors".to_string());
 
-    if !std::path::Path::new(&tokenizer_path).exists() || !std::path::Path::new(&model_path).exists()
+    if !std::path::Path::new(&tokenizer_path).exists()
+        || !std::path::Path::new(&model_path).exists()
     {
         println!("Model weights not found.");
         println!("  MODEL_PATH     = {model_path}");
@@ -44,7 +45,7 @@ fn main() -> Result<()> {
     };
     let config = LlamaConfig {
         quantization,
-        ..LlamaConfig::default()
+        ..LlamaConfig::beside_checkpoint(&model_path)
     };
     let weights = loader.load_weights(&config)?;
     println!(
@@ -64,8 +65,7 @@ fn main() -> Result<()> {
         block_size: 16,
         ..EngineConfig::default()
     };
-    let mut engine =
-        Engine::new(weights, config, engine_config).with_tokenizer(tokenizer);
+    let mut engine = Engine::new(weights, config, engine_config).with_tokenizer(tokenizer);
     println!(
         "KV cache: {:.2} MB across {} blocks of 16 tokens.\n",
         engine.kv_cache_bytes() as f64 / 1_048_576.0,
@@ -111,7 +111,11 @@ fn main() -> Result<()> {
 
     let s = engine.stats();
     let prefix = engine.prefix_stats();
-    println!("Completed {} sequences in {elapsed:.2?} over {} steps.", completions.len(), s.steps);
+    println!(
+        "Completed {} sequences in {elapsed:.2?} over {} steps.",
+        completions.len(),
+        s.steps
+    );
     println!(
         "  prompt tokens     : {} total, {} prefilled, {} reused from cache",
         s.prompt_tokens,

@@ -54,6 +54,55 @@ impl Default for LlamaConfig {
 }
 
 impl LlamaConfig {
+    /// Read the architecture from a HuggingFace `config.json`.
+    ///
+    /// Every HF checkpoint ships one next to `model.safetensors`, so the shape
+    /// of the model should come from the checkpoint rather than from a
+    /// hardcoded default that silently mismatches — the failure mode otherwise
+    /// is a missing-tensor error at load, or worse, a wrong-shaped load that
+    /// runs and produces noise.
+    ///
+    /// Fields absent from the file keep their [`Default`] value.
+    pub fn from_hf_config(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+
+        let default = Self::default();
+        let usize_at = |key: &str, fallback: usize| -> usize {
+            json[key].as_u64().map_or(fallback, |v| v as usize)
+        };
+        let f32_at =
+            |key: &str, fallback: f32| -> f32 { json[key].as_f64().map_or(fallback, |v| v as f32) };
+
+        let num_attention_heads = usize_at("num_attention_heads", default.num_attention_heads);
+        Ok(Self {
+            hidden_size: usize_at("hidden_size", default.hidden_size),
+            num_hidden_layers: usize_at("num_hidden_layers", default.num_hidden_layers),
+            num_attention_heads,
+            // Multi-head checkpoints omit this; it then equals the query heads.
+            num_key_value_heads: usize_at("num_key_value_heads", num_attention_heads),
+            intermediate_size: usize_at("intermediate_size", default.intermediate_size),
+            vocab_size: usize_at("vocab_size", default.vocab_size),
+            rms_norm_eps: f32_at("rms_norm_eps", default.rms_norm_eps),
+            rope_theta: f32_at("rope_theta", default.rope_theta),
+            // Not architecture: these are engine policy, so they keep defaults
+            // and are set by the caller.
+            attention_window: default.attention_window,
+            rope_style: default.rope_style,
+            quantization: default.quantization,
+        })
+    }
+
+    /// Load the config sitting beside a checkpoint, or fall back to defaults
+    /// when the checkpoint ships without one.
+    pub fn beside_checkpoint(model_path: impl AsRef<std::path::Path>) -> Self {
+        let candidate = model_path.as_ref().with_file_name("config.json");
+        Self::from_hf_config(&candidate).unwrap_or_default()
+    }
+
     #[inline]
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
