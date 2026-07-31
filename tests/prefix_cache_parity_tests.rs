@@ -38,6 +38,7 @@ fn load_config() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         rope_theta: kv["rope_theta"].parse().unwrap(),
         attention_window: None,
         rope_style: Default::default(),
+        quantization: Default::default(),
     };
     let tokens: Vec<u32> = kv["tokens"]
         .split(',')

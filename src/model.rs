@@ -31,6 +31,8 @@ pub struct LlamaConfig {
     /// are the model's, not the engine's.
     pub attention_window: Option<usize>,
     pub rope_style: RopeStyle,
+    /// How to store projection weights. See [`Quantization`].
+    pub quantization: Quantization,
 }
 
 impl Default for LlamaConfig {
@@ -46,6 +48,7 @@ impl Default for LlamaConfig {
             rope_theta: 10_000.0,
             attention_window: None,
             rope_style: RopeStyle::Neox,
+            quantization: Quantization::F32,
         }
     }
 }
@@ -147,6 +150,78 @@ impl QuantizedLinear {
     }
 }
 
+/// How projection weights are stored in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quantization {
+    /// Widen bf16 to f32 once at load. Fastest per element, but 2x the
+    /// checkpoint's size on disk and 4x an int8 copy.
+    #[default]
+    F32,
+    /// Per-row symmetric int8, with an f32 scale per row.
+    ///
+    /// A matvec is memory-bound, so cutting weight traffic 4x is a throughput
+    /// win as well as a footprint win — TinyLlama's projections drop from about
+    /// 4.2 GB to 1.1 GB, which is the difference between fitting in a laptop's
+    /// RAM and not.
+    Int8,
+}
+
+/// One projection matrix, in whichever representation was requested at load.
+#[derive(Debug, Clone)]
+pub enum Projection {
+    F32(PackedLinear),
+    Int8(QuantizedLinear),
+}
+
+impl Projection {
+    fn from_tensor(t: &Tensor<'_>, quantization: Quantization) -> Self {
+        let packed = PackedLinear::from_tensor(t);
+        match quantization {
+            Quantization::F32 => Projection::F32(packed),
+            Quantization::Int8 => Projection::Int8(QuantizedLinear::from_packed(&packed)),
+        }
+    }
+
+    #[inline]
+    pub fn apply_parallel(&self, out: &mut [f32], x: &[f32]) {
+        match self {
+            Projection::F32(w) => w.apply_parallel(out, x),
+            Projection::Int8(w) => w.apply_parallel(out, x),
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Projection::F32(w) => w.rows,
+            Projection::Int8(w) => w.rows,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            Projection::F32(w) => w.cols,
+            Projection::Int8(w) => w.cols,
+        }
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        match self {
+            Projection::F32(w) => w.weight.len() * std::mem::size_of::<f32>(),
+            Projection::Int8(w) => w.weight_bytes(),
+        }
+    }
+
+    /// The f32 weights, if this projection kept them. The GPU path needs them:
+    /// the WGSL kernel reads `array<vec4<f32>>`, so int8 weights would have to
+    /// be dequantized before upload, defeating the point.
+    pub fn f32_weights(&self) -> Option<&[f32]> {
+        match self {
+            Projection::F32(w) => Some(&w.weight),
+            Projection::Int8(_) => None,
+        }
+    }
+}
+
 // ── GPU-resident projection weights ──────────────────────────────────────────
 
 /// GPU copies of all seven projection matrices for one transformer layer.
@@ -170,60 +245,37 @@ pub struct GpuForwardContext {
 }
 
 impl GpuForwardContext {
-    /// Upload all projection weights to GPU.  Returns `None` if no GPU adapter
-    /// is available.
+    /// Upload every projection weight to the GPU.
+    ///
+    /// Returns `None` when there is no GPU adapter, or when the weights were
+    /// loaded as int8 — the WGSL kernel reads `array<vec4<f32>>`, so int8
+    /// weights would have to be dequantized before upload, which would cost more
+    /// host memory than the f32 path it was meant to replace. Load with
+    /// [`Quantization::F32`] to use the GPU.
     pub fn from_weights(weights: &LlamaWeights<'_>) -> Option<Self> {
         let ctx = GpuContext::new()?;
+
+        let upload = |p: &Projection| -> Option<GpuLinear> {
+            Some(GpuLinear::new(&ctx, p.rows(), p.cols(), p.f32_weights()?))
+        };
+
         let layers = weights
             .layers
             .iter()
-            .map(|l| GpuLayerWeights {
-                wq: GpuLinear::new(
-                    &ctx,
-                    l.attention.wq.rows,
-                    l.attention.wq.cols,
-                    &l.attention.wq.weight,
-                ),
-                wk: GpuLinear::new(
-                    &ctx,
-                    l.attention.wk.rows,
-                    l.attention.wk.cols,
-                    &l.attention.wk.weight,
-                ),
-                wv: GpuLinear::new(
-                    &ctx,
-                    l.attention.wv.rows,
-                    l.attention.wv.cols,
-                    &l.attention.wv.weight,
-                ),
-                wo: GpuLinear::new(
-                    &ctx,
-                    l.attention.wo.rows,
-                    l.attention.wo.cols,
-                    &l.attention.wo.weight,
-                ),
-                w1: GpuLinear::new(
-                    &ctx,
-                    l.feed_forward.w1.rows,
-                    l.feed_forward.w1.cols,
-                    &l.feed_forward.w1.weight,
-                ),
-                w2: GpuLinear::new(
-                    &ctx,
-                    l.feed_forward.w2.rows,
-                    l.feed_forward.w2.cols,
-                    &l.feed_forward.w2.weight,
-                ),
-                w3: GpuLinear::new(
-                    &ctx,
-                    l.feed_forward.w3.rows,
-                    l.feed_forward.w3.cols,
-                    &l.feed_forward.w3.weight,
-                ),
+            .map(|l| {
+                Some(GpuLayerWeights {
+                    wq: upload(&l.attention.wq)?,
+                    wk: upload(&l.attention.wk)?,
+                    wv: upload(&l.attention.wv)?,
+                    wo: upload(&l.attention.wo)?,
+                    w1: upload(&l.feed_forward.w1)?,
+                    w2: upload(&l.feed_forward.w2)?,
+                    w3: upload(&l.feed_forward.w3)?,
+                })
             })
-            .collect();
-        let lm = &weights.lm_head;
-        let lm_head = GpuLinear::new(&ctx, lm.rows, lm.cols, &lm.weight);
+            .collect::<Option<Vec<_>>>()?;
+
+        let lm_head = upload(&weights.lm_head)?;
         Some(Self {
             ctx,
             layers,
@@ -236,17 +288,17 @@ impl GpuForwardContext {
 
 #[derive(Debug, Clone)]
 pub struct AttentionWeights {
-    pub wq: PackedLinear,
-    pub wk: PackedLinear,
-    pub wv: PackedLinear,
-    pub wo: PackedLinear,
+    pub wq: Projection,
+    pub wk: Projection,
+    pub wv: Projection,
+    pub wo: Projection,
 }
 
 #[derive(Debug, Clone)]
 pub struct FeedForwardWeights {
-    pub w1: PackedLinear,
-    pub w2: PackedLinear,
-    pub w3: PackedLinear,
+    pub w1: Projection,
+    pub w2: Projection,
+    pub w3: Projection,
 }
 
 #[derive(Debug, Clone)]
@@ -262,7 +314,7 @@ pub struct LlamaWeights<'a> {
     pub token_embeddings: Tensor<'a>,
     pub layers: Vec<LayerWeights>,
     pub final_norm: Vec<f32>,
-    pub lm_head: PackedLinear,
+    pub lm_head: Projection,
 }
 
 pub struct ModelLoader<'a> {
@@ -296,19 +348,20 @@ impl<'a> ModelLoader<'a> {
             let w2 = self.tensor(&format!("{prefix}.mlp.down_proj.weight"))?;
             let w3 = self.tensor(&format!("{prefix}.mlp.up_proj.weight"))?;
 
+            let q = config.quantization;
             layers.push(LayerWeights {
                 attention_norm: pack_bf16_to_f32(attn_norm.raw_bytes()),
                 attention: AttentionWeights {
-                    wq: PackedLinear::from_tensor(&wq),
-                    wk: PackedLinear::from_tensor(&wk),
-                    wv: PackedLinear::from_tensor(&wv),
-                    wo: PackedLinear::from_tensor(&wo),
+                    wq: Projection::from_tensor(&wq, q),
+                    wk: Projection::from_tensor(&wk, q),
+                    wv: Projection::from_tensor(&wv, q),
+                    wo: Projection::from_tensor(&wo, q),
                 },
                 ffn_norm: pack_bf16_to_f32(ffn_norm.raw_bytes()),
                 feed_forward: FeedForwardWeights {
-                    w1: PackedLinear::from_tensor(&w1),
-                    w2: PackedLinear::from_tensor(&w2),
-                    w3: PackedLinear::from_tensor(&w3),
+                    w1: Projection::from_tensor(&w1, q),
+                    w2: Projection::from_tensor(&w2, q),
+                    w3: Projection::from_tensor(&w3, q),
                 },
             });
         }
@@ -317,7 +370,10 @@ impl<'a> ModelLoader<'a> {
             token_embeddings,
             layers,
             final_norm,
-            lm_head: PackedLinear::from_tensor(&lm_head_t),
+            // The LM head stays f32: it is the last projection before the
+            // softmax, so its quantization error lands directly on token
+            // choice, and it is one matrix rather than seven per layer.
+            lm_head: Projection::F32(PackedLinear::from_tensor(&lm_head_t)),
         })
     }
 
@@ -385,19 +441,42 @@ impl ForwardScratch {
 }
 
 impl<'a> LlamaWeights<'a> {
+    /// Bytes the projection weights occupy as stored.
+    pub fn weight_bytes(&self) -> usize {
+        let mut total = 0;
+        for layer in &self.layers {
+            for p in [
+                &layer.attention.wq,
+                &layer.attention.wk,
+                &layer.attention.wv,
+                &layer.attention.wo,
+                &layer.feed_forward.w1,
+                &layer.feed_forward.w2,
+                &layer.feed_forward.w3,
+            ] {
+                total += p.weight_bytes();
+            }
+        }
+        total + self.lm_head.weight_bytes()
+    }
+
+    /// What the same weights would occupy as f32, for a quantization ratio.
     pub fn weight_bytes_f32(&self) -> usize {
         let mut total = 0;
         for layer in &self.layers {
-            total += layer.attention.wq.weight.len() * 4;
-            total += layer.attention.wk.weight.len() * 4;
-            total += layer.attention.wv.weight.len() * 4;
-            total += layer.attention.wo.weight.len() * 4;
-            total += layer.feed_forward.w1.weight.len() * 4;
-            total += layer.feed_forward.w2.weight.len() * 4;
-            total += layer.feed_forward.w3.weight.len() * 4;
+            for p in [
+                &layer.attention.wq,
+                &layer.attention.wk,
+                &layer.attention.wv,
+                &layer.attention.wo,
+                &layer.feed_forward.w1,
+                &layer.feed_forward.w2,
+                &layer.feed_forward.w3,
+            ] {
+                total += p.rows() * p.cols() * 4;
+            }
         }
-        total += self.lm_head.weight.len() * 4;
-        total
+        total + self.lm_head.rows() * self.lm_head.cols() * 4
     }
 
     /// One decode step: consume `token_id` at `pos`, append its K/V to the paged

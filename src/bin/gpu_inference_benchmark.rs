@@ -16,7 +16,7 @@ use paged_infer::{
     memory::{allocator::BlockAllocator, block_table::BlockTable},
     model::{
         AttentionWeights, FeedForwardWeights, GpuForwardContext, LayerWeights, LlamaConfig,
-        LlamaWeights, PackedLinear,
+        LlamaWeights, PackedLinear, Projection,
     },
     tensor::Tensor,
 };
@@ -36,12 +36,12 @@ fn bench_config() -> LlamaConfig {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn make_packed(rows: usize, cols: usize, val: f32) -> PackedLinear {
-    PackedLinear {
+fn make_projection(rows: usize, cols: usize, val: f32) -> Projection {
+    Projection::F32(PackedLinear {
         rows,
         cols,
         weight: vec![val; rows * cols],
-    }
+    })
 }
 
 /// Build synthetic LlamaWeights for the given config.
@@ -59,16 +59,16 @@ fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
         .map(|_| LayerWeights {
             attention_norm: vec![1.0f32; h],
             attention: AttentionWeights {
-                wq: make_packed(h, h, 0.001),
-                wk: make_packed(kv, h, 0.001),
-                wv: make_packed(kv, h, 0.001),
-                wo: make_packed(h, h, 0.001),
+                wq: make_projection(h, h, 0.001),
+                wk: make_projection(kv, h, 0.001),
+                wv: make_projection(kv, h, 0.001),
+                wo: make_projection(h, h, 0.001),
             },
             ffn_norm: vec![1.0f32; h],
             feed_forward: FeedForwardWeights {
-                w1: make_packed(ff, h, 0.001),
-                w2: make_packed(h, ff, 0.001),
-                w3: make_packed(ff, h, 0.001),
+                w1: make_projection(ff, h, 0.001),
+                w2: make_projection(h, ff, 0.001),
+                w3: make_projection(ff, h, 0.001),
             },
         })
         .collect();
@@ -77,7 +77,7 @@ fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
         token_embeddings,
         layers,
         final_norm: vec![1.0f32; h],
-        lm_head: make_packed(config.vocab_size, h, 0.001),
+        lm_head: make_projection(config.vocab_size, h, 0.001),
     }
 }
 
