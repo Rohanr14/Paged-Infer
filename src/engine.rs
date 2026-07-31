@@ -21,6 +21,7 @@ use crate::memory::layout::KvLayout;
 use crate::memory::prefix_cache::PrefixCacheStats;
 use crate::model::{BatchScratch, LlamaConfig, LlamaWeights};
 use crate::sampling::Sampler;
+use crate::speculative::{verify_greedy, Drafter, PromptLookupDrafter, SpecStats};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -44,6 +45,14 @@ pub struct EngineConfig {
     /// trade as `max_batch_size`, along the position axis instead of the
     /// sequence axis.
     pub prefill_chunk_size: usize,
+    /// Draft tokens to propose per step. `0` disables speculative decoding.
+    ///
+    /// Only greedy sequences speculate: acceptance is defined as "the model
+    /// would have chosen this token", which is exactly greedy. A sampled
+    /// sequence would need the rejection-sampling correction to stay
+    /// distributionally faithful, so it takes the ordinary path instead of a
+    /// subtly wrong shortcut.
+    pub draft_tokens: usize,
 }
 
 impl Default for EngineConfig {
@@ -60,6 +69,7 @@ impl Default for EngineConfig {
             enable_prefix_cache: true,
             max_batch_size: 32,
             prefill_chunk_size: 32,
+            draft_tokens: 0,
         }
     }
 }
@@ -130,6 +140,19 @@ struct Sequence {
     sampler: Sampler,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
+    /// Present only when this sequence speculates.
+    drafter: Option<Box<dyn Drafter>>,
+}
+
+/// One sequence's contribution to a decode step: the token it already holds,
+/// plus whatever its drafter guessed comes next.
+struct SpecGroup {
+    seq_idx: usize,
+    /// `[held_token, draft_0, ..]` — what the model is asked to process.
+    tokens: Vec<u32>,
+    positions: Vec<usize>,
+    /// `tokens[1..]`, kept separately because verification only concerns these.
+    drafts: Vec<u32>,
 }
 
 pub struct Engine<'a> {
@@ -148,6 +171,7 @@ pub struct Engine<'a> {
     next_sequence_id: usize,
     tick: u64,
     stats: RunStats,
+    spec: SpecStats,
 }
 
 impl<'a> Engine<'a> {
@@ -175,6 +199,7 @@ impl<'a> Engine<'a> {
             next_sequence_id: 0,
             tick: 0,
             stats: RunStats::default(),
+            spec: SpecStats::default(),
         }
     }
 
@@ -197,6 +222,30 @@ impl<'a> Engine<'a> {
 
     pub fn cow_copies(&self) -> u64 {
         self.kv.cow_copies()
+    }
+
+    pub fn spec_stats(&self) -> SpecStats {
+        self.spec
+    }
+
+    /// Change how many tokens are drafted per step. Takes effect for requests
+    /// admitted after this call.
+    pub fn set_draft_tokens(&mut self, draft_tokens: usize) {
+        self.engine.draft_tokens = draft_tokens;
+    }
+
+    /// Drop all queues, counters and cached KV, keeping the loaded weights.
+    ///
+    /// Lets a benchmark measure several configurations without paying to
+    /// reload a multi-gigabyte checkpoint between them.
+    pub fn reset(&mut self) {
+        self.waiting.clear();
+        self.active.clear();
+        self.completed.clear();
+        self.kv.clear();
+        self.stats = RunStats::default();
+        self.spec = SpecStats::default();
+        self.tick = 0;
     }
 
     /// Queue a prompt that is already tokenized. `num_samples` continuations are
@@ -380,6 +429,9 @@ impl<'a> Engine<'a> {
                     sampler,
                     admitted_at,
                     first_token_at: Some(Instant::now()),
+                    // Speculation is only sound under greedy; see EngineConfig.
+                    drafter: (self.engine.draft_tokens > 0 && temperature <= 0.0)
+                        .then(|| Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>),
                 });
             }
         }
@@ -387,104 +439,210 @@ impl<'a> Engine<'a> {
 
     // ── decode ───────────────────────────────────────────────────────────────
 
-    /// Advance every live sequence by one token.
+    /// Advance every live sequence, by one token or by several.
     ///
-    /// Memory is settled for all of them first, then they go through the model
-    /// together. That ordering is what makes batching possible: `decode_batch`
-    /// needs the block tables final and immutable, while growing a mapping or
+    /// Every sequence contributes a *group* of positions to one batch: the
+    /// token it already holds, plus however many tokens its drafter guessed. A
+    /// sequence that is not speculating contributes a group of one, so ordinary
+    /// decoding is just the K=0 case of this path rather than a separate one.
+    ///
+    /// Memory is settled for all of them first, because the batched forward
+    /// needs the block tables final and immutable while growing a mapping or
     /// splitting a shared block mutates them.
     fn decode(&mut self) {
         let t0 = Instant::now();
-        let runnable = self.prepare_memory();
-        if !runnable.is_empty() {
-            // Chunked so scratch stays bounded regardless of how many sequences
-            // the scheduler admitted.
-            for chunk_start in (0..runnable.len()).step_by(self.batch_scratch.capacity()) {
-                let end = (chunk_start + self.batch_scratch.capacity()).min(runnable.len());
-                self.decode_chunk(&runnable[chunk_start..end]);
-            }
+        let groups = self.plan_step();
+        if !groups.is_empty() {
+            let predictions = self.run_groups(&groups);
+            self.commit(&groups, &predictions);
         }
         self.stats.decode_time += t0.elapsed();
     }
 
-    /// Grow mappings and resolve copy-on-write for every sequence that will
-    /// step, returning the indices that are ready to run.
-    fn prepare_memory(&mut self) -> Vec<usize> {
+    /// Draft, grow mappings, and resolve copy-on-write for everything that will
+    /// run this step.
+    fn plan_step(&mut self) -> Vec<SpecGroup> {
         let block_size = self.engine.block_size;
-        let mut runnable = Vec::with_capacity(self.active.len());
+        let k = self.engine.draft_tokens;
+        let mut groups = Vec::with_capacity(self.active.len());
 
         for idx in 0..self.active.len() {
             if self.active[idx].finished.is_some() {
                 continue;
             }
-            let pos = self.active[idx].token_ids.len() - 1;
             let seq_id = self.active[idx].id;
+            let pos = self.active[idx].token_ids.len() - 1;
 
-            // Grow the mapping if this position runs past the last block.
-            if pos >= self.active[idx].block_table.len() * block_size {
-                let mut table = std::mem::take(&mut self.active[idx].block_table);
-                let grew = self.kv.append_block(seq_id, &mut table, self.tick);
-                self.active[idx].block_table = table;
-                if !grew {
+            // Never draft past the request's token budget: a step emits one
+            // more token than it accepts.
+            let budget = self.active[idx]
+                .max_tokens
+                .saturating_sub(self.active[idx].generated.len());
+            let room = budget.saturating_sub(1);
+
+            let mut drafts = Vec::new();
+            if k > 0 && room > 0 {
+                // The drafter is moved out so it can be given the sequence's own
+                // token history without aliasing it.
+                if let Some(mut drafter) = self.active[idx].drafter.take() {
+                    drafts = drafter.draft(&self.active[idx].token_ids, k.min(room));
+                    drafts.truncate(room);
+                    self.active[idx].drafter = Some(drafter);
+                }
+            }
+
+            // Positions this group writes: the held token, then each draft.
+            let span = drafts.len() + 1;
+            let needed_blocks = (pos + span).div_ceil(block_size);
+            let mut table = std::mem::take(&mut self.active[idx].block_table);
+            let mut out_of_memory = false;
+            while table.len() < needed_blocks {
+                if !self.kv.append_block(seq_id, &mut table, self.tick) {
+                    out_of_memory = true;
+                    break;
+                }
+            }
+            if out_of_memory {
+                // Drop the speculation rather than the request: one more token
+                // still fits if the mapping already covers it.
+                drafts.clear();
+                if table.len() * block_size <= pos {
+                    self.active[idx].block_table = table;
                     self.active[idx].finished = Some(FinishReason::OutOfMemory);
                     continue;
                 }
             }
 
-            // Forked siblings map the same partial block. Split it before
-            // writing so one sample cannot corrupt another's KV.
-            let mut table = std::mem::take(&mut self.active[idx].block_table);
-            self.kv
-                .ensure_writable(seq_id, &mut table, pos, &mut self.kv_cache, &self.layout);
+            // Forked siblings map the same partial block. Split before writing,
+            // for every position this group touches.
+            for p in pos..pos + drafts.len() + 1 {
+                self.kv
+                    .ensure_writable(seq_id, &mut table, p, &mut self.kv_cache, &self.layout);
+            }
             self.active[idx].block_table = table;
-
             self.kv.touch(seq_id, self.tick);
-            runnable.push(idx);
+
+            let held = *self.active[idx].token_ids.last().expect("never empty");
+            let mut tokens = Vec::with_capacity(drafts.len() + 1);
+            tokens.push(held);
+            tokens.extend_from_slice(&drafts);
+            let positions = (pos..pos + tokens.len()).collect();
+
+            groups.push(SpecGroup {
+                seq_idx: idx,
+                tokens,
+                positions,
+                drafts,
+            });
         }
-        runnable
+        groups
     }
 
-    /// One batched forward for `chunk`, then sample each sequence's next token.
-    fn decode_chunk(&mut self, chunk: &[usize]) {
+    /// Run every group's positions through the model and return, per group, the
+    /// token the model itself chose at each position.
+    ///
+    /// Groups are flattened into one flat batch so the weights stream once for
+    /// all of them. Splitting a group across chunks is safe: a chunk runs every
+    /// layer before the next begins, so a later position always finds the KV of
+    /// the earlier ones already written.
+    fn run_groups(&mut self, groups: &[SpecGroup]) -> Vec<Vec<u32>> {
         let vocab = self.config.vocab_size;
         let block_size = self.engine.block_size;
 
-        let tokens: Vec<u32> = chunk
-            .iter()
-            .map(|&i| *self.active[i].token_ids.last().expect("never empty"))
-            .collect();
-        let positions: Vec<usize> = chunk
-            .iter()
-            .map(|&i| self.active[i].token_ids.len() - 1)
-            .collect();
-        let tables: Vec<&BlockTable> = chunk.iter().map(|&i| &self.active[i].block_table).collect();
-
-        // The whole batch streams each weight matrix once between them, rather
-        // than once per sequence.
-        self.weights.decode_batch_into(
-            &tokens,
-            &positions,
-            &tables,
-            &self.config,
-            &mut self.kv_cache,
-            block_size,
-            &mut self.batch_scratch,
-        );
-        drop(tables);
-
-        for (b, &idx) in chunk.iter().enumerate() {
-            let logits = self.batch_scratch.logits_for_mut(b, vocab);
-            let seq = &mut self.active[idx];
-            let next = seq.sampler.sample(logits);
-            seq.generated.push(next);
-            seq.token_ids.push(next);
-            self.stats.generated_tokens += 1;
-
-            if next == self.engine.eos_token {
-                seq.finished = Some(FinishReason::Eos);
-            } else if seq.generated.len() >= seq.max_tokens {
-                seq.finished = Some(FinishReason::Length);
+        let mut flat_tokens = Vec::new();
+        let mut flat_positions = Vec::new();
+        let mut owner = Vec::new();
+        for (g, group) in groups.iter().enumerate() {
+            for (t, p) in group.tokens.iter().zip(group.positions.iter()) {
+                flat_tokens.push(*t);
+                flat_positions.push(*p);
+                owner.push(g);
             }
+        }
+
+        let mut predictions: Vec<Vec<u32>> = groups
+            .iter()
+            .map(|g| Vec::with_capacity(g.tokens.len()))
+            .collect();
+
+        let capacity = self.batch_scratch.capacity();
+        let mut start = 0;
+        while start < flat_tokens.len() {
+            let end = (start + capacity).min(flat_tokens.len());
+            let tables: Vec<&BlockTable> = owner[start..end]
+                .iter()
+                .map(|&g| &self.active[groups[g].seq_idx].block_table)
+                .collect();
+
+            self.weights.decode_batch_into(
+                &flat_tokens[start..end],
+                &flat_positions[start..end],
+                &tables,
+                &self.config,
+                &mut self.kv_cache,
+                block_size,
+                &mut self.batch_scratch,
+            );
+            drop(tables);
+
+            for b in 0..(end - start) {
+                let g = owner[start + b];
+                let idx = groups[g].seq_idx;
+                let logits = self.batch_scratch.logits_for_mut(b, vocab);
+                // Speculating sequences are greedy by construction, so argmax is
+                // both the verification rule and what their sampler would return.
+                // Everything else goes through its own sampler.
+                let token = if self.active[idx].drafter.is_some() {
+                    crate::sampling::argmax(logits) as u32
+                } else {
+                    self.active[idx].sampler.sample(logits)
+                };
+                predictions[g].push(token);
+            }
+
+            self.spec.passes += 1;
+            start = end;
+        }
+        predictions
+    }
+
+    /// Accept the drafts the model agreed with and append the result.
+    fn commit(&mut self, groups: &[SpecGroup], predictions: &[Vec<u32>]) {
+        for (g, group) in groups.iter().enumerate() {
+            let verdict = verify_greedy(&group.drafts, &predictions[g]);
+            let idx = group.seq_idx;
+
+            self.spec.steps += 1;
+            self.spec.drafted += verdict.drafted as u64;
+            self.spec.accepted += verdict.accepted.len() as u64;
+
+            let mut emitted = 0usize;
+            for token in verdict
+                .accepted
+                .iter()
+                .copied()
+                .chain(std::iter::once(verdict.corrected))
+            {
+                let seq = &mut self.active[idx];
+                if seq.finished.is_some() {
+                    break;
+                }
+                seq.generated.push(token);
+                seq.token_ids.push(token);
+                emitted += 1;
+
+                if token == self.engine.eos_token {
+                    seq.finished = Some(FinishReason::Eos);
+                } else if seq.generated.len() >= seq.max_tokens {
+                    seq.finished = Some(FinishReason::Length);
+                }
+            }
+
+            // KV written for rejected drafts is left in place. It is never read:
+            // attention only ever looks at positions below the sequence's
+            // length, and the next step overwrites those slots.
+            self.spec.emitted += emitted as u64;
+            self.stats.generated_tokens += emitted;
         }
     }
 

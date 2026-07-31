@@ -1,6 +1,6 @@
 # Paged-Infer
 
-**An LLM inference engine written from scratch in Rust: PagedAttention, automatic prefix caching, copy-on-write forking, batched decode, and hand-written SIMD kernels.**
+**An LLM inference engine written from scratch in Rust: PagedAttention, automatic prefix caching, copy-on-write forking, batched decode and prefill, lossless speculative decoding, and hand-written SIMD kernels.**
 
 No PyTorch, no TensorFlow, no `transformers`. The forward pass, the attention
 kernels, the KV-cache allocator, the scheduler, and the HTTP server are all in
@@ -54,10 +54,11 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 95 tests, incl. golden parity
+cargo test                                        # 116 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
+cargo run --release --bin speculative_benchmark   # lossless speculative decoding
 ```
 
 With weights:
@@ -153,49 +154,44 @@ early never pays for a copy at all.
 
 ## What a run looks like
 
-`cargo run --release` submits three requests that share one system prompt; the
+`cargo run --release` submits three requests sharing one system prompt; the
 third asks for four continuations, which are forked rather than re-prefilled.
 
 ```
 Mapped 22 layers, 4.14 GB of F32 weights. SIMD backend: neon.
 KV cache: 352.00 MB across 512 blocks of 16 tokens.
 
-[req 0 / seq 0] 32 tokens, Length, ttft 666.74ms
-  Answer: PagedAttention solves the problem of training deep neural networks on
-  large datasets by using a technique called paging. This technique allows the model
+[req 0 / seq 0] 32 tokens, Length, ttft 5.18s
+[req 1 / seq 1] 32 tokens, Length, ttft 188.71ms
+  Answer: Continuous batching is a technique that allows the system to process
+  batches of data in parallel, rather than in a single thread.
 
-[req 1 / seq 1] 32 tokens, Length, ttft 293.42ms
-  Answer: Continuous batching improves throughput by reducing the number of
-  batches that need to be processed. This reduces the time required to
+[req 2 / seq 2] 32 tokens, Length, ttft 163.28ms
+  Questioner: Explain the reasons behind grouping queries into sub-sets when
+  computing the attention weights in the neural machine translation model.
+[req 2 / seq 3] ... Grouped-query attention is a way to use attention mechanisms to
+[req 2 / seq 4] ... Grouped-query attention is a more recent attention mechanism
+[req 2 / seq 5] ... Grouped-query attention is a type of attention mechanism often
 
-[req 2 / seq 2] 32 tokens, Length, ttft 260.24ms
-  Our system achieves grouped-query attention by using the attention scores
-  across all attention heads for a single input word, and the attention scores for the
-
-[req 2 / seq 3] 32 tokens, Length, ttft 260.85ms
-  Answer the question clearly and concisely. ...
-
-[req 2 / seq 4] ...
-[req 2 / seq 5] ...
-
-Completed 6 sequences in 4.72s over 31 steps.
-  prompt tokens     : 103 total, 71 prefilled, 32 reused from cache
+Completed 6 sequences in 9.18s over 31 steps.
+  prompt tokens     : 511 total, 191 prefilled, 320 reused from cache
   generated tokens  : 192
-  prefix cache      : 2/5 block lookups hit (40.0%)
+  prefix cache      : 20/21 block lookups hit (95.2%)
   copy-on-write     : 3 block copies
-  prefill 1.22s / decode 3.50s (54.92 tok/s)
+  prefill 5.53s / decode 3.64s (52.68 tok/s)
 ```
 
-Requests 1 and 2 have a lower TTFT than request 0 because they inherit its
-system-prompt blocks. The four sequences under request 2 share one prefill and
-diverge into visibly different continuations — that is copy-on-write forking
-doing its job, and the three block copies are the partial block they all wrote
-into.
+The TTFT column is the prefix cache doing its job. Request 0 pays 5.18 s to
+build the system prompt's KV; requests 1 and 2 inherit those blocks and start in
+**188 ms and 163 ms — about 30x faster**. Across the run, 320 of 511 prompt
+tokens never went through the model at all.
 
-The 40% hit rate is a property of that prompt set, not a ceiling: the demo's
-system prompt has since been lengthened to a realistic size, because a preamble
-shorter than a block or two has nothing to share. Output is TinyLlama 1.1B
-being TinyLlama — fluent, and wrong about what PagedAttention is.
+The four sequences under request 2 come from a single prefill and diverge into
+visibly different continuations. The three copy-on-write copies are the one
+partial block they all wrote into; the blocks before it stayed shared.
+
+Output is TinyLlama 1.1B being TinyLlama — fluent, and wrong about what
+PagedAttention is.
 
 ---
 
@@ -437,7 +433,7 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-95 tests, no model download required.
+116 tests, no model download required.
 
 | suite | covers |
 |---|---|
@@ -445,6 +441,7 @@ against a deliberately tight block pool:
 | `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
 | `batched_decode_tests` | batched decode and prefill are bit-identical to the paths they replace: ragged batches, block boundaries, per-sequence windows, ragged chunks, resumed prefill, causality |
 | `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
+| `speculative_tests` | speculative output is token-identical to greedy: draft depths, mixed batches, chunk splits, block boundaries, EOS mid-run, memory pressure |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
 | memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW |
@@ -456,6 +453,42 @@ committed reference is only trustworthy if its generator still reproduces it
 byte for byte.
 
 ---
+
+## Speculative decoding
+
+The optimizations above all trade on having *more* work available — more
+sequences, more positions. None of them help one user waiting on one stream.
+Speculative decoding does.
+
+A cheap drafter guesses `K` tokens; the model checks all `K+1` positions in one
+batched pass. Because decoding is memory-bound, that pass costs barely more than
+producing a single token, so every accepted draft is nearly free. The
+verification primitive is exactly the batched decode above, with the batch being
+positions of one sequence.
+
+**It is lossless, not an approximation.** A draft is accepted only where it
+equals what the model itself would have chosen, and the token after the last
+accepted one comes from the model's own logits — so the output is *exactly* the
+greedy output. `tests/speculative_tests.rs` asserts that token-for-token across
+draft depths, mixed batches, chunk splits, block boundaries, EOS landing inside
+an accepted run, and memory pressure. Sampled sequences do not speculate at all:
+acceptance-by-argmax is a greedy rule, and applying it to a sampled sequence
+would quietly change its distribution.
+
+The drafter is **prompt lookup** — find the longest recent suffix that occurred
+earlier in the context and propose what followed it. No draft model, so nothing
+extra to load or keep resident. It works because serving workloads copy
+constantly: summarize this, answer from this passage, rewrite this function.
+
+```bash
+cargo run --release --bin speculative_benchmark   # runs without a checkpoint
+MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin speculative_benchmark
+```
+
+Acceptance is a property of the workload, so the benchmark reports several
+side by side — including the open-ended case, where there is nothing to copy and
+speculation costs a little and saves nothing. It asserts on every run that the
+token count is unchanged.
 
 ## Honest limitations
 
@@ -475,8 +508,10 @@ byte for byte.
   same applies to the speculative-decoding acceptance rate, which depends on the
   model producing sensible tokens. `e2e_benchmark` and `speculative_benchmark`
   still run; the numbers need re-measuring on hardware with the weights present.
-- **Speculative decoding is drafting plus verification accounting**, not batched
-  tree verification.
+- **Speculative decoding verifies a single draft sequence**, not a tree. Tree
+  verification explores several branches per pass and lifts acceptance further.
+- **Sampled sequences never speculate.** Extending it there needs the
+  rejection-sampling correction to stay distributionally exact.
 - **The prefix cache publishes prompt blocks only.** Blocks that fill during
   decode are not published, since their contents depend on sampled tokens the
   hash chain does not cover.
