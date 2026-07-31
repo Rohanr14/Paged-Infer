@@ -1,426 +1,350 @@
 # Paged-Infer
 
-**A Bare-Metal Rust Inference Engine with PagedAttention and Continuous Batching**
+**An LLM inference engine written from scratch in Rust: PagedAttention, automatic prefix caching, copy-on-write forking, and hand-written SIMD kernels.**
 
-## Overview
-`Paged-Infer` is a from-scratch, dependency-light inference engine designed to serve modern LLMs efficiently. By implementing a custom OS-style memory allocator (PagedAttention) alongside an iteration-level scheduler, this engine eliminates KV Cache memory fragmentation and maximizes generation throughput during batched autoregressive decoding. 
+No PyTorch, no TensorFlow, no `transformers`. The forward pass, the attention
+kernels, the KV-cache allocator, the scheduler, and the HTTP server are all in
+this repository. The only meaningful dependencies are `safetensors` and
+`memmap2` for reading checkpoints, `tokenizers` for BPE, and `rayon` for thread
+pooling.
 
-This project demonstrates deep expertise in low-level systems engineering, Rust memory management, and modern Transformer architecture—skills critical for ML Infrastructure roles at top-tier AI labs.
+The interesting part is not the transformer — it's the memory manager. Serving
+LLMs is a memory allocation problem wearing a linear algebra costume, and this
+engine treats it that way: KV cache is paged into fixed blocks, blocks are
+reference counted, identical prefixes across requests map the same physical
+block, and forked sequences split blocks copy-on-write.
 
-## Technical Specifications
-* **Language:** Rust (Edition 2021)
-* **Target Model:** Llama 3.2 1B (via `.safetensors` format)
-* **Key Optimizations:**
-    * Memory-mapped weight loading (`mmap`).
-    * Paged KV Cache Allocation & Iteration-Level Scheduling (Continuous Batching).
-    * **Block Size:** 16 tokens per physical block.
-    * int8 weight-only quantization (4x memory reduction, ~10x matvec speedup vs naive).
-    * GPU compute via `wgpu` (Metal/Vulkan) with WGSL workgroup-parallel reduction kernel.
-    * Speculative decoding with n-gram drafting (21.88% acceptance rate, 1.88x theoretical speedup).
-* **Core Exclusions:** No PyTorch, No TensorFlow, No HuggingFace `transformers` library for inference. All forward passes and attention mechanisms are written entirely from scratch.
-* **Engineering Tradeoffs & Realities:**
-    * **Floating Point Precision:** Llama 3.2 1B weights are natively `bfloat16`. To balance memory footprint with compute simplicity, weights are memory-mapped as `bf16` (via the `half` crate) and cast to `f32` upon entering the CPU cache for the forward pass.
-    * **Tokenization:** Uses the `tokenizers` crate to handle Llama 3's complex ~128k BPE vocabulary, strictly managing special tokens like `<|begin_of_text|>` (128000) and `<|eot_id|>` (128009) to control sequence lifecycle.
+---
 
-## Architecture & Directory Structure
+## Verified against a reference implementation
 
-    paged-infer/
-    ├── README.md                   # Architecture details, benchmark graphs, and run instructions
-    ├── scripts/
-    │   ├── download_model.py       # Script to fetch Llama 3.2 1B safetensors and tokenizer
-    │   ├── run_e2e_sweep.sh        # Automate batch×steps sweep benchmarks
-    │   └── analyze_sweep.py        # CSV analysis and chart generation
-    ├── Cargo.toml                  # Rust dependencies (safetensors, memmap2, tokenizers, half, rayon, wgpu)
-    ├── src/
-    │   ├── main.rs                 # CLI entry point, scheduler, and continuous batching loop
-    │   ├── lib.rs                  # Module exports
-    │   ├── tensor.rs               # Bare-metal tensor wrapper around memory-mapped bytes
-    │   ├── math.rs                 # Kernels: GEMM, RoPE, SwiGLU, int8 matvec, AVX2 SIMD
-    │   ├── model.rs                # Llama architecture, forward pass, weight loading
-    │   ├── speculative.rs          # N-gram drafter for speculative decoding
-    │   ├── shaders/
-    │   │   └── matvec.wgsl         # WGSL compute shader: workgroup-parallel row matvec
-    │   ├── memory/
-    │   │   ├── mod.rs              # Memory module exports
-    │   │   ├── allocator.rs        # BlockAllocator: manages physical KV cache blocks
-    │   │   ├── block_table.rs      # BlockTable: logical-to-physical address mapping
-    │   │   └── kv_cache_manager.rs # KvCacheManager: LRU eviction policy
-    │   └── bin/
-    │       ├── benchmark.rs        # Kernel-level microbenchmarks (matvec, attention, int8)
-    │       ├── e2e_benchmark.rs    # Full model forward pass with latency percentiles
-    │       ├── eviction_benchmark.rs # LRU eviction stress testing
-    │       ├── gpu_benchmark.rs    # GPU vs CPU matvec benchmark (Metal/Vulkan via wgpu)
-    │       ├── speculative_benchmark.rs # Speculative decoding acceptance rate
-    │       └── http_server.rs      # OpenAI-compatible HTTP API
-    └── tests/
-        ├── math_tests.rs           # Unit tests for tensor ops and int8 quantization
-        ├── parity_tests.rs         # Attention correctness validation
-        └── paged_tests.rs          # Paged attention vs naive baseline comparison
+Every claim below rests on this. `scripts/gen_golden_fixture.py` builds a small
+Llama checkpoint in the exact HuggingFace tensor layout and computes reference
+logits with an independent NumPy transcription of `modeling_llama.py`.
+`tests/golden_parity_tests.rs` drives that same checkpoint through the real
+engine — loader, paged cache, block table, SIMD kernels — and compares.
 
-## Development Roadmap
-
-### Phase 1: Foundation (Naive Inference)
-* **Goal:** Build a working, unoptimized forward pass for Llama 3.2 1B.
-* **Tasks:**
-    1. Parse and load the model weights into memory using `memmap2` and the `safetensors` crate.
-    2. Implement basic ND-array tensor structs and pure Rust matrix multiplication.
-    3. Implement Rotary Positional Embeddings (RoPE), SwiGLU, and RMSNorm.
-    4. Write a naive Grouped-Query Attention (GQA) mechanism.
-* **Deliverable:** A CLI interface that takes a prompt and successfully generates text one token at a time.
-
-### Phase 2: The Block Allocator (Memory Management)
-* **Goal:** Step away from neural networks and build the OS-level memory structures.
-* **Tasks:**
-    1. Define the physical constraints: Pre-allocate a large chunk of heap memory to act as the global KV Cache.
-    2. Build the `BlockAllocator` struct that divides this memory into fixed chunks of **16 tokens**.
-    3. Implement `allocate()` and `free()` methods to hand out blocks and reclaim them when a generation sequence finishes.
-    4. Build the `BlockTable` mapping system (Logical -> Physical).
-* **Deliverable:** Rigorous Rust unit tests proving the allocator can handle thousands of allocate/free cycles without leaking memory.
-
-### Phase 3: PagedAttention & Continuous Batching
-* **Goal:** Wire the memory manager into the model and achieve high throughput.
-* **Tasks:**
-    1. Rewrite the naive Attention function to query the `BlockTable` and fetch fragmented 16-token chunks during the Key/Value lookup.
-    2. Implement an **Iteration-Level Scheduler**.
-    3. Inject new requests into the batch at the exact moment another request generates its `<|eot_id|>` token, utilizing the newly freed physical blocks immediately.
-* **Deliverable:** The engine seamlessly processes a continuous stream of prompts of varying lengths without stalling or wasting memory.
-
-### Phase 4: Benchmarking & SIMD Optimization
-* **Goal:** Quantify the engineering impact and make the engine practically viable.
-* **Tasks:**
-    1. Optimize the bare-metal Matrix Multiplication (GEMM). Replace pure Rust `for` loops with `std::arch` SIMD intrinsics (AVX2/AVX-512) to make the 1B parameter forward pass performant.
-    2. Track memory usage (Resident Set Size) between a contiguous baseline and the Paged-Infer engine.
-    3. Generate a chart showing how Paged-Infer achieves near 0% memory waste.
-* **Deliverable:** A highly polished `README.md` featuring architecture diagrams and performance metrics.
-## Optimization Pass 4 (March 27, 2026) — GPU Acceleration via Metal/wgpu
-
-Added a GPU compute path for matrix-vector multiplication using `wgpu` (Metal on Apple Silicon, Vulkan on Linux/Windows). Weights upload once at model load; only the small per-token activation vector moves to the GPU each step.
-
-### WGSL Kernel Design (`src/shaders/matvec.wgsl`)
-
-Each output row is handled by **one workgroup of 256 threads**. The kernel uses **`vec4<f32>` loads** — Metal's SIMD units process 4 floats per instruction, so packing reads into `vec4` gives 4x fewer memory transactions and replaces 4 multiply-adds with a single `dot(vec4, vec4)` MAD-4 instruction. After accumulation, an **8-step binary tree reduction** collapses 256 partial sums using `var<workgroup>` shared memory:
-
-```wgsl
-// weight and x_vec are typed as array<vec4<f32>> — same bytes, 4x wider loads
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(workgroup_id) wg_id, @builtin(local_invocation_id) local_id) {
-    let row = wg_id.x;
-    let cols4 = dims.cols / 4u;  // e.g. 2048/4 = 512 vec4 groups
-    var acc: f32 = 0.0;
-    // 4x fewer iterations vs scalar; dot() is a single MAD-4 instruction
-    for c = lid; c < cols4; c += 256 {
-        acc += dot(weight[row * cols4 + c], x_vec[c]);
-    }
-    partial_sums[lid] = acc;
-    // Tree reduce: 256→128→64→32→16→8→4→2→1 (8 barrier stages)
-    if lid == 0 { output[row] = partial_sums[0]; }
-}
+```
+incremental decode: max|delta|=0.000003, argmax mismatches=0/40
+prefill:            max|delta|=0.000002
 ```
 
-This is the GPU parallel-reduction pattern — identical algorithm to a CUDA atomicAdd-free reduction kernel, implemented in WGSL for cross-platform support (Metal/Vulkan/DX12). No changes to the Rust buffer creation are needed: the `f32` bytes are reinterpreted as `vec4<f32>` purely in the shader.
+The reference is written against HuggingFace semantics rather than against this
+engine's code, so agreement is evidence rather than a tautology. The fixture is
+~400 KB, spans three KV blocks, and runs in CI in under a second.
 
-### Apple Silicon advantage: Unified Memory
+**This is how three real bugs were found.** Before the harness existed the engine
+diverged from the reference by `max|Δ| = 0.67` and picked a *different greedy
+token at 5 of 40 positions*:
 
-On M2/M3, CPU and GPU share the **same physical memory pool** — no PCIe bus. Weights loaded with `mmap` at startup are directly accessible by the Metal command queue. Per-token inference moves only the 8 KB activation vector (`hidden=2048 × f32`), not the 4+ GB weight tensors.
+| Bug | Effect |
+|---|---|
+| Rotary embeddings used the GPT-J interleaved convention | HF checkpoints are permuted for NeoX `rotate_half`; every attention score was computed on wrongly rotated Q/K |
+| Key heads rotated once per *query* head | Under GQA, `kv_group` query heads share a key head — an 8× over-rotation on TinyLlama |
+| Unmapped positions scored `0.0` instead of `-inf` | They survived the softmax and took a full share of attention weight |
 
-### Running the benchmark
+Separately, the engine had **no prefill at all**: the scheduler ran a forward
+pass only on the *last* prompt token, leaving positions `0..n-1` of the KV cache
+zeroed. The model could not see the prompt.
+
+---
+
+## Quick start
+
+Nothing below needs model weights:
 
 ```bash
-cargo run --release --bin gpu_benchmark
+cargo test                                        # 83 tests, incl. golden parity
+cargo run --release --bin benchmark               # kernel attribution ladder
+cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
 ```
 
-Exits gracefully with a CPU reference number on headless/no-GPU systems.
-
-### Results (Apple M2, Metal)
-
-Scalar kernel (initial):
-```
-GPU Matvec Benchmark
-====================
-Adapter : Apple M2 (Metal)
-Matrix  : 2048×2048 f32, 5 warm-up + 20 timed iters
-
-Results
--------
-CPU packed+parallel : 0.0308s total  (1.541ms / iter)
-GPU wgpu/Metal      : 0.0079s total  (0.394ms / iter)
-GPU speedup         : 3.9x
-
-Correctness: max |CPU - GPU| = 1.53e-4  ✓
-```
-
-vec4 kernel (current):
-```
-CPU packed+parallel : 0.0311s total  (1.555ms / iter)
-GPU wgpu/Metal      : 0.0066s total  (0.330ms / iter)
-GPU speedup         : 4.7x
-
-Correctness: max |CPU - GPU| = 1.60e-4  ✓
-```
-
-### Bandwidth analysis (M2)
-- Weight data per iter: 2048×2048×4 = **16 MB**
-- M2 GPU memory bandwidth: ~100 GB/s → theoretical floor **~0.16 ms/iter**
-- Scalar kernel: 0.394 ms/iter = 41% of peak bandwidth
-- vec4 kernel: 0.330 ms/iter = **48% of peak bandwidth** — 4.7x over CPU (up from 3.9x scalar)
-
-## Optimization Pass 3 (March 27, 2026) — Parallel Attention Across Heads
-
-The attention computation was the primary bottleneck at high batch sizes and long contexts. Previously, all 32 query heads were computed sequentially per token; at `batch=8, steps=256` this caused p95 latency to spike to **1.1 seconds** and throughput to collapse to **1.62 tok/s**.
-
-**Fix:** Parallelize attention across heads using Rayon's `par_chunks_mut`. Each head computes its score/softmax/weighted-sum independently on a separate thread. The KV cache is read-only during attention (writes complete before the parallel section), so shared access is safe with zero synchronization overhead.
-
-- Each head gets its own compact score buffer sized to `min(pos+1, attention_window)` — no wasted allocation
-- Non-overlapping output slices (`attn_out[h*head_dim..(h+1)*head_dim]`) eliminate false sharing
-- With 32 heads and 8+ cores, this directly addresses the batch=8 degradation
-
-Re-run `cargo run --release --bin e2e_benchmark` with `BENCH_BATCH=8 BENCH_STEPS=256` to measure the improvement on your hardware.
-
-## Optimization Pass 2 (March 26, 2026) — int8 Quantization + Speculative Decoding
-
-### Feature 1: int8 Weight-Only Quantization
-
-Per-row symmetric int8 quantization of all projection matrices. Each row's weights are scaled to the range `[-127, 127]` using a per-row `f32` scale factor, reducing weight memory by **~4x** with a parallel dequantizing matvec kernel.
-
-- `quantize_rows_i8(weight, rows, cols)` — one-shot quantization at model load time
-- `matvec_i8_weight_parallel()` — Rayon-parallel kernel; dequantizes on-the-fly during accumulation
-- `QuantizedLinear` struct — drop-in replacement for `PackedLinear` with 4x lower memory footprint
-
-Benchmark (`cargo run --release --bin benchmark`, 2048×2048 matrix, 20 iters, Apple M3):
-
-| Kernel | Time | vs Baseline | vs Packed f32 | Memory |
-|---|---:|---:|---:|---:|
-| Baseline (bf16 convert each iter) | 0.2127s | 1.00x | — | 16.00 MB |
-| Stream bf16 | 0.1245s | 1.71x | — | — |
-| Packed f32 + parallel | 0.0241s | 8.84x | 1.00x | 16.00 MB |
-| **int8 + parallel** | **0.0215s** | **9.90x** | **1.12x** | **4.01 MB** |
-
-- **9.90x throughput vs baseline**, **1.12x vs packed f32** from better cache utilization
-- **3.99x memory reduction** vs f32 (4 bytes → 1 byte per weight + tiny per-row scale overhead)
-- For TinyLlama 1.1B: projection weights shrink from ~4.3 GB to ~1.1 GB
-
-### Feature 2: Speculative Decoding with N-gram Drafting
-
-`NgramDrafter` maintains an in-memory n-gram frequency table (default n=3). At each decode step it proposes K cheap draft tokens via O(1) table lookup; the main model verifies each candidate and accepts if its argmax agrees.
-
-- `src/speculative.rs` — `NgramDrafter::observe()` / `::draft()` with majority-vote update rule
-- `src/bin/speculative_benchmark.rs` — measures acceptance rate and theoretical throughput gain
+With weights:
 
 ```bash
-MODEL_PATH=models/tinyllama-1.1b/model.safetensors \
-SPEC_STEPS=50 SPEC_K=4 SPEC_N=3 \
-cargo run --release --bin speculative_benchmark
-```
+pip install huggingface_hub
+python3 scripts/download_model.py                 # TinyLlama 1.1B, ~2.2 GB
 
-**Measured results** (TinyLlama 1.1B, Apple M3):
+cargo run --release                               # CLI demo
+QUANT=int8 cargo run --release                    # 4x less weight memory
 
-| Metric | Value |
-|---|---:|
-| Baseline throughput | 3.49 tok/s |
-| Speculative throughput | 3.93 tok/s |
-| Draft tokens proposed | 96 |
-| Draft tokens accepted | 21 |
-| **Acceptance rate** | **21.88%** |
-| Theoretical max speedup (batched) | **1.88x** |
-
-With batched prefill verification (future work), an acceptance rate of `α` with `K` draft tokens gives a throughput multiplier of approximately `(1 + α·K)` since the drafter is free. The measured 21.88% acceptance rate with K=4 predicts a **1.88x** effective throughput multiplier once batched verification is implemented.
-
-## Optimization Pass 1 (March 26, 2026) — Prepack + Buffer Reuse
-
-We implemented and benchmarked the two highest-impact follow-ups for decode throughput:
-
-1. **Prepack bf16 weights into cache-friendly f32 layout + parallelize row matvec**
-   Projection weights are converted once during model load and stored contiguously for fast row access; matvec now runs in parallel across output rows.
-2. **Reuse attention score buffers instead of allocating per head per step**
-   Attention keeps a reusable score scratch buffer and resets it in-place.
-
-### Benchmark setup
-- Command: `cargo run --release --bin benchmark`
-- CPU benchmark is synthetic and isolates kernel behavior:
-  - Matvec: hidden=2048, rows=2048, 20 iterations
-  - Attention score path: head_dim=64, seq_len=1024, 200 iterations
-
-### Results (Apple M3)
-| Kernel | Baseline | Optimized | Speedup |
-|---|---:|---:|---:|
-| Matvec (bf16 convert each iter) | 0.2127s | 0.1245s (stream bf16) | **1.71x** |
-| Matvec (bf16 convert each iter) | 0.2127s | 0.0241s (packed + parallel) | **8.84x** |
-| Matvec (bf16 convert each iter) | 0.2127s | 0.0215s (int8 + parallel) | **9.90x** |
-| Attention score scratch handling | 0.0007s | 0.0007s | **1.02x** |
-
-### Takeaway
-- The largest win comes from **one-time prepacking + parallel row matvec** on projection kernels.
-- int8 quantization pushes the matvec win further to **9.90x** with a 4x memory reduction.
-
-## Final Validation Checklist (Correctness + E2E + Memory)
-
-To make this project interview-ready and reproducible, use:
-
-1. **Kernel / attention correctness parity**
-   - `cargo test --test parity_tests`
-   - Verifies paged attention matches a naive reference implementation on deterministic pseudo-random inputs.
-
-2. **int8 quantization correctness**
-   - `cargo test --test math_tests test_quantize_rows_i8_roundtrip`
-   - `cargo test --test math_tests test_matvec_i8_matches_f32`
-   - Verifies quantize→dequantize roundtrip and int8 matvec parity against f32 reference (within 2% relative error).
-
-3. **Kernel microbenchmarks (no model required)**
-   - `cargo run --release --bin benchmark`
-   - Reports matvec throughput across bf16/f32/int8 kernels, memory footprints, and attention buffer reuse.
-
-4. **End-to-end decode benchmark (throughput + latency + memory)**
-   - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark`
-   - Reports:
-     - tokens/sec throughput
-     - avg token latency
-     - p50/p95 token latency
-     - peak RSS memory (MB)
-
-5. **Speculative decoding acceptance rate**
-   - `MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin speculative_benchmark`
-   - Reports acceptance rate and theoretical throughput multiplier for n-gram drafting with K=4.
-
-6. **GPU matmul benchmark (Metal/Vulkan)**
-   - `cargo run --release --bin gpu_benchmark`
-   - Exits gracefully if no GPU found; reports adapter name, GPU vs CPU throughput, and correctness check.
-
-If `MODEL_PATH` is missing, model-dependent binaries exit early with a clear message rather than failing.
-
-### Larger local sweeps (recommended for final README table)
-
-Use the helper script:
-
-```bash
-MODEL_PATH=/absolute/path/to/model.safetensors \
-STEPS_LIST="64 128 256" \
-BATCH_LIST="1 2 4 8" \
-OUT_CSV=e2e_sweep.csv \
-./scripts/run_e2e_sweep.sh
-```
-
-This produces a CSV with:
-- `batch`, `steps`, `total_tokens`
-- `throughput_tok_s`
-- `avg_token_latency_ms`
-- `p50_token_latency_us`, `p95_token_latency_us`
-- `peak_rss_mb`
-
-Note: `e2e_benchmark` now uses `/proc/self/status` when available and falls back to `ps -o rss=` for platforms like macOS, so RSS should no longer show `0.00` unless collection genuinely fails.
-
-## Local E2E Sweep Results (TinyLlama 1.1B, Apple M3)
-
-Pre-parallel-attention baseline (sequential heads). Re-run after Optimization Pass 3 to measure improvement.
-
-| batch | steps | total_tokens | throughput_tok_s | avg_token_latency_ms | p50_us | p95_us | peak_rss_mb |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 64  | 64   | 3.61 | 276.972 | 250575 | 312630 | 5143.31 |
-| 1 | 128 | 128  | 3.49 | 286.617 | 249484 | 426967 | 5359.11 |
-| 1 | 256 | 256  | 3.23 | 310.074 | 260574 | 373675 | 4959.55 |
-| 2 | 64  | 128  | 3.20 | 312.289 | 260816 | 437640 | 5211.59 |
-| 2 | 128 | 256  | 3.49 | 286.840 | 259368 | 375500 | 5037.42 |
-| 2 | 256 | 512  | 3.44 | 290.436 | 259861 | 353972 | 5066.11 |
-| 4 | 64  | 256  | 3.88 | 257.877 | 248295 | 296406 | 5236.92 |
-| 4 | 128 | 512  | 3.72 | 269.109 | 250458 | 317303 | 5035.05 |
-| 4 | 256 | 1024 | 3.53 | 282.944 | 256858 | 372770 | 5152.27 |
-| 8 | 64  | 512  | 3.82 | 261.718 | 248201 | 293093 | 5167.16 |
-| 8 | 128 | 1024 | 2.21 | 452.649 | 255909 | 1221832 | 5225.03 |
-| 8 | 256 | 2048 | 1.62 | 617.372 | 493354 | 1115276 | 4978.95 |
-
-### What this indicates
-- **Throughput ranges from 3.2–3.9 tok/s** for batch 1–4, peaking at **3.88 tok/s** (`batch=4`, `steps=64`).
-- **batch=8 degrades sharply at long contexts**: throughput drops to **1.62 tok/s** with p95 latency spiking to **1.1 seconds**. Root cause: 32 attention heads computed sequentially, each scanning up to 256 past tokens. This is directly addressed by **Optimization Pass 3** (parallel heads).
-- **Peak RSS is consistently ~5.0–5.4 GB**, confirming stable memory footprint under the paged KV design.
-
-## Scaling Behavior Summary
-
-### Batch scaling (1→8, pre-parallel-attention)
-
-| batch | throughput_tok_s | avg_latency_ms | p95_us | peak_rss_mb |
-|---:|---:|---:|---:|---:|
-| 1 | 3.44 | 291.22 | 371091 | 5154.0 |
-| 2 | 3.38 | 296.52 | 389037 | 5105.0 |
-| 4 | 3.71 | 269.98 | 328826 | 5141.4 |
-| 8 | 2.55 | 443.91 | 876734 | 5123.7 |
-
-```mermaid
-xychart-beta
-    title "Throughput vs Batch (pre-parallel-attention)"
-    x-axis "batch" [1, 2, 4, 8]
-    y-axis "tok/s" 0 --> 5
-    line [3.44, 3.38, 3.71, 2.55]
-```
-
-### Throughput vs context length
-
-| steps | throughput_tok_s | avg_latency_ms | p95_us |
-|---:|---:|---:|---:|
-| 64 | 3.63 | 277.21 | 334942 |
-| 128 | 3.23 | 323.80 | 585400 |
-| 256 | 2.96 | 375.21 | 553923 |
-
-### Memory vs sequence length
-
-| steps | peak_rss_mb |
-|---:|---:|
-| 64 | 5189.7 |
-| 128 | 5163.4 |
-| 256 | 5039.2 |
-
-You can regenerate these summaries from CSV using:
-- `./scripts/analyze_sweep.py e2e_sweep.csv`
-
-## Product Mode: Simple OpenAI-Compatible HTTP API
-
-Run:
-
-```bash
-HOST=0.0.0.0 PORT=8080 \
 MODEL_PATH=models/tinyllama-1.1b/model.safetensors \
 TOKENIZER_PATH=models/tinyllama-1.1b/tokenizer.json \
 cargo run --release --bin http_server
 ```
 
-Health check:
-
 ```bash
-curl http://localhost:8080/health
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Explain paged attention."}],
+  "max_tokens": 64, "n": 2, "temperature": 0.8
+}'
+
+curl localhost:8080/metrics   # prefix cache hit rate, tokens reused, tok/s
 ```
 
-Chat completion (OpenAI-style path):
+The engine reads the architecture from the checkpoint's own `config.json`, so
+any HuggingFace-format Llama checkpoint works, not just TinyLlama.
 
-```bash
-curl -s http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "tinyllama-1.1b",
-    "messages": [{"role":"user","content":"Explain paged attention in one paragraph."}],
-    "max_tokens": 64
-  }'
+---
+
+## The memory manager
+
+```
+                    ┌───────────────────────────────────────────┐
+   request ────────►│  Engine::step()                           │
+                    │    admit → prefill → decode → reclaim     │
+                    └───────────┬───────────────────────────────┘
+                                │
+                    ┌───────────▼───────────────────────────────┐
+                    │  KvCacheManager                           │
+                    │    prefix reuse · copy-on-write · evict   │
+                    └──────┬──────────────────────┬─────────────┘
+                           │                      │
+                ┌──────────▼─────────┐  ┌─────────▼──────────┐
+                │  PrefixCache       │  │  BlockAllocator    │
+                │  hash → block      │  │  refcounted pool   │
+                └──────────┬─────────┘  └─────────┬──────────┘
+                           └──────────┬───────────┘
+                                      │
+                    ┌─────────────────▼─────────────────────────┐
+                    │  KV cache: [layer][block][tok][kv_head]   │
+                    │  BlockTable maps logical → physical       │
+                    └───────────────────────────────────────────┘
 ```
 
-If model/tokenizer files are unavailable, the server still runs in a `dry-run` mode for API integration tests.
+### Reference-counted blocks
 
-## Killer Feature: KV Cache Eviction (LRU)
+A physical block returns to the free pool only when its last reference drops.
+That single change is what makes everything else possible: several sequences can
+map the same block at once. Double-free and incref-after-free are assertions,
+not silent corruption. `tests` run 5,000 alloc/free rounds with interleaved
+sharing and check the pool returns to exactly its starting state.
 
-`KvCacheManager` introduces an eviction-aware KV allocator policy:
-- Tracks per-sequence KV ownership and `last_used_tick`
-- On allocation pressure, evicts the least-recently-used sequence (excluding current requester)
-- Keeps the allocator from hard-failing under contention-heavy workloads
+### Automatic prefix caching
 
-Run benchmark:
+Serving traffic is enormously repetitive — the same system prompt, the same
+few-shot preamble, the same retrieved document, on request after request. The KV
+state for a token sequence is a deterministic function of that sequence, so it
+can be computed once and shared.
 
-```bash
-cargo run --release --bin eviction_benchmark
-```
+Blocks are keyed by a hash chained through the previous block's hash, so a
+block's identity covers its **entire prefix**. This matters for soundness: two
+prompts can share sixteen tokens at some offset while having completely
+different histories, and their KV state for those tokens genuinely differs.
+Chaining means a hit implies identical history — exactly the condition under
+which reuse is valid. Lookups walk blocks in order and stop at the first miss.
 
-Latest result on this branch:
+`tests/prefix_cache_parity_tests.rs` proves the reuse is numerically invisible:
+a batch with a shared preamble produces logits agreeing to `<1e-5` with a
+cache-disabled run, while recomputing 48 prompt tokens instead of 120.
 
-| Policy | completed | dropped | active_end |
+### Copy-on-write forking
+
+Drawing *n* continuations from one prompt maps the parent's blocks into each
+child instead of copying them. Nothing moves at fork time. The one block the
+siblings both write to is split lazily, on first write — so a sample that stops
+early never pays for a copy at all.
+
+---
+
+## What prefix caching is worth
+
+`cargo run --release --bin prefix_cache_benchmark`. Model-free: prompt tokens
+prefilled and blocks allocated are exact properties of the memory manager, so
+these numbers are deterministic and reproduce anywhere.
+
+**64 requests · 240-token shared system prompt · three 480-token documents · 48 unique tokens each**
+
+| metric | no cache | prefix cache | saved |
 |---|---:|---:|---:|
-| No eviction | 11 | 93 | 8 |
-| LRU eviction | 104 | 0 | 8 |
+| prompt tokens prefilled | 49,152 | 4,752 | **90.3%** |
+| KV blocks allocated | 3,072 | 297 | **90.3%** |
+| block cache hit rate | — | 97.7% | |
 
-`completed_gain_pct = 845.45%`
+Prefill is O(prompt tokens), so this is roughly a 10× cut in time-to-first-token
+for requests that hit.
 
-This benchmark simulates long-running and short-running requests under tight KV block pressure; LRU prevents starvation and dramatically improves request completion throughput.
+That headline is a property of *the workload*, not of the engine, so the
+benchmark also reports the full range:
+
+| shared prefix | prefilled (no cache) | prefilled (cache) | saved |
+|---|---:|---:|---:|
+| 0 tokens | 3,072 | 3,072 | **0.0%** |
+| 64 tokens | 7,168 | 3,136 | 56.2% |
+| 240 tokens | 18,432 | 3,312 | 82.0% |
+| 480 tokens | 33,792 | 3,552 | 89.5% |
+| 960 tokens | 64,512 | 4,032 | **93.8%** |
+
+With nothing shared there is nothing to reuse, and the cache degrades to the
+uncached path at the cost of the lookups.
+
+**Parallel sampling** — KV blocks for *n* continuations of a 1,024-token prompt:
+
+| samples | independent | copy-on-write | saved |
+|---|---:|---:|---:|
+| 2 | 128 | 64 | 50.0% |
+| 4 | 256 | 64 | 75.0% |
+| 8 | 512 | 64 | 87.5% |
+| 16 | 1,024 | 64 | **93.8%** |
+
+Verified live over HTTP: six concurrent clients sharing a 16-token prefix
+produced 5/6 block cache hits and reused 80 of 123 prompt tokens.
+
+---
+
+## Kernel performance
+
+`cargo run --release --bin benchmark`. Structured as an attribution ladder —
+each rung adds exactly one change to the one above — so the numbers say what
+each optimization is worth rather than only reporting a total.
+
+**Why hand-written SIMD is necessary here:** f32 addition is not associative, so
+LLVM may not reassociate a reduction. The obvious `acc += a[i] * b[i]` loop stays
+scalar at any optimization level. That constraint, not compiler weakness, is why
+these kernels exist.
+
+**16384×8192 f32 (512 MiB working set), 4-core Xeon @ 2.10 GHz, AVX2+FMA**
+
+| kernel | per iter | vs base | vs prev |
+|---|---:|---:|---:|
+| bf16 convert + serial scalar | 642.5 ms | 1.00× | 1.00× |
+| + stream bf16 (no realloc) | 163.9 ms | 3.92× | 3.92× |
+| + prepack f32, serial scalar | 159.2 ms | 4.04× | 1.03× |
+| + 4 accumulators (serial) | 162.9 ms | 3.94× | 0.98× |
+| + AVX2/FMA (serial) | 59.8 ms | 10.75× | **2.73×** |
+| + rayon across rows (4t) | 13.7 ms | 47.01× | **4.37×** |
+| + int8 weights | 3.4 ms | **191×** | **4.07×** |
+
+Measured on a shared cloud VM; across three runs the per-stage figures ranged
+AVX2 2.7–3.2×, rayon 2.9–4.5×, int8 2.7–4.1×, total 120–191×. Run it on your own
+hardware rather than trusting these. The naive baseline reallocates 512 MB per
+iteration and is the noisiest row.
+
+Two results worth reading carefully:
+
+- **Accumulator unrolling measures ~1.0×, not a win.** A scalar loop is limited
+  by load throughput long before the FMA dependency chain becomes the
+  bottleneck; multiple accumulators only pay once the loop issues wide FMAs. The
+  benchmark reports this rather than claiming a speedup it does not measure.
+- **The default 2048×2048 size is misleading.** That is 16 MiB, which fits
+  entirely in this machine's 260 MiB L3 — it measures cache bandwidth, not DRAM,
+  and no 1B-parameter model fits in cache. The benchmark now detects this and
+  says so. Use `BENCH_ROWS`/`BENCH_COLS` to exceed your LLC.
+
+Weight memory: 512.00 MB f32 → 128.06 MB int8 (**4.00×**). The LM head stays f32
+deliberately — its quantization error lands directly on token choice, and it is
+one matrix rather than seven per layer.
+
+### GPU path (Metal / Vulkan via `wgpu`)
+
+A WGSL compute shader does one output row per 256-thread workgroup, with
+`vec4<f32>` loads and an 8-step binary tree reduction in workgroup memory —
+the standard GPU parallel-reduction pattern, in WGSL for cross-platform support.
+
+Measured previously on an **Apple M2**, 2048×2048 f32 matvec:
+
+| kernel | per iter | vs CPU |
+|---|---:|---:|
+| CPU packed + parallel | 1.555 ms | 1.0× |
+| GPU scalar WGSL | 0.394 ms | 3.9× |
+| GPU vec4 WGSL | 0.330 ms | **4.7×** |
+
+Max `|CPU − GPU|` = 1.6e-4. At ~100 GB/s of M2 bandwidth the theoretical floor is
+~0.16 ms/iter, so the vec4 kernel reaches ~48% of peak. This is a standalone
+matvec benchmark and is unaffected by the correctness fixes above. On Apple
+Silicon the CPU and GPU share physical memory, so `mmap`ed weights are directly
+addressable and only the 8 KB activation vector moves per step.
+
+`cargo run --release --bin gpu_benchmark` — exits with a CPU reference number on
+headless machines.
+
+### KV eviction under pressure
+
+`cargo run --release --bin eviction_benchmark` — long- and short-lived requests
+against a deliberately tight block pool:
+
+| policy | completed | dropped |
+|---|---:|---:|
+| no eviction | 11 | 93 |
+| LRU eviction | **104** | **0** |
+
+---
+
+## Correctness and testing
+
+83 tests, no model download required.
+
+| suite | covers |
+|---|---|
+| `golden_parity_tests` | full forward pass vs the NumPy reference: decode, prefill, resumed prefill |
+| `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
+| `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
+| `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
+| `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
+| memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW |
+
+CI runs `fmt`, `clippy -D warnings`, and the suite on **x86_64 (AVX2+FMA)** and
+**aarch64 (NEON)**, so a kernel that only works on the machine it was written on
+gets caught. A separate job regenerates the golden fixture and diffs it — a
+committed reference is only trustworthy if its generator still reproduces it
+byte for byte.
+
+---
+
+## Honest limitations
+
+- **Decode is one sequence at a time.** Iteration-level scheduling is real —
+  requests are admitted and retired continuously, and they share KV — but each
+  sequence's forward pass runs separately rather than as a batched GEMM. Batching
+  the projections across the active set is the single biggest remaining
+  throughput win.
+- **Prefill is a loop over positions**, not a batched GEMM. It skips the LM head
+  for all but the last token, which is most of the easy saving, but a real
+  prefill would process the prompt as a matrix.
+- **The GPU path covers matvec only.** Attention, RMSNorm and SwiGLU stay on the
+  CPU, and every call round-trips through a blocking readback — so it is
+  currently a demonstration of a WGSL reduction kernel, not a fast end-to-end
+  path.
+- **No end-to-end throughput numbers are published here.** The previous README
+  carried a batch×steps sweep on an Apple M3, but those runs predate the
+  correctness fixes: they were measured with no prefill, the wrong rotary
+  convention, and a silent 256-token attention window. They measured something
+  that was not the model, so they have been removed rather than restated. The
+  same applies to the speculative-decoding acceptance rate, which depends on the
+  model producing sensible tokens. `e2e_benchmark` and `speculative_benchmark`
+  still run; the numbers need re-measuring on hardware with the weights present.
+- **Speculative decoding is drafting plus verification accounting**, not batched
+  tree verification.
+- **The prefix cache publishes prompt blocks only.** Blocks that fill during
+  decode are not published, since their contents depend on sampled tokens the
+  hash chain does not cover.
+
+## Repository layout
+
+```
+src/
+  engine.rs          scheduler: admit → prefill → decode → reclaim
+  model.rs           Llama forward pass, weight loading, quantization
+  math.rs            RMSNorm, RoPE, SwiGLU, softmax, matvec dispatch
+  simd.rs            AVX2/FMA and NEON kernels + scalar reference
+  sampling.rs        temperature / top-p / top-k over a seeded RNG
+  memory/
+    allocator.rs     refcounted physical block pool
+    block_table.rs   logical → physical mapping
+    prefix_cache.rs  content-addressed KV reuse
+    kv_cache_manager.rs  admission, copy-on-write, eviction
+    layout.rs        physical KV addressing
+  bin/
+    http_server.rs         OpenAI-shaped API over the real engine
+    benchmark.rs           kernel attribution ladder
+    prefix_cache_benchmark.rs
+    e2e_benchmark.rs  eviction_benchmark.rs  gpu_benchmark.rs
+scripts/
+  gen_golden_fixture.py    reference model + logits (NumPy)
+  download_model.py        fetch TinyLlama 1.1B
+tests/                     83 tests; fixtures/ holds the reference checkpoint
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
