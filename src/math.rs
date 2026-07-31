@@ -128,6 +128,125 @@ pub fn matvec_f32_weight_transposed_parallel(
     });
 }
 
+/// Batched matvec: project `batch` activation vectors through one weight matrix.
+///
+/// This is the whole point of batching decode. A matvec is memory-bound — it
+/// streams the entire weight matrix to do one multiply-add per element — so
+/// running `batch` sequences one at a time reads the weights `batch` times from
+/// DRAM. Here each weight row is fetched once and reused across every sequence
+/// in the batch, cutting weight traffic by a factor of `batch` while doing the
+/// same arithmetic. For a 1.1B model that is ~4.2 GB per token that no longer
+/// has to move.
+///
+/// The `batch` loop sits *inside* the row loop deliberately: `w_row` is
+/// streamed from DRAM on the first sequence and served from L1 for the rest.
+///
+/// Output is `[row][batch]`-major, which is what lets Rayon hand each task a
+/// disjoint `&mut` slice. Use [`transpose_rb_to_br`] to get back to
+/// per-sequence contiguous vectors.
+pub fn matmat_f32_weight_transposed_parallel(
+    out_rb: &mut [f32],
+    x_br: &[f32],
+    weight: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(x_br.len(), batch * cols);
+    assert_eq!(out_rb.len(), rows * batch);
+    assert_eq!(weight.len(), rows * cols);
+
+    macro_rules! run {
+        ($dot:expr) => {
+            out_rb
+                .par_chunks_mut(batch)
+                .enumerate()
+                .for_each(|(r, out_row)| {
+                    let w_row = &weight[r * cols..(r + 1) * cols];
+                    for (b, slot) in out_row.iter_mut().enumerate() {
+                        *slot = $dot(w_row, &x_br[b * cols..(b + 1) * cols]);
+                    }
+                })
+        };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::available() {
+        run!(|w, x| unsafe { crate::simd::x86::dot(w, x) });
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        run!(|w, x| unsafe { crate::simd::neon::dot(w, x) });
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        run!(crate::simd::dot_scalar);
+    }
+}
+
+/// [`matmat_f32_weight_transposed_parallel`] against int8 weights.
+pub fn matmat_i8_weight_parallel(
+    out_rb: &mut [f32],
+    x_br: &[f32],
+    weight: &[i8],
+    scales: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(x_br.len(), batch * cols);
+    assert_eq!(out_rb.len(), rows * batch);
+    assert_eq!(weight.len(), rows * cols);
+    assert_eq!(scales.len(), rows);
+
+    macro_rules! run {
+        ($dot:expr) => {
+            out_rb
+                .par_chunks_mut(batch)
+                .enumerate()
+                .for_each(|(r, out_row)| {
+                    let w_row = &weight[r * cols..(r + 1) * cols];
+                    let scale = scales[r];
+                    for (b, slot) in out_row.iter_mut().enumerate() {
+                        *slot = $dot(w_row, &x_br[b * cols..(b + 1) * cols]) * scale;
+                    }
+                })
+        };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::available() {
+        run!(|w, x| unsafe { crate::simd::x86::dot_i8(w, x) });
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        run!(|w, x| unsafe { crate::simd::neon::dot_i8(w, x) });
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        run!(crate::simd::dot_i8_scalar);
+    }
+}
+
+/// `[row][batch]` -> `[batch][row]`.
+///
+/// Costs `rows * batch` moves against the projection's `rows * cols * batch`
+/// multiply-adds, so it is noise at any real hidden size.
+pub fn transpose_rb_to_br(src_rb: &[f32], dst_br: &mut [f32], rows: usize, batch: usize) {
+    assert_eq!(src_rb.len(), rows * batch);
+    assert_eq!(dst_br.len(), rows * batch);
+    for r in 0..rows {
+        let row = &src_rb[r * batch..(r + 1) * batch];
+        for (b, v) in row.iter().enumerate() {
+            dst_br[b * rows + r] = *v;
+        }
+    }
+}
+
 #[inline(always)]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())

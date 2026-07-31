@@ -2,6 +2,9 @@
 name = "paged-infer"
 version = "0.1.0"
 edition = "2021"
+# Several binaries live in src/bin, so plain `cargo run` is ambiguous without
+# this. The CLI is the one you want by default.
+default-run = "paged-infer"
 description = "A Bare-Metal Rust Inference Engine with PagedAttention"
 
 [dependencies]

@@ -19,7 +19,7 @@ use crate::memory::block_table::BlockTable;
 use crate::memory::kv_cache_manager::KvCacheManager;
 use crate::memory::layout::KvLayout;
 use crate::memory::prefix_cache::PrefixCacheStats;
-use crate::model::{ForwardScratch, LlamaConfig, LlamaWeights};
+use crate::model::{BatchScratch, ForwardScratch, LlamaConfig, LlamaWeights};
 use crate::sampling::Sampler;
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,10 @@ pub struct EngineConfig {
     /// Prepended to every prompt when set.
     pub bos_token: Option<u32>,
     pub enable_prefix_cache: bool,
+    /// Most sequences decoded in one batched pass. Larger batches amortize the
+    /// weight traffic over more sequences; the cap bounds scratch memory, which
+    /// grows as `max_batch_size * vocab_size`.
+    pub max_batch_size: usize,
 }
 
 impl Default for EngineConfig {
@@ -50,6 +54,7 @@ impl Default for EngineConfig {
             eos_token: 2,
             bos_token: Some(1),
             enable_prefix_cache: true,
+            max_batch_size: 32,
         }
     }
 }
@@ -130,6 +135,7 @@ pub struct Engine<'a> {
     kv_cache: Vec<f32>,
     layout: KvLayout,
     scratch: ForwardScratch,
+    batch_scratch: BatchScratch,
     tokenizer: Option<Tokenizer>,
     waiting: VecDeque<Request>,
     active: Vec<Sequence>,
@@ -147,6 +153,7 @@ impl<'a> Engine<'a> {
         let kv = KvCacheManager::new(engine.total_blocks, engine.block_size)
             .with_prefix_cache(engine.enable_prefix_cache);
         let scratch = ForwardScratch::new(&config);
+        let batch_scratch = BatchScratch::new(&config, engine.max_batch_size.max(1));
 
         Self {
             weights,
@@ -156,6 +163,7 @@ impl<'a> Engine<'a> {
             kv_cache,
             layout,
             scratch,
+            batch_scratch,
             tokenizer: None,
             waiting: VecDeque::new(),
             active: Vec::new(),
@@ -375,15 +383,36 @@ impl<'a> Engine<'a> {
 
     // ── decode ───────────────────────────────────────────────────────────────
 
+    /// Advance every live sequence by one token.
+    ///
+    /// Memory is settled for all of them first, then they go through the model
+    /// together. That ordering is what makes batching possible: `decode_batch`
+    /// needs the block tables final and immutable, while growing a mapping or
+    /// splitting a shared block mutates them.
     fn decode(&mut self) {
-        let block_size = self.engine.block_size;
         let t0 = Instant::now();
+        let runnable = self.prepare_memory();
+        if !runnable.is_empty() {
+            // Chunked so scratch stays bounded regardless of how many sequences
+            // the scheduler admitted.
+            for chunk_start in (0..runnable.len()).step_by(self.batch_scratch.capacity()) {
+                let end = (chunk_start + self.batch_scratch.capacity()).min(runnable.len());
+                self.decode_chunk(&runnable[chunk_start..end]);
+            }
+        }
+        self.stats.decode_time += t0.elapsed();
+    }
+
+    /// Grow mappings and resolve copy-on-write for every sequence that will
+    /// step, returning the indices that are ready to run.
+    fn prepare_memory(&mut self) -> Vec<usize> {
+        let block_size = self.engine.block_size;
+        let mut runnable = Vec::with_capacity(self.active.len());
 
         for idx in 0..self.active.len() {
             if self.active[idx].finished.is_some() {
                 continue;
             }
-
             let pos = self.active[idx].token_ids.len() - 1;
             let seq_id = self.active[idx].id;
 
@@ -405,20 +434,44 @@ impl<'a> Engine<'a> {
                 .ensure_writable(seq_id, &mut table, pos, &mut self.kv_cache, &self.layout);
             self.active[idx].block_table = table;
 
-            let token = *self.active[idx].token_ids.last().expect("never empty");
-            self.weights.forward_into(
-                token,
-                pos,
-                &self.config,
-                &self.active[idx].block_table,
-                &mut self.kv_cache,
-                block_size,
-                None,
-                &mut self.scratch,
-            );
+            self.kv.touch(seq_id, self.tick);
+            runnable.push(idx);
+        }
+        runnable
+    }
 
+    /// One batched forward for `chunk`, then sample each sequence's next token.
+    fn decode_chunk(&mut self, chunk: &[usize]) {
+        let vocab = self.config.vocab_size;
+        let block_size = self.engine.block_size;
+
+        let tokens: Vec<u32> = chunk
+            .iter()
+            .map(|&i| *self.active[i].token_ids.last().expect("never empty"))
+            .collect();
+        let positions: Vec<usize> = chunk
+            .iter()
+            .map(|&i| self.active[i].token_ids.len() - 1)
+            .collect();
+        let tables: Vec<&BlockTable> = chunk.iter().map(|&i| &self.active[i].block_table).collect();
+
+        // The whole batch streams each weight matrix once between them, rather
+        // than once per sequence.
+        self.weights.decode_batch_into(
+            &tokens,
+            &positions,
+            &tables,
+            &self.config,
+            &mut self.kv_cache,
+            block_size,
+            &mut self.batch_scratch,
+        );
+        drop(tables);
+
+        for (b, &idx) in chunk.iter().enumerate() {
+            let logits = self.batch_scratch.logits_for_mut(b, vocab);
             let seq = &mut self.active[idx];
-            let next = seq.sampler.sample(&mut self.scratch.logits);
+            let next = seq.sampler.sample(logits);
             seq.generated.push(next);
             seq.token_ids.push(next);
             self.stats.generated_tokens += 1;
@@ -428,10 +481,7 @@ impl<'a> Engine<'a> {
             } else if seq.generated.len() >= seq.max_tokens {
                 seq.finished = Some(FinishReason::Length);
             }
-            self.kv.touch(seq_id, self.tick);
         }
-
-        self.stats.decode_time += t0.elapsed();
     }
 
     // ── reclamation ──────────────────────────────────────────────────────────

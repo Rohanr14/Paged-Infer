@@ -1,7 +1,8 @@
 use memmap2::MmapOptions;
 use paged_infer::memory::allocator::BlockAllocator;
 use paged_infer::memory::block_table::BlockTable;
-use paged_infer::model::{LlamaConfig, ModelLoader};
+use paged_infer::model::{ForwardScratch, LlamaConfig, ModelLoader, Quantization};
+use paged_infer::simd;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::time::Instant;
@@ -73,9 +74,19 @@ fn main() -> anyhow::Result<()> {
     let file = File::open(&model_path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let loader = ModelLoader::new(&mmap)?;
+    // QUANT=int8 stores projections as per-row int8. Worth measuring here
+    // rather than only in the kernel benchmark: weight memory dominates a 1B
+    // model's footprint, and a matvec is memory-bound so it is a speed knob too.
+    let quantization = match std::env::var("QUANT").as_deref() {
+        Ok("int8") => Quantization::Int8,
+        _ => Quantization::F32,
+    };
     let config = LlamaConfig {
         attention_window,
-        ..LlamaConfig::default()
+        quantization,
+        // Read the architecture from the checkpoint rather than assuming
+        // TinyLlama's shape.
+        ..LlamaConfig::beside_checkpoint(&model_path)
     };
     let weights = loader.load_weights(&config)?;
 
@@ -102,11 +113,16 @@ fn main() -> anyhow::Result<()> {
     let mut token_lat_us = Vec::with_capacity(batch_size * steps);
     let mut peak_rss_kb = read_rss_kb().unwrap_or(0);
 
+    // Reuse one scratch across every step, as the engine does. Calling the
+    // allocating `forward` here would fold ~10 allocations per token -- the
+    // largest a vocab-wide logit buffer -- into the measurement.
+    let mut scratch = ForwardScratch::new(&config);
+
     let t0 = Instant::now();
     for _ in 0..steps {
         for i in 0..batch_size {
             let start = Instant::now();
-            let logits = weights.forward(
+            weights.forward_into(
                 tokens[i],
                 positions[i],
                 &config,
@@ -114,10 +130,12 @@ fn main() -> anyhow::Result<()> {
                 &mut kv_cache,
                 block_size,
                 None,
+                &mut scratch,
             );
             token_lat_us.push(start.elapsed().as_micros());
 
-            let next = logits
+            let next = scratch
+                .logits
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
@@ -141,7 +159,22 @@ fn main() -> anyhow::Result<()> {
     let elapsed = t0.elapsed().as_secs_f64();
     let total_tokens = (batch_size * steps) as f64;
 
-    println!("E2E benchmark complete");
+    println!("E2E decode benchmark");
+    println!("===================");
+    println!("model      : {model_path}");
+    println!(
+        "weights    : {:.2} GB as {:?} ({:.2}x vs f32)",
+        weights.weight_bytes() as f64 / 1e9,
+        quantization,
+        weights.weight_bytes_f32() as f64 / weights.weight_bytes().max(1) as f64
+    );
+    println!(
+        "kv cache   : {:.2} GB ({total_blocks} blocks x {block_size} tokens)",
+        (kv_cache_size * 4) as f64 / 1e9
+    );
+    println!("simd       : {}", simd::backend());
+    println!("threads    : {}", rayon::current_num_threads());
+    println!();
     println!(
         "batch_size={batch_size}, steps={steps}, attention_window={}, total_tokens={}",
         attention_window.map_or("full".to_string(), |w| w.to_string()),

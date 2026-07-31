@@ -239,6 +239,26 @@ impl Projection {
         }
     }
 
+    /// Project `batch` activation vectors at once, streaming the weights a
+    /// single time instead of once per sequence.
+    ///
+    /// `x_br` and `out_br` are `[batch][feature]`-major. `stage` is scratch of
+    /// at least `rows * batch`, used for the kernel's `[row][batch]` output
+    /// before it is transposed back.
+    pub fn apply_batched(&self, out_br: &mut [f32], x_br: &[f32], batch: usize, stage: &mut [f32]) {
+        let (rows, cols) = (self.rows(), self.cols());
+        let stage = &mut stage[..rows * batch];
+        match self {
+            Projection::F32(w) => crate::math::matmat_f32_weight_transposed_parallel(
+                stage, x_br, &w.weight, batch, rows, cols,
+            ),
+            Projection::Int8(w) => crate::math::matmat_i8_weight_parallel(
+                stage, x_br, &w.weight, &w.scales, batch, rows, cols,
+            ),
+        }
+        crate::math::transpose_rb_to_br(stage, &mut out_br[..rows * batch], rows, batch);
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Projection::F32(w) => w.rows,
@@ -486,6 +506,80 @@ impl ForwardScratch {
             rope_sin: vec![0.0; half],
             logits: vec![0.0; config.vocab_size],
         }
+    }
+}
+
+/// Working memory for decoding several sequences in one pass.
+///
+/// Every per-sequence buffer is `[batch][feature]`-major, so sequence `b`'s
+/// slice is contiguous and the per-sequence steps (RMSNorm, RoPE, SwiGLU) index
+/// it directly.
+pub struct BatchScratch {
+    capacity: usize,
+    x: Vec<f32>,
+    xb: Vec<f32>,
+    attn_out: Vec<f32>,
+    proj_out: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    ff_gate: Vec<f32>,
+    ff_up: Vec<f32>,
+    ff_down: Vec<f32>,
+    /// `[row][batch]` output from the projection kernel, before transposing.
+    stage: Vec<f32>,
+    /// Rotary tables, one per sequence: batched sequences sit at different
+    /// positions, so they cannot share a table the way one sequence's heads do.
+    rope_cos: Vec<f32>,
+    rope_sin: Vec<f32>,
+    scores: Vec<f32>,
+    pub logits: Vec<f32>,
+}
+
+impl BatchScratch {
+    /// Allocate for up to `capacity` concurrent sequences.
+    pub fn new(config: &LlamaConfig, capacity: usize) -> Self {
+        let hidden = config.hidden_size;
+        let half = config.head_dim() / 2;
+        // The staging buffer has to hold the widest projection, which is the LM
+        // head at vocab_size rows.
+        let widest = config
+            .vocab_size
+            .max(config.intermediate_size)
+            .max(hidden)
+            .max(config.kv_dim());
+        Self {
+            capacity,
+            x: vec![0.0; capacity * hidden],
+            xb: vec![0.0; capacity * hidden],
+            attn_out: vec![0.0; capacity * hidden],
+            proj_out: vec![0.0; capacity * hidden],
+            q: vec![0.0; capacity * hidden],
+            k: vec![0.0; capacity * config.kv_dim()],
+            v: vec![0.0; capacity * config.kv_dim()],
+            ff_gate: vec![0.0; capacity * config.intermediate_size],
+            ff_up: vec![0.0; capacity * config.intermediate_size],
+            ff_down: vec![0.0; capacity * hidden],
+            stage: vec![0.0; capacity * widest],
+            rope_cos: vec![0.0; capacity * half],
+            rope_sin: vec![0.0; capacity * half],
+            scores: Vec::new(),
+            logits: vec![0.0; capacity * config.vocab_size],
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Logits for sequence `b` of a batch of `batch`.
+    pub fn logits_for(&self, b: usize, vocab_size: usize) -> &[f32] {
+        &self.logits[b * vocab_size..(b + 1) * vocab_size]
+    }
+
+    /// Mutable logits for sequence `b`, for sampling in place.
+    pub fn logits_for_mut(&mut self, b: usize, vocab_size: usize) -> &mut [f32] {
+        &mut self.logits[b * vocab_size..(b + 1) * vocab_size]
     }
 }
 
@@ -869,5 +963,269 @@ impl<'a> LlamaWeights<'a> {
         }
 
         rms_norm(&mut scratch.x, &self.final_norm, config.rms_norm_eps);
+    }
+
+    // ── batched decode ───────────────────────────────────────────────────────
+
+    /// Advance `tokens.len()` sequences by one token each, in a single pass.
+    ///
+    /// The projections are the reason this exists. Decoding sequences one at a
+    /// time re-reads every weight matrix per sequence, and a matvec is
+    /// memory-bound, so `batch` sequences cost `batch` times the DRAM traffic
+    /// for identical arithmetic. Batching streams each matrix once.
+    ///
+    /// Attention does *not* batch: each sequence has its own block table, its
+    /// own position, and its own KV history, so there is no shared operand.
+    /// It is instead parallelized across every (sequence, head) pair at once,
+    /// which gives Rayon more independent work than one sequence's heads would.
+    ///
+    /// Leaves sequence `b`'s logits at `scratch.logits_for(b, vocab_size)`.
+    /// `positions[b]` is where `tokens[b]` lands in its own sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batch_into(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block_tables: &[&BlockTable],
+        config: &LlamaConfig,
+        kv_cache: &mut [f32],
+        block_size: usize,
+        scratch: &mut BatchScratch,
+    ) {
+        let batch = tokens.len();
+        assert_eq!(positions.len(), batch);
+        assert_eq!(block_tables.len(), batch);
+        assert!(batch > 0, "decode_batch_into needs at least one sequence");
+        assert!(
+            batch <= scratch.capacity,
+            "batch {batch} exceeds scratch capacity {}",
+            scratch.capacity
+        );
+
+        let hidden = config.hidden_size;
+        let head_dim = config.head_dim();
+        let kv_dim = config.kv_dim();
+        let inter = config.intermediate_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let kv_group = config.kv_group();
+        let half = head_dim / 2;
+        let layout = config.kv_layout_for_cache(kv_cache.len(), block_size);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Sequences sit at different positions, so each needs its own rotary
+        // table and its own attention window.
+        let attn_window = config.attention_window.unwrap_or(usize::MAX);
+        let mut starts = Vec::with_capacity(batch);
+        let mut widest_window = 0;
+        for (b, &pos) in positions.iter().enumerate() {
+            rope_table(
+                pos,
+                head_dim,
+                config.rope_theta,
+                &mut scratch.rope_cos[b * half..(b + 1) * half],
+                &mut scratch.rope_sin[b * half..(b + 1) * half],
+            );
+            let start = (pos + 1).saturating_sub(attn_window);
+            widest_window = widest_window.max(pos + 1 - start);
+            starts.push(start);
+        }
+
+        for (b, &token_id) in tokens.iter().enumerate() {
+            let token = (token_id as usize) % config.vocab_size;
+            let bytes =
+                &self.token_embeddings.raw_bytes()[token * hidden * 2..(token + 1) * hidden * 2];
+            bf16_bytes_into_f32(bytes, &mut scratch.x[b * hidden..(b + 1) * hidden]);
+        }
+
+        // One score lane per (sequence, head), sized to the widest window in the
+        // batch so every lane has the same stride.
+        let lanes = batch * num_heads;
+        if scratch.scores.len() < lanes * widest_window {
+            scratch.scores.resize(lanes * widest_window, 0.0);
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            for b in 0..batch {
+                let span = b * hidden..(b + 1) * hidden;
+                scratch.xb[span.clone()].copy_from_slice(&scratch.x[span]);
+                rms_norm(
+                    &mut scratch.xb[b * hidden..(b + 1) * hidden],
+                    &layer.attention_norm,
+                    config.rms_norm_eps,
+                );
+            }
+
+            let xb = &scratch.xb[..batch * hidden];
+            layer
+                .attention
+                .wq
+                .apply_batched(&mut scratch.q, xb, batch, &mut scratch.stage);
+            layer
+                .attention
+                .wk
+                .apply_batched(&mut scratch.k, xb, batch, &mut scratch.stage);
+            layer
+                .attention
+                .wv
+                .apply_batched(&mut scratch.v, xb, batch, &mut scratch.stage);
+
+            // Rotate queries and keys separately: under GQA several query heads
+            // share one key head, so driving keys from the query loop would
+            // rotate them kv_group times over.
+            for b in 0..batch {
+                let (cos, sin) = (
+                    &scratch.rope_cos[b * half..(b + 1) * half],
+                    &scratch.rope_sin[b * half..(b + 1) * half],
+                );
+                for h in 0..num_heads {
+                    let off = b * hidden + h * head_dim;
+                    rope_rotate(
+                        &mut scratch.q[off..off + head_dim],
+                        cos,
+                        sin,
+                        config.rope_style,
+                    );
+                }
+                for kv_h in 0..num_kv_heads {
+                    let off = b * kv_dim + kv_h * head_dim;
+                    rope_rotate(
+                        &mut scratch.k[off..off + head_dim],
+                        cos,
+                        sin,
+                        config.rope_style,
+                    );
+                }
+            }
+
+            for b in 0..batch {
+                if let Some((pb, offset)) =
+                    block_tables[b].get_physical_location(positions[b], block_size)
+                {
+                    for kv_h in 0..num_kv_heads {
+                        let src = b * kv_dim + kv_h * head_dim;
+                        let k_idx = layout.index(layer_idx, pb.index, offset, kv_h, false);
+                        let v_idx = layout.index(layer_idx, pb.index, offset, kv_h, true);
+                        kv_cache[k_idx..k_idx + head_dim]
+                            .copy_from_slice(&scratch.k[src..src + head_dim]);
+                        kv_cache[v_idx..v_idx + head_dim]
+                            .copy_from_slice(&scratch.v[src..src + head_dim]);
+                    }
+                }
+            }
+
+            // Every KV write for this step is done, so the cache is read-only
+            // below and the output slices are disjoint.
+            let kv_ref: &[f32] = &*kv_cache;
+            let q_ref: &[f32] = &scratch.q;
+            let attn_out = &mut scratch.attn_out[..batch * hidden];
+            let scores = &mut scratch.scores[..lanes * widest_window];
+            let starts_ref = &starts;
+
+            attn_out
+                .par_chunks_mut(head_dim)
+                .zip(scores.par_chunks_mut(widest_window))
+                .enumerate()
+                .for_each(|(lane, (out_slice, score_lane))| {
+                    let b = lane / num_heads;
+                    let h = lane % num_heads;
+                    let pos = positions[b];
+                    let start_t = starts_ref[b];
+                    let kv_h = h / kv_group;
+                    let table = block_tables[b];
+                    let q_start = b * hidden + h * head_dim;
+                    let q_head = &q_ref[q_start..q_start + head_dim];
+
+                    // This sequence may have a shorter window than the widest in
+                    // the batch; only its own span participates.
+                    let used = pos + 1 - start_t;
+                    let score_lane = &mut score_lane[..used];
+
+                    for (si, t) in (start_t..=pos).enumerate() {
+                        score_lane[si] = match table.get_physical_location(t, block_size) {
+                            Some((pb, off)) => {
+                                let k_idx = layout.index(layer_idx, pb.index, off, kv_h, false);
+                                crate::math::dot(q_head, &kv_ref[k_idx..k_idx + head_dim]) * scale
+                            }
+                            None => f32::NEG_INFINITY,
+                        };
+                    }
+
+                    crate::math::softmax_in_place(score_lane);
+
+                    out_slice.fill(0.0);
+                    for (si, t) in (start_t..=pos).enumerate() {
+                        let weight = score_lane[si];
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        if let Some((pb, off)) = table.get_physical_location(t, block_size) {
+                            let v_idx = layout.index(layer_idx, pb.index, off, kv_h, true);
+                            crate::math::axpy(out_slice, weight, &kv_ref[v_idx..v_idx + head_dim]);
+                        }
+                    }
+                });
+
+            let attn_in = &scratch.attn_out[..batch * hidden];
+            layer.attention.wo.apply_batched(
+                &mut scratch.proj_out,
+                attn_in,
+                batch,
+                &mut scratch.stage,
+            );
+            for i in 0..batch * hidden {
+                scratch.x[i] += scratch.proj_out[i];
+            }
+
+            for b in 0..batch {
+                let span = b * hidden..(b + 1) * hidden;
+                scratch.xb[span.clone()].copy_from_slice(&scratch.x[span]);
+                rms_norm(
+                    &mut scratch.xb[b * hidden..(b + 1) * hidden],
+                    &layer.ffn_norm,
+                    config.rms_norm_eps,
+                );
+            }
+
+            let xb = &scratch.xb[..batch * hidden];
+            layer.feed_forward.w1.apply_batched(
+                &mut scratch.ff_gate,
+                xb,
+                batch,
+                &mut scratch.stage,
+            );
+            layer
+                .feed_forward
+                .w3
+                .apply_batched(&mut scratch.ff_up, xb, batch, &mut scratch.stage);
+            // SwiGLU is elementwise, so the whole batch goes through in one
+            // call — no per-sequence loop, and the two buffers are disjoint
+            // fields so both borrows coexist.
+            let gate = &mut scratch.ff_gate[..batch * inter];
+            let up = &scratch.ff_up[..batch * inter];
+            swiglu(gate, up);
+            let ff = &scratch.ff_gate[..batch * inter];
+            layer.feed_forward.w2.apply_batched(
+                &mut scratch.ff_down,
+                ff,
+                batch,
+                &mut scratch.stage,
+            );
+            for i in 0..batch * hidden {
+                scratch.x[i] += scratch.ff_down[i];
+            }
+        }
+
+        for b in 0..batch {
+            rms_norm(
+                &mut scratch.x[b * hidden..(b + 1) * hidden],
+                &self.final_norm,
+                config.rms_norm_eps,
+            );
+        }
+
+        let x = &scratch.x[..batch * hidden];
+        self.lm_head
+            .apply_batched(&mut scratch.logits, x, batch, &mut scratch.stage);
     }
 }
