@@ -261,3 +261,236 @@ fn test_sliding_window_is_respected_per_sequence() {
         assert!(delta < 1e-5, "windowed sequence {b} diverged: {delta}");
     }
 }
+
+// ── batched prefill ──────────────────────────────────────────────────────────
+
+use paged_infer::model::LlamaConfig as Cfg;
+
+/// Prefill a prompt both ways and compare the resulting logits.
+fn compare_prefill(prompt_len: usize, chunk_size: usize, start_split: Option<usize>) -> f32 {
+    let (config, tokens, bytes) = fixture();
+    let loader = ModelLoader::new(&bytes).unwrap();
+    let weights = loader.load_weights(&config).unwrap();
+    let prompt = &tokens[..prompt_len];
+    let blocks = prompt_len.div_ceil(BLOCK_SIZE) + 2;
+
+    let build_table = |allocator: &mut BlockAllocator| {
+        let mut t = BlockTable::new();
+        for _ in 0..blocks {
+            t.append_block(allocator.allocate().unwrap());
+        }
+        t
+    };
+
+    // Reference: the position-at-a-time prefill.
+    let mut ref_cache = new_cache(&config);
+    let mut ref_alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+    let ref_table = build_table(&mut ref_alloc);
+    let reference = weights.prefill(
+        prompt,
+        0,
+        &config,
+        &ref_table,
+        &mut ref_cache,
+        BLOCK_SIZE,
+        None,
+    );
+
+    // Batched, optionally resumed mid-prompt the way a prefix-cache hit does.
+    let mut cache = new_cache(&config);
+    let mut alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+    let table = build_table(&mut alloc);
+    let mut scratch = BatchScratch::new(&config, chunk_size.max(1));
+    match start_split {
+        None => weights.prefill_batched(
+            prompt,
+            0,
+            &config,
+            &table,
+            &mut cache,
+            BLOCK_SIZE,
+            chunk_size,
+            &mut scratch,
+        ),
+        Some(split) => {
+            weights.prefill_batched(
+                &prompt[..split],
+                0,
+                &config,
+                &table,
+                &mut cache,
+                BLOCK_SIZE,
+                chunk_size,
+                &mut scratch,
+            );
+            weights.prefill_batched(
+                &prompt[split..],
+                split,
+                &config,
+                &table,
+                &mut cache,
+                BLOCK_SIZE,
+                chunk_size,
+                &mut scratch,
+            );
+        }
+    }
+
+    max_abs(scratch.logits_for(0, config.vocab_size), &reference)
+}
+
+#[test]
+fn test_batched_prefill_matches_sequential_prefill() {
+    for chunk in [1, 2, 4, 8, 16, 64] {
+        let delta = compare_prefill(24, chunk, None);
+        println!("prefill chunk={chunk}: max|delta|={delta:.8}");
+        assert!(delta < 1e-5, "chunk {chunk} diverged: {delta}");
+    }
+}
+
+#[test]
+fn test_batched_prefill_handles_a_ragged_final_chunk() {
+    // 23 tokens in chunks of 8 leaves a final chunk of 7.
+    let delta = compare_prefill(23, 8, None);
+    println!("ragged final chunk: max|delta|={delta:.8}");
+    assert!(delta < 1e-5, "ragged tail diverged: {delta}");
+}
+
+#[test]
+fn test_batched_prefill_chunk_larger_than_the_prompt() {
+    let delta = compare_prefill(5, 64, None);
+    assert!(delta < 1e-5, "oversized chunk diverged: {delta}");
+}
+
+#[test]
+fn test_batched_prefill_can_resume_mid_prompt() {
+    // What a prefix-cache hit does: replay only the uncached suffix and land on
+    // exactly the state a full prefill would have produced.
+    let delta = compare_prefill(24, 8, Some(16));
+    println!("resumed prefill: max|delta|={delta:.8}");
+    assert!(delta < 1e-5, "resumed prefill diverged: {delta}");
+}
+
+#[test]
+fn test_batched_prefill_is_causal() {
+    // The load-bearing property: a position inside a chunk must not see the
+    // positions after it. If it did, changing a later token would change an
+    // earlier one's output.
+    let (config, tokens, bytes) = fixture();
+    let loader = ModelLoader::new(&bytes).unwrap();
+    let weights = loader.load_weights(&config).unwrap();
+
+    let run = |prompt: &[u32]| -> Vec<f32> {
+        let mut cache = new_cache(&config);
+        let mut alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+        let mut table = BlockTable::new();
+        for _ in 0..prompt.len().div_ceil(BLOCK_SIZE) + 2 {
+            table.append_block(alloc.allocate().unwrap());
+        }
+        let mut scratch = BatchScratch::new(&config, 16);
+        // One chunk holds the whole prompt, so every position is in the batch
+        // together -- the case where a masking bug would show.
+        weights.prefill_batched(
+            prompt,
+            0,
+            &config,
+            &table,
+            &mut cache,
+            BLOCK_SIZE,
+            16,
+            &mut scratch,
+        );
+        scratch.logits_for(0, config.vocab_size).to_vec()
+    };
+
+    // Truncating the prompt must reproduce the shorter prompt's own answer.
+    let short = run(&tokens[..8]);
+    let mut altered = tokens[..8].to_vec();
+    altered.extend_from_slice(&[7, 7, 7, 7]);
+    // The 12-token run's *first eight* positions saw the same history, so
+    // prefilling 8 alone must equal prefilling 8 of the 12-token prompt.
+    let mut cache = new_cache(&config);
+    let mut alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+    let mut table = BlockTable::new();
+    for _ in 0..4 {
+        table.append_block(alloc.allocate().unwrap());
+    }
+    let mut scratch = BatchScratch::new(&config, 16);
+    weights.prefill_batched(
+        &altered,
+        0,
+        &config,
+        &table,
+        &mut cache,
+        BLOCK_SIZE,
+        16,
+        &mut scratch,
+    );
+    // Re-derive position 7's logits from the same cache by decoding token 7
+    // again at position 7 -- it must not have been contaminated by 8..11.
+    let mut single = ForwardScratch::new(&config);
+    weights.forward_into(
+        tokens[7],
+        7,
+        &config,
+        &table,
+        &mut cache,
+        BLOCK_SIZE,
+        None,
+        &mut single,
+    );
+    let delta = max_abs(&single.logits, &short);
+    println!("causality check: max|delta|={delta:.8}");
+    assert!(
+        delta < 1e-5,
+        "a position saw tokens that come after it: {delta}"
+    );
+}
+
+#[test]
+fn test_batched_prefill_respects_scratch_capacity() {
+    // Asking for a chunk larger than the scratch was built for must clamp, not
+    // overrun.
+    let (config, tokens, bytes) = fixture();
+    let loader = ModelLoader::new(&bytes).unwrap();
+    let weights = loader.load_weights(&config).unwrap();
+    let mut cache = new_cache(&config);
+    let mut alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+    let mut table = BlockTable::new();
+    for _ in 0..6 {
+        table.append_block(alloc.allocate().unwrap());
+    }
+    let mut scratch = BatchScratch::new(&config, 4);
+    weights.prefill_batched(
+        &tokens[..20],
+        0,
+        &config,
+        &table,
+        &mut cache,
+        BLOCK_SIZE,
+        999,
+        &mut scratch,
+    );
+
+    let mut ref_cache = new_cache(&config);
+    let mut ref_alloc = BlockAllocator::new(TOTAL_BLOCKS, BLOCK_SIZE);
+    let mut ref_table = BlockTable::new();
+    for _ in 0..6 {
+        ref_table.append_block(ref_alloc.allocate().unwrap());
+    }
+    let reference = weights.prefill(
+        &tokens[..20],
+        0,
+        &config,
+        &ref_table,
+        &mut ref_cache,
+        BLOCK_SIZE,
+        None,
+    );
+    let delta = max_abs(scratch.logits_for(0, config.vocab_size), &reference);
+    assert!(delta < 1e-5, "capacity-clamped prefill diverged: {delta}");
+}
+
+// Silence the unused-import warning when only some tests reference it.
+#[allow(dead_code)]
+fn _cfg_marker(_: &Cfg) {}

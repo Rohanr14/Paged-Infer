@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 89 tests, incl. golden parity
+cargo test                                        # 95 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -166,10 +166,23 @@ batch one sequence at a time, so this is the *sequential* path — see
 MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark
 ```
 
-That 5,870 MB is the honest cost of the current design: weights are widened from
-bf16 to f32 once at load, so a 1.1B-parameter model carries ~4.2 GB of
-projections plus the KV pool. `QUANT=int8` stores them per-row int8 instead and
-takes roughly a quarter of that.
+That 5,870 MB is the cost of widening bf16 to f32 at load: a 1.1B model carries
+~4.14 GB of projections plus the KV pool. `QUANT=int8` stores them per-row int8
+instead, and because decode is memory-bound it is a *throughput* knob, not only
+a footprint one:
+
+| | weights | throughput | avg latency | p95 | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| f32 | 4.14 GB | 11.37 tok/s | 88.0 ms | 83.7 ms | 5,870 MB |
+| **int8** | **1.23 GB** | **31.79 tok/s** | **31.5 ms** | 39.9 ms | **3,320 MB** |
+
+A quarter of the weight bytes buys **2.8x the throughput**. The ratio is 3.36x
+rather than 4x because the LM head stays f32 on purpose, and RSS falls by less
+than the weights do because the KV pool and the mapped checkpoint are unchanged.
+
+```bash
+QUANT=int8 MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin e2e_benchmark
+```
 
 ### Batched decode
 
@@ -178,15 +191,20 @@ multiply-add per element — so running `B` sequences one at a time reads the
 weights `B` times. `decode_batch_into` runs the active batch through the model
 together, streaming each matrix once and reusing every row across the batch.
 
-Measured on **4-core x86_64 (AVX2+FMA)**, 0.77 GB of weights, 128 tokens of
-context:
+**TinyLlama 1.1B (4.14 GB of f32 weights), Apple Silicon, NEON, 8 threads, 128
+tokens of context:**
 
 | batch | sequential | batched | speedup | weight GB/s |
 |---:|---:|---:|---:|---:|
-| 1 | 32.22 tok/s | 32.03 tok/s | 0.99x | 24.7 |
-| 2 | 34.36 tok/s | 53.66 tok/s | 1.56x | 20.7 |
-| 4 | 34.38 tok/s | 86.20 tok/s | **2.51x** | 16.6 |
-| 8 | 33.37 tok/s | 105.68 tok/s | **3.17x** | 10.2 |
+| 1 | 13.71 tok/s | 13.93 tok/s | 1.02x | 57.6 |
+| 2 | 13.72 tok/s | 26.49 tok/s | 1.93x | 54.8 |
+| 4 | 13.49 tok/s | 50.50 tok/s | **3.74x** | 52.2 |
+| 8 | 13.81 tok/s | 59.80 tok/s | **4.33x** | 30.9 |
+
+The same sweep on **4-core x86_64 (AVX2+FMA)** with 0.77 GB of weights reaches
+2.51x at batch 4 and 3.17x at batch 8. Apple Silicon does better because it
+sustains ~57 GB/s to the CPU against that machine's ~25, so it stays
+bandwidth-bound — the regime where batching pays — out to a larger batch.
 
 Sequential throughput is flat in batch size, which is the point: it is doing `B`
 times the work for `B` times the traffic. Batch 1 costs nothing (0.99x), so
@@ -199,9 +217,37 @@ block table) plus per-sequence RMSNorm, RoPE and SwiGLU. Context length moves
 this less than batch size does: at batch 8, 3.8x at 32 tokens of context against
 3.3x at 512.
 
-Batched and sequential decode are **bit-identical** on the fixture model
-(`max|Δ| = 0.00000000`), including ragged batches, block-boundary crossings and
-per-sequence sliding windows. Only the loop nesting changed.
+### Batched prefill
+
+Prefill sets time-to-first-token, and it batches along *positions* instead of
+sequences — same kernel, same reason. It is correct for the same reason too:
+every position's K/V is written to the cache before any attention runs, and a
+position's attention loop ends at itself, so it sees the positions before it in
+the chunk and none after. That is exactly causal masking, for free.
+
+Over a 256-token prompt, synthetic weights, 4-core x86_64:
+
+| positions per pass | prefill | throughput | speedup |
+|---:|---:|---:|---:|
+| 1 (sequential) | 6.314 s | 40.5 tok/s | 1.00x |
+| 4 | 2.652 s | 96.5 tok/s | 2.38x |
+| 8 | 1.889 s | 135.5 tok/s | **3.34x** |
+| 32 | 1.921 s | 133.2 tok/s | 3.29x |
+| 64 | 1.781 s | 143.7 tok/s | **3.55x** |
+
+The gain plateaus after about 8 positions per pass, so the default chunk of 32
+is comfortably past the knee — no reason to spend scratch memory on more.
+
+Only the final position pays for the LM head. That projection is
+`vocab_size x hidden_size`, the largest matrix in the model, so running every
+prompt position through it would cost more than the layers do.
+
+Batched decode and prefill are both **bit-identical** to the paths they replace
+on the fixture model (`max|Δ| = 0.00000000`) — ragged batches, block-boundary
+crossings, per-sequence sliding windows, ragged final chunks, resumed
+mid-prompt prefill after a cache hit, and an explicit causality check that a
+position inside a chunk cannot see the ones after it. Only the loop nesting
+changed.
 
 ```bash
 cargo run --release --bin batch_benchmark          # synthetic weights, no download
@@ -337,13 +383,13 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-89 tests, no model download required.
+95 tests, no model download required.
 
 | suite | covers |
 |---|---|
 | `golden_parity_tests` | full forward pass vs the NumPy reference: decode, prefill, resumed prefill |
 | `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
-| `batched_decode_tests` | batched decode is bit-identical to sequential: ragged batches, block boundaries, per-sequence windows |
+| `batched_decode_tests` | batched decode and prefill are bit-identical to the paths they replace: ragged batches, block boundaries, per-sequence windows, ragged chunks, resumed prefill, causality |
 | `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
@@ -359,11 +405,6 @@ byte for byte.
 
 ## Honest limitations
 
-- **Prefill is still a loop over positions**, not a batched GEMM. It skips the LM
-  head for all but the last token, which is most of the easy saving, but a real
-  prefill would push the whole prompt through as a matrix — the same trick decode
-  now uses, applied across positions instead of across sequences. This is the
-  biggest remaining throughput win.
 - **Attention does not batch.** Each sequence has its own block table, position
   and KV history, so there is no shared operand to amortize. It is parallelized
   across (sequence, head) pairs instead. This is what caps the batched-decode

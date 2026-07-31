@@ -171,6 +171,45 @@ fn run_batched(
     start.elapsed().as_secs_f64()
 }
 
+/// Prefill a prompt one position at a time.
+fn prefill_sequential(weights: &LlamaWeights<'_>, h: &mut Harness, prompt: &[u32]) -> f64 {
+    let mut scratch = ForwardScratch::new(&h.config);
+    let start = Instant::now();
+    weights.prefill_into(
+        prompt,
+        0,
+        &h.config,
+        &h.tables[0],
+        &mut h.kv_cache,
+        BLOCK_SIZE,
+        None,
+        &mut scratch,
+    );
+    start.elapsed().as_secs_f64()
+}
+
+/// Prefill the same prompt `chunk` positions at a time.
+fn prefill_batched(
+    weights: &LlamaWeights<'_>,
+    h: &mut Harness,
+    prompt: &[u32],
+    chunk: usize,
+) -> f64 {
+    let mut scratch = BatchScratch::new(&h.config, chunk);
+    let start = Instant::now();
+    weights.prefill_batched(
+        prompt,
+        0,
+        &h.config,
+        &h.tables[0],
+        &mut h.kv_cache,
+        BLOCK_SIZE,
+        chunk,
+        &mut scratch,
+    );
+    start.elapsed().as_secs_f64()
+}
+
 fn main() -> anyhow::Result<()> {
     let steps = env_usize("BENCH_STEPS", 8);
     let context = env_usize("BENCH_CONTEXT", 128);
@@ -266,6 +305,45 @@ fn main() -> anyhow::Result<()> {
             batched_traffic
         );
     }
+
+    // ── prefill ──────────────────────────────────────────────────────────────
+    let prompt_len = env_usize("BENCH_PROMPT", 256);
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| (i % 1000) as u32).collect();
+
+    println!();
+    println!("Prefill: positions per pass over a {prompt_len}-token prompt");
+    println!(
+        "{:<10} {:>15} {:>12} {:>10}",
+        "chunk", "prefill time", "tok/s", "speedup"
+    );
+    println!("{}", "-".repeat(51));
+
+    let mut h = Harness::new(&config, 1, prompt_len + 2);
+    prefill_batched(&weights, &mut h, &prompt[..8.min(prompt_len)], 8);
+    let base = prefill_sequential(&weights, &mut h, &prompt);
+    println!(
+        "{:<10} {:>12.3} s {:>12.1} {:>9.2}x",
+        "1 (seq)",
+        base,
+        prompt_len as f64 / base,
+        1.0
+    );
+    for chunk in [4usize, 8, 16, 32, 64] {
+        let secs = prefill_batched(&weights, &mut h, &prompt, chunk);
+        println!(
+            "{:<10} {:>12.3} s {:>12.1} {:>9.2}x",
+            chunk,
+            secs,
+            prompt_len as f64 / secs,
+            base / secs.max(1e-12)
+        );
+    }
+    println!();
+    println!("Prefill batches along positions rather than sequences, but the kernel");
+    println!("and the reason are identical: one pass over the weights serves the whole");
+    println!("chunk. Causality still holds because each position attends only up to");
+    println!("itself, and every position's K/V is written before any attention runs.");
+    println!("This is the path that sets time-to-first-token.");
 
     println!();
     println!("Sequential decode reads every weight matrix once per sequence; batched");

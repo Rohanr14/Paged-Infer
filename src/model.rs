@@ -979,10 +979,19 @@ impl<'a> LlamaWeights<'a> {
     /// It is instead parallelized across every (sequence, head) pair at once,
     /// which gives Rayon more independent work than one sequence's heads would.
     ///
-    /// Leaves sequence `b`'s logits at `scratch.logits_for(b, vocab_size)`.
-    /// `positions[b]` is where `tokens[b]` lands in its own sequence.
+    /// Run every transformer layer for a batch of (token, position, table)
+    /// triples, leaving each entry's final normalized hidden state in
+    /// `scratch.x`. Shared by batched decode and batched prefill.
+    ///
+    /// The two differ only in what the batch *means*. Decode passes one token
+    /// from each of several sequences; prefill passes consecutive tokens of one
+    /// sequence, with the same block table repeated. Both are correct here for
+    /// the same reason: every entry's K/V is written to the cache before any
+    /// attention runs, and an entry's attention loop ends at its own position —
+    /// so a prefill entry sees the entries before it in the chunk and none
+    /// after, which is exactly causal masking.
     #[allow(clippy::too_many_arguments)]
-    pub fn decode_batch_into(
+    fn run_layers_batch(
         &self,
         tokens: &[u32],
         positions: &[usize],
@@ -1223,9 +1232,83 @@ impl<'a> LlamaWeights<'a> {
                 config.rms_norm_eps,
             );
         }
+    }
 
-        let x = &scratch.x[..batch * hidden];
+    /// Advance `tokens.len()` sequences by one token each, in a single pass.
+    ///
+    /// Leaves sequence `b`'s logits at `scratch.logits_for(b, vocab_size)`.
+    /// `positions[b]` is where `tokens[b]` lands in its own sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batch_into(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block_tables: &[&BlockTable],
+        config: &LlamaConfig,
+        kv_cache: &mut [f32],
+        block_size: usize,
+        scratch: &mut BatchScratch,
+    ) {
+        let batch = tokens.len();
+        self.run_layers_batch(
+            tokens,
+            positions,
+            block_tables,
+            config,
+            kv_cache,
+            block_size,
+            scratch,
+        );
+        let x = &scratch.x[..batch * config.hidden_size];
         self.lm_head
             .apply_batched(&mut scratch.logits, x, batch, &mut scratch.stage);
+    }
+
+    /// Consume a whole prompt, processing `chunk_size` positions at a time.
+    ///
+    /// Prefill was the last part of the engine still walking one token at a
+    /// time, which meant re-reading every weight matrix per prompt token — the
+    /// same waste batched decode removed, on the path that sets
+    /// time-to-first-token. Positions batch exactly like sequences do: their
+    /// projections are independent, and causality is already enforced by each
+    /// entry attending only up to its own position.
+    ///
+    /// Only the final position pays for the LM head, and its logits land at
+    /// `scratch.logits_for(0, vocab_size)`. `start_pos` is where `tokens[0]`
+    /// sits, so a prefix-cache hit can replay just the uncached suffix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_batched(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        config: &LlamaConfig,
+        block_table: &BlockTable,
+        kv_cache: &mut [f32],
+        block_size: usize,
+        chunk_size: usize,
+        scratch: &mut BatchScratch,
+    ) {
+        assert!(!tokens.is_empty(), "prefill needs at least one token");
+        let hidden = config.hidden_size;
+        let chunk_size = chunk_size.clamp(1, scratch.capacity());
+
+        let mut last_hidden_at = 0;
+        for (c, chunk) in tokens.chunks(chunk_size).enumerate() {
+            let base = start_pos + c * chunk_size;
+            let positions: Vec<usize> = (0..chunk.len()).map(|i| base + i).collect();
+            // Every position of one sequence shares that sequence's mapping.
+            let tables = vec![block_table; chunk.len()];
+            self.run_layers_batch(
+                chunk, &positions, &tables, config, kv_cache, block_size, scratch,
+            );
+            last_hidden_at = chunk.len() - 1;
+        }
+
+        // Only the last position needs logits. The LM head is `vocab_size x
+        // hidden_size` — the largest matrix in the model — so projecting every
+        // prompt position through it would cost more than the layers did.
+        let x = &scratch.x[last_hidden_at * hidden..(last_hidden_at + 1) * hidden];
+        let logits = &mut scratch.logits[..config.vocab_size];
+        self.lm_head.apply_parallel(logits, x);
     }
 }

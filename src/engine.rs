@@ -19,7 +19,7 @@ use crate::memory::block_table::BlockTable;
 use crate::memory::kv_cache_manager::KvCacheManager;
 use crate::memory::layout::KvLayout;
 use crate::memory::prefix_cache::PrefixCacheStats;
-use crate::model::{BatchScratch, ForwardScratch, LlamaConfig, LlamaWeights};
+use crate::model::{BatchScratch, LlamaConfig, LlamaWeights};
 use crate::sampling::Sampler;
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,10 @@ pub struct EngineConfig {
     /// weight traffic over more sequences; the cap bounds scratch memory, which
     /// grows as `max_batch_size * vocab_size`.
     pub max_batch_size: usize,
+    /// Prompt positions pushed through the model together during prefill. Same
+    /// trade as `max_batch_size`, along the position axis instead of the
+    /// sequence axis.
+    pub prefill_chunk_size: usize,
 }
 
 impl Default for EngineConfig {
@@ -55,6 +59,7 @@ impl Default for EngineConfig {
             bos_token: Some(1),
             enable_prefix_cache: true,
             max_batch_size: 32,
+            prefill_chunk_size: 32,
         }
     }
 }
@@ -134,7 +139,6 @@ pub struct Engine<'a> {
     kv: KvCacheManager,
     kv_cache: Vec<f32>,
     layout: KvLayout,
-    scratch: ForwardScratch,
     batch_scratch: BatchScratch,
     tokenizer: Option<Tokenizer>,
     waiting: VecDeque<Request>,
@@ -152,8 +156,8 @@ impl<'a> Engine<'a> {
         let kv_cache = vec![0.0; layout.total_floats()];
         let kv = KvCacheManager::new(engine.total_blocks, engine.block_size)
             .with_prefix_cache(engine.enable_prefix_cache);
-        let scratch = ForwardScratch::new(&config);
-        let batch_scratch = BatchScratch::new(&config, engine.max_batch_size.max(1));
+        let batch_capacity = engine.max_batch_size.max(engine.prefill_chunk_size).max(1);
+        let batch_scratch = BatchScratch::new(&config, batch_capacity);
 
         Self {
             weights,
@@ -162,7 +166,6 @@ impl<'a> Engine<'a> {
             kv,
             kv_cache,
             layout,
-            scratch,
             batch_scratch,
             tokenizer: None,
             waiting: VecDeque::new(),
@@ -303,6 +306,7 @@ impl<'a> Engine<'a> {
                 break;
             };
             let req = self.waiting.pop_front().expect("front was just checked");
+            let vocab = self.config.vocab_size;
             self.next_sequence_id += 1;
             let admitted_at = Instant::now();
 
@@ -311,15 +315,15 @@ impl<'a> Engine<'a> {
             // its KV is rewritten with identical values.
             let resume_at = admission.cached_tokens.min(req.tokens.len() - 1);
             let t0 = Instant::now();
-            self.weights.prefill_into(
+            self.weights.prefill_batched(
                 &req.tokens[resume_at..],
                 resume_at,
                 &self.config,
                 &admission.block_table,
                 &mut self.kv_cache,
                 self.engine.block_size,
-                None,
-                &mut self.scratch,
+                self.engine.prefill_chunk_size,
+                &mut self.batch_scratch,
             );
             self.stats.prefill_time += t0.elapsed();
             self.stats.requests += 1;
@@ -355,7 +359,7 @@ impl<'a> Engine<'a> {
                     self.engine.top_k,
                     self.engine.seed ^ ((sid as u64) << 16) ^ i as u64,
                 );
-                let first = sampler.sample(&mut self.scratch.logits);
+                let first = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
                 self.stats.generated_tokens += 1;
 
                 let mut token_ids = req.tokens.clone();
