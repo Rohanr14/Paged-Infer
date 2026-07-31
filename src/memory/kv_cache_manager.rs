@@ -90,12 +90,16 @@ impl KvCacheManager {
     /// Release every sequence and drop the prefix cache, returning the pool to
     /// its initial state. Intended for benchmarks measuring several
     /// configurations against one loaded model.
+    ///
+    /// Counters are zeroed along with the blocks: a hit rate that carried over
+    /// from a previous configuration would describe neither of them.
     pub fn clear(&mut self) {
         let ids: Vec<usize> = self.sequences.keys().copied().collect();
         for id in ids {
             self.release_sequence(id);
         }
         self.prefix_cache.clear(&mut self.allocator);
+        self.prefix_cache.reset_stats();
         self.cow_copies = 0;
         debug_assert_eq!(
             self.allocator.available_blocks(),

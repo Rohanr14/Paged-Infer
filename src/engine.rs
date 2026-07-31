@@ -53,6 +53,13 @@ pub struct EngineConfig {
     /// distributionally faithful, so it takes the ordinary path instead of a
     /// subtly wrong shortcut.
     pub draft_tokens: usize,
+    /// Record every token the moment it is produced, for
+    /// [`Engine::take_deltas`].
+    ///
+    /// Off by default because it is only useful to a caller that drains it
+    /// every step; a batch caller that never looked would accumulate the whole
+    /// run's output twice over.
+    pub stream_tokens: bool,
 }
 
 impl Default for EngineConfig {
@@ -70,6 +77,7 @@ impl Default for EngineConfig {
             max_batch_size: 32,
             prefill_chunk_size: 32,
             draft_tokens: 0,
+            stream_tokens: false,
         }
     }
 }
@@ -82,6 +90,24 @@ pub enum FinishReason {
     Length,
     /// The KV cache could not grow to hold another token.
     OutOfMemory,
+    /// The caller gave up on the request — a disconnected streaming client,
+    /// typically. Whatever was generated up to that point is still returned.
+    Cancelled,
+}
+
+/// Tokens one sequence produced during a single step.
+///
+/// Usually one token. A speculative step that had drafts accepted emits the
+/// whole accepted run at once, which is exactly what a streaming client should
+/// see — the tokens really are all available at that instant.
+#[derive(Debug, Clone)]
+pub struct TokenDelta {
+    pub request_id: usize,
+    pub sequence_id: usize,
+    pub tokens: Vec<u32>,
+    /// Set on the last delta of a sequence, so a streaming consumer can close
+    /// the stream without waiting for the completion to be reclaimed.
+    pub finish_reason: Option<FinishReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +193,7 @@ pub struct Engine<'a> {
     waiting: VecDeque<Request>,
     active: Vec<Sequence>,
     completed: Vec<Completion>,
+    deltas: Vec<TokenDelta>,
     next_request_id: usize,
     next_sequence_id: usize,
     tick: u64,
@@ -195,6 +222,7 @@ impl<'a> Engine<'a> {
             waiting: VecDeque::new(),
             active: Vec::new(),
             completed: Vec::new(),
+            deltas: Vec::new(),
             next_request_id: 0,
             next_sequence_id: 0,
             tick: 0,
@@ -224,6 +252,44 @@ impl<'a> Engine<'a> {
         self.kv.cow_copies()
     }
 
+    pub fn total_blocks(&self) -> usize {
+        self.kv.total_blocks()
+    }
+
+    /// Blocks not currently mapped by a sequence or held by the prefix cache.
+    pub fn available_blocks(&self) -> usize {
+        self.kv.available_blocks()
+    }
+
+    /// Sequences decoding right now, and requests still queued behind them.
+    pub fn queue_depth(&self) -> (usize, usize) {
+        (self.active.len(), self.waiting.len())
+    }
+
+    /// Stop generating for a request, freeing its blocks at the next step.
+    ///
+    /// A streaming client that hangs up would otherwise keep paying for tokens
+    /// nobody will read, and — worse on a small pool — keep holding KV blocks
+    /// that a live request needs. Returns the number of sequences stopped.
+    ///
+    /// Already-generated tokens are kept and the sequence completes normally
+    /// with [`FinishReason::Cancelled`], so the caller still gets a well-formed
+    /// completion rather than a dangling request.
+    pub fn cancel_request(&mut self, request_id: usize) -> usize {
+        let before = self.waiting.len();
+        self.waiting.retain(|r| r.id != request_id);
+        let mut stopped = before - self.waiting.len();
+
+        for seq in self.active.iter_mut() {
+            if seq.request_id == request_id && seq.finished.is_none() {
+                seq.finished = Some(FinishReason::Cancelled);
+                stopped += 1;
+            }
+        }
+        self.reclaim();
+        stopped
+    }
+
     pub fn spec_stats(&self) -> SpecStats {
         self.spec
     }
@@ -242,9 +308,62 @@ impl<'a> Engine<'a> {
         self.waiting.clear();
         self.active.clear();
         self.completed.clear();
+        self.deltas.clear();
         self.kv.clear();
         self.stats = RunStats::default();
         self.spec = SpecStats::default();
+        self.tick = 0;
+    }
+
+    /// Run one throwaway forward pass so the first real request does not absorb
+    /// costs that belong to startup.
+    ///
+    /// Three one-time costs land on whichever request happens to be first: the
+    /// rayon pool spinning up its worker threads, first-touch of the scratch
+    /// arenas (which are `max_batch_size * vocab_size` floats and so are not
+    /// small), and, for a memory-mapped checkpoint, a page fault per 4 KiB of
+    /// weights. None of that is the first request's fault, and a server that
+    /// reports time-to-first-token should not charge it for them.
+    ///
+    /// This runs a full prefill over a synthetic prompt — every layer, every
+    /// projection — then returns the cache and all counters to their initial
+    /// state, so a warmed engine is indistinguishable from a fresh one except
+    /// for being warm. Must be called before any request is submitted.
+    pub fn warm_up(&mut self) {
+        assert!(
+            !self.has_work() && self.stats.requests == 0,
+            "warm_up must run before any request is submitted"
+        );
+
+        // Long enough to fill one prefill chunk, so the batched path is
+        // exercised too, but never larger than the pool can hold.
+        let capacity = self.engine.total_blocks * self.engine.block_size;
+        let len = self.engine.prefill_chunk_size.clamp(2, capacity.max(2));
+        let vocab = self.config.vocab_size as u32;
+        let tokens: Vec<u32> = (0..len as u32).map(|i| i % vocab).collect();
+
+        const WARMUP_SEQ: usize = usize::MAX;
+        if let Some(admission) = self.kv.admit(WARMUP_SEQ, &tokens, 0) {
+            self.weights.prefill_batched(
+                &tokens,
+                0,
+                &self.config,
+                &admission.block_table,
+                &mut self.kv_cache,
+                self.engine.block_size,
+                self.engine.prefill_chunk_size,
+                &mut self.batch_scratch,
+            );
+            self.kv.release_sequence(WARMUP_SEQ);
+        }
+
+        // The synthetic prompt must leave no trace: its blocks were never
+        // published to the prefix cache, but `clear` also resets the hit/miss
+        // counters so the reported hit rate is the workload's, not ours.
+        self.kv.clear();
+        self.stats = RunStats::default();
+        self.spec = SpecStats::default();
+        self.deltas.clear();
         self.tick = 0;
     }
 
@@ -314,6 +433,34 @@ impl<'a> Engine<'a> {
     /// lands, rather than waiting for the whole batch to drain.
     pub fn take_completed(&mut self) -> Vec<Completion> {
         std::mem::take(&mut self.completed)
+    }
+
+    /// Take the tokens produced since the last call, per sequence.
+    ///
+    /// Empty unless [`EngineConfig::stream_tokens`] is set. This is what makes
+    /// streaming responses possible without changing the scheduler: the loop
+    /// still advances every sequence together, and a client that wants tokens
+    /// as they land reads them here instead of waiting for the completion.
+    pub fn take_deltas(&mut self) -> Vec<TokenDelta> {
+        std::mem::take(&mut self.deltas)
+    }
+
+    fn record_delta(
+        &mut self,
+        request_id: usize,
+        sequence_id: usize,
+        tokens: Vec<u32>,
+        finish_reason: Option<FinishReason>,
+    ) {
+        if !self.engine.stream_tokens || (tokens.is_empty() && finish_reason.is_none()) {
+            return;
+        }
+        self.deltas.push(TokenDelta {
+            request_id,
+            sequence_id,
+            tokens,
+            finish_reason,
+        });
     }
 
     /// Drain both queues, returning every completion in finish order.
@@ -433,6 +580,9 @@ impl<'a> Engine<'a> {
                     drafter: (self.engine.draft_tokens > 0 && temperature <= 0.0)
                         .then(|| Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>),
                 });
+                // The token sampled off the prefill logits is a real emission —
+                // it is the one a streaming client is waiting on.
+                self.record_delta(req.id, sid, vec![first], finished);
             }
         }
     }
@@ -509,6 +659,10 @@ impl<'a> Engine<'a> {
                 if table.len() * block_size <= pos {
                     self.active[idx].block_table = table;
                     self.active[idx].finished = Some(FinishReason::OutOfMemory);
+                    // Terminal, so a streaming client must hear about it here —
+                    // this sequence will never reach `commit`.
+                    let (rid, sid) = (self.active[idx].request_id, self.active[idx].id);
+                    self.record_delta(rid, sid, Vec::new(), Some(FinishReason::OutOfMemory));
                     continue;
                 }
             }
@@ -616,7 +770,7 @@ impl<'a> Engine<'a> {
             self.spec.drafted += verdict.drafted as u64;
             self.spec.accepted += verdict.accepted.len() as u64;
 
-            let mut emitted = 0usize;
+            let mut emitted = Vec::with_capacity(verdict.accepted.len() + 1);
             for token in verdict
                 .accepted
                 .iter()
@@ -629,7 +783,7 @@ impl<'a> Engine<'a> {
                 }
                 seq.generated.push(token);
                 seq.token_ids.push(token);
-                emitted += 1;
+                emitted.push(token);
 
                 if token == self.engine.eos_token {
                     seq.finished = Some(FinishReason::Eos);
@@ -641,8 +795,12 @@ impl<'a> Engine<'a> {
             // KV written for rejected drafts is left in place. It is never read:
             // attention only ever looks at positions below the sequence's
             // length, and the next step overwrites those slots.
-            self.spec.emitted += emitted as u64;
-            self.stats.generated_tokens += emitted;
+            self.spec.emitted += emitted.len() as u64;
+            self.stats.generated_tokens += emitted.len();
+
+            let seq = &self.active[idx];
+            let (request_id, sequence_id, finished) = (seq.request_id, seq.id, seq.finished);
+            self.record_delta(request_id, sequence_id, emitted, finished);
         }
     }
 

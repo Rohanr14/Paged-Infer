@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 116 tests, incl. golden parity
+cargo test                                        # 130 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -84,11 +84,20 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
   "max_tokens": 64, "n": 2, "temperature": 0.8
 }'
 
-curl localhost:8080/metrics   # prefix cache hit rate, tokens reused, tok/s
+# Tokens as they are produced, in OpenAI's server-sent-event format.
+curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Explain paged attention."}],
+  "max_tokens": 128, "stream": true
+}'
+
+curl localhost:8080/metrics   # Prometheus text format
+curl localhost:8080/stats     # the same counters as JSON
 ```
 
 The engine reads the architecture from the checkpoint's own `config.json`, so
 any HuggingFace-format Llama checkpoint works, not just TinyLlama.
+`DRAFT_TOKENS=4` turns on speculative decoding, `QUANT=int8` quantizes the
+projections, and `WARMUP=0` disables the startup pass.
 
 ---
 
@@ -433,7 +442,7 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-116 tests, no model download required.
+130 tests, no model download required.
 
 | suite | covers |
 |---|---|
@@ -442,6 +451,7 @@ against a deliberately tight block pool:
 | `batched_decode_tests` | batched decode and prefill are bit-identical to the paths they replace: ragged batches, block boundaries, per-sequence windows, ragged chunks, resumed prefill, causality |
 | `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
 | `speculative_tests` | speculative output is token-identical to greedy: draft depths, mixed batches, chunk splits, block boundaries, EOS mid-run, memory pressure |
+| `streaming_tests` | streamed deltas reconstruct the completion exactly, under speculation and forking; every sequence gets one terminal delta; cancellation returns blocks; warm-up leaves no trace |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
 | memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW |
@@ -490,6 +500,73 @@ side by side — including the open-ended case, where there is nothing to copy a
 speculation costs a little and saves nothing. It asserts on every run that the
 token count is unchanged.
 
+### Measured
+
+TinyLlama 1.1B in f32 on an Apple MacBook Air (NEON), greedy, 64 tokens per
+prompt. `tok/step` is tokens emitted per sequence-step — ordinary decoding is
+exactly 1.00.
+
+**Verbatim copy** — "repeat this passage exactly", 85-token prompt. The output
+*is* the input, which is the best case prompt lookup can ever see:
+
+| drafts | accepted | tok/step | decode | speedup |
+|-------:|---------:|---------:|-------:|--------:|
+| 0 (off) | –       | 1.00     | 4.711 s | 1.00× |
+| 2      | 100.0%   | 3.00     | 1.733 s | 2.72× |
+| 4      | 100.0%   | 4.85     | 1.199 s | 3.93× |
+| 8      | 100.0%   | 9.00     | 1.028 s | **4.58×** |
+
+At `K=8`, `tok/step` is exactly 9.00 — every draft accepted, every step.
+
+**Extractive QA** — "answer using only this passage", 91-token prompt. The
+answer quotes the passage but is not the passage:
+
+| drafts | accepted | tok/step | decode | speedup |
+|-------:|---------:|---------:|-------:|--------:|
+| 0 (off) | –       | 1.00     | 2.569 s | 1.00× |
+| 2      | 50.0%    | 1.28     | 1.947 s | **1.32×** |
+| 4      | 45.0%    | 1.39     | 2.127 s | 1.21× |
+| 8      | 22.5%    | 1.39     | 2.167 s | 1.19× |
+
+The second table is the more interesting one, because **more drafting makes it
+slower**. `K=4` emits more tokens per step than `K=2` and still loses on
+wall-clock: a rejected draft is a position that was embedded, rotated, attended
+over and projected through the LM head for nothing. Past the point where
+acceptance falls faster than the batch amortizes, deeper drafting is pure waste.
+That is why `draft_tokens` defaults to 0 and why the benchmark sweeps it rather
+than picking a number.
+
+Speedup is always below `tok/step` for the same reason — verifying `K+1`
+positions costs more than producing one token. The gap between the two columns
+is the price of guessing.
+
+## Serving
+
+The HTTP front end is not a wrapper that re-implements batching; it holds the
+engine on one thread and funnels every connection into the same scheduler, so
+requests from *different clients* land in the same batch and share prefix-cache
+blocks.
+
+- **Streaming.** `"stream": true` returns OpenAI-shaped server-sent events, one
+  chunk per scheduler step. A speculative step that had four drafts accepted
+  emits four tokens in one chunk — they really are all available at that
+  instant. Detokenization is incremental but not per-token: a BPE token can
+  carry a fragment of a UTF-8 character, so the whole prefix is decoded each
+  time and only the newly-appeared text is sent.
+- **Cancellation.** A client that hangs up is noticed on the next chunk write,
+  and the engine stops: the sequence retires at the next step and its KV blocks
+  go back to the pool. Measured against the fixture, a stream abandoned after
+  four chunks stopped at 25 generated tokens out of a requested 4000, and the
+  pool returned to 511 of 512 blocks free.
+- **Warm-up.** `Engine::warm_up()` runs one throwaway prefill before the
+  listener opens, so the rayon pool, the scratch arenas and the checkpoint's
+  pages are all touched by something other than the first real request. It then
+  returns the cache and every counter to its initial state — `tests/streaming_tests.rs`
+  asserts a warmed engine is indistinguishable from a fresh one. `WARMUP=0`
+  disables it, which is how you measure what it was worth.
+- **Metrics.** `/metrics` speaks Prometheus text format (counters carry
+  `_total`, so `rate()` works); `/stats` returns the same numbers as JSON.
+
 ## Honest limitations
 
 - **Attention does not batch.** Each sequence has its own block table, position
@@ -500,16 +577,18 @@ token count is unchanged.
   CPU, and every call round-trips through a blocking readback — so it is
   currently a demonstration of a WGSL reduction kernel, not a fast end-to-end
   path.
-- **No end-to-end throughput numbers are published here.** The previous README
-  carried a batch×steps sweep on an Apple M3, but those runs predate the
-  correctness fixes: they were measured with no prefill, the wrong rotary
-  convention, and a silent 256-token attention window. They measured something
-  that was not the model, so they have been removed rather than restated. The
-  same applies to the speculative-decoding acceptance rate, which depends on the
-  model producing sensible tokens. `e2e_benchmark` and `speculative_benchmark`
-  still run; the numbers need re-measuring on hardware with the weights present.
 - **Speculative decoding verifies a single draft sequence**, not a tree. Tree
-  verification explores several branches per pass and lifts acceptance further.
+  verification explores several branches per pass and lifts acceptance further —
+  which is exactly where the extractive-QA numbers above run out of road.
+- **The open-ended speculation row is unmeasured.** Its first prompt ended in a
+  complete sentence, and the base model answered with EOS immediately; the
+  benchmark was reporting a speedup computed from two near-zero timers. The
+  prompt now ends mid-sentence and the benchmark refuses to print a row for a
+  run shorter than 8 tokens, but the honest number for that workload has not
+  been re-measured yet. Expect it to be at or slightly below 1.00×.
+- **Only streaming clients can be cancelled.** Disconnection is detected on a
+  failed chunk write, and a buffered request writes nothing until it is
+  finished, so there is no write to fail on.
 - **Sampled sequences never speculate.** Extending it there needs the
   rejection-sampling correction to stay distributionally exact.
 - **The prefix cache publishes prompt blocks only.** Blocks that fill during
@@ -531,8 +610,10 @@ src/
     prefix_cache.rs  content-addressed KV reuse
     kv_cache_manager.rs  admission, copy-on-write, eviction
     layout.rs        physical KV addressing
+  detokenizer.rs     incremental token → text for streaming
+  speculative.rs     drafters and lossless greedy verification
   bin/
-    http_server.rs         OpenAI-shaped API over the real engine
+    http_server.rs         OpenAI-shaped API, SSE streaming, Prometheus
     benchmark.rs           kernel attribution ladder
     batch_benchmark.rs     batched vs sequential decode
     prefix_cache_benchmark.rs
@@ -540,7 +621,8 @@ src/
 scripts/
   gen_golden_fixture.py    reference model + logits (NumPy)
   download_model.py        fetch TinyLlama 1.1B
-tests/                     83 tests; fixtures/ holds the reference checkpoint
+    speculative_benchmark.rs   acceptance and speedup per workload
+tests/                     130 tests; fixtures/ holds the reference checkpoint
 ```
 
 ## License

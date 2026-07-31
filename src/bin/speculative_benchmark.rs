@@ -56,7 +56,10 @@ removes that waste and lets separate requests share identical prefixes.";
         (
             "open-ended",
             "nothing to copy; the hard case",
-            "Explain why memory bandwidth, rather than arithmetic, limits transformer decoding.".to_string(),
+            // Ends mid-sentence on purpose. A base model shown a complete
+            // sentence that needs no continuation will often pick EOS as its
+            // very first token, which measures nothing at all.
+            "Question: why is transformer decoding limited by memory bandwidth rather than by arithmetic?\n\nAnswer: The reason is that".to_string(),
         ),
     ];
 
@@ -101,6 +104,14 @@ struct Measurement {
     tokens_per_step: f64,
     acceptance: f64,
 }
+
+/// A run this short measures scheduling overhead, not decoding.
+///
+/// It happens for a real reason — a base model handed a prompt that needs no
+/// continuation answers with EOS immediately — and the failure mode is nasty:
+/// dividing two near-zero decode times yields an impressive-looking speedup
+/// computed entirely from timer noise. Better to say the row is empty.
+const MIN_USEFUL_TOKENS: usize = 8;
 
 fn measure(
     engine: &mut Engine<'_>,
@@ -208,6 +219,10 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
+    // Otherwise the first configuration measured would also be paying for the
+    // rayon pool and the scratch arenas, and would look slower than it is.
+    engine.warm_up();
+
     println!("Speculative decoding benchmark");
     println!("==============================");
     println!(
@@ -232,6 +247,15 @@ fn main() -> anyhow::Result<()> {
         );
 
         let base = measure(&mut engine, &workload.tokens, max_tokens, 0);
+        if base.tokens < MIN_USEFUL_TOKENS {
+            println!(
+                "   skipped: the model stopped after {} token(s), so there is nothing to",
+                base.tokens
+            );
+            println!("   speculate on and any speedup printed here would be timer noise.");
+            println!();
+            continue;
+        }
         println!(
             "   {:<9} {:>9} {:>10.2} {:>11.3} s {:>8.2}x",
             "0 (off)", "-", base.tokens_per_step, base.decode_secs, 1.0
@@ -249,7 +273,7 @@ fn main() -> anyhow::Result<()> {
                 m.acceptance * 100.0,
                 m.tokens_per_step,
                 m.decode_secs,
-                base.decode_secs / m.decode_secs.max(1e-12)
+                base.decode_secs / m.decode_secs
             );
         }
         println!();

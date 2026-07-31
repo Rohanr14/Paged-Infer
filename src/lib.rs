@@ -1,3 +1,4 @@
+pub mod detokenizer;
 pub mod engine;
 pub mod gpu;
 pub mod math;

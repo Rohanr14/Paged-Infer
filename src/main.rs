@@ -87,10 +87,22 @@ fn main() -> Result<()> {
     };
     let mut engine = Engine::new(weights, config, engine_config).with_tokenizer(tokenizer);
     println!(
-        "KV cache: {:.2} MB across {} blocks of 16 tokens.\n",
+        "KV cache: {:.2} MB across {} blocks of 16 tokens.",
         engine.kv_cache_bytes() as f64 / 1_048_576.0,
         512
     );
+
+    // Startup costs — the rayon pool, first-touch of the scratch arenas, page
+    // faults across a memory-mapped checkpoint — otherwise land on whichever
+    // request happens to be first, and get reported as its time-to-first-token.
+    // Run with WARMUP=0 to see the difference in the numbers below.
+    if std::env::var("WARMUP").as_deref() != Ok("0") {
+        let t0 = Instant::now();
+        engine.warm_up();
+        println!("Warm-up pass: {:.2?}.\n", t0.elapsed());
+    } else {
+        println!("Warm-up disabled; request 0 pays the startup costs.\n");
+    }
 
     // Two requests share a system prompt: the first pays to prefill it, the
     // second maps the same KV blocks and prefills only its own question. The

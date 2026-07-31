@@ -186,6 +186,15 @@ impl PrefixCache {
         self.stats
     }
 
+    /// Zero the counters without touching the entries.
+    ///
+    /// Used when the owner returns the pool to its initial state: a reported
+    /// hit rate should describe one workload, not every workload the process
+    /// has ever run.
+    pub fn reset_stats(&mut self) {
+        self.stats = PrefixCacheStats::default();
+    }
+
     pub(crate) fn record_tokens_saved(&mut self, tokens: usize) {
         self.stats.tokens_saved += tokens as u64;
     }
