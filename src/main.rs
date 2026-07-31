@@ -9,7 +9,27 @@ use std::fs::File;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
-const SYSTEM: &str = "You are a systems engineer who explains GPU inference clearly and concisely. Answer the question directly.";
+/// A realistically-sized system prompt.
+///
+/// Length is the point, not the content. The prefix cache reuses whole blocks,
+/// so a preamble shorter than a block or two has almost nothing to share and
+/// makes the feature look useless — a demo with a 30-token system prompt at a
+/// 16-token block size can only ever reuse one block. Production system prompts
+/// run to hundreds of tokens, which is the regime the cache is built for.
+const SYSTEM: &str = "\
+You are a senior systems engineer specializing in machine learning infrastructure.
+You explain GPU and CPU inference internals precisely and concisely.
+
+Guidelines:
+- Answer the question directly, without restating it.
+- Prefer concrete mechanisms over analogies.
+- When performance is involved, say what the bottleneck is and why.
+- If a trade-off exists, name both sides of it.
+- Keep the answer to a few sentences unless more detail is genuinely required.
+- Do not speculate about details you were not given.
+
+You are being consulted by another engineer who already knows the fundamentals, \
+so skip introductory material and get to the substance of the question.";
 
 fn main() -> Result<()> {
     let tokenizer_path = std::env::var("TOKENIZER_PATH")

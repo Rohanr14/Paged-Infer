@@ -151,6 +151,54 @@ early never pays for a copy at all.
 
 ---
 
+## What a run looks like
+
+`cargo run --release` submits three requests that share one system prompt; the
+third asks for four continuations, which are forked rather than re-prefilled.
+
+```
+Mapped 22 layers, 4.14 GB of F32 weights. SIMD backend: neon.
+KV cache: 352.00 MB across 512 blocks of 16 tokens.
+
+[req 0 / seq 0] 32 tokens, Length, ttft 666.74ms
+  Answer: PagedAttention solves the problem of training deep neural networks on
+  large datasets by using a technique called paging. This technique allows the model
+
+[req 1 / seq 1] 32 tokens, Length, ttft 293.42ms
+  Answer: Continuous batching improves throughput by reducing the number of
+  batches that need to be processed. This reduces the time required to
+
+[req 2 / seq 2] 32 tokens, Length, ttft 260.24ms
+  Our system achieves grouped-query attention by using the attention scores
+  across all attention heads for a single input word, and the attention scores for the
+
+[req 2 / seq 3] 32 tokens, Length, ttft 260.85ms
+  Answer the question clearly and concisely. ...
+
+[req 2 / seq 4] ...
+[req 2 / seq 5] ...
+
+Completed 6 sequences in 4.72s over 31 steps.
+  prompt tokens     : 103 total, 71 prefilled, 32 reused from cache
+  generated tokens  : 192
+  prefix cache      : 2/5 block lookups hit (40.0%)
+  copy-on-write     : 3 block copies
+  prefill 1.22s / decode 3.50s (54.92 tok/s)
+```
+
+Requests 1 and 2 have a lower TTFT than request 0 because they inherit its
+system-prompt blocks. The four sequences under request 2 share one prefill and
+diverge into visibly different continuations — that is copy-on-write forking
+doing its job, and the three block copies are the partial block they all wrote
+into.
+
+The 40% hit rate is a property of that prompt set, not a ceiling: the demo's
+system prompt has since been lengthened to a realistic size, because a preamble
+shorter than a block or two has nothing to share. Output is TinyLlama 1.1B
+being TinyLlama — fluent, and wrong about what PagedAttention is.
+
+---
+
 ## End-to-end decode
 
 TinyLlama 1.1B, full causal attention (no sliding window), greedy decode, on an
@@ -225,18 +273,24 @@ every position's K/V is written to the cache before any attention runs, and a
 position's attention loop ends at itself, so it sees the positions before it in
 the chunk and none after. That is exactly causal masking, for free.
 
-Over a 256-token prompt, synthetic weights, 4-core x86_64:
+**TinyLlama 1.1B, 256-token prompt, Apple Silicon, NEON:**
 
 | positions per pass | prefill | throughput | speedup |
 |---:|---:|---:|---:|
-| 1 (sequential) | 6.314 s | 40.5 tok/s | 1.00x |
-| 4 | 2.652 s | 96.5 tok/s | 2.38x |
-| 8 | 1.889 s | 135.5 tok/s | **3.34x** |
-| 32 | 1.921 s | 133.2 tok/s | 3.29x |
-| 64 | 1.781 s | 143.7 tok/s | **3.55x** |
+| 1 (sequential) | 18.275 s | 14.0 tok/s | 1.00x |
+| 4 | 4.811 s | 53.2 tok/s | 3.80x |
+| 8 | 4.073 s | 62.9 tok/s | **4.49x** |
+| 16 | 4.293 s | 59.6 tok/s | 4.26x |
+| 32 | 4.604 s | 55.6 tok/s | 3.97x |
+| 64 | 4.193 s | 61.0 tok/s | 4.36x |
 
-The gain plateaus after about 8 positions per pass, so the default chunk of 32
-is comfortably past the knee — no reason to spend scratch memory on more.
+The gain plateaus after about 8 positions per pass; past that the spread is
+run-to-run noise on both machines measured, so the default chunk of 32 sits well
+clear of the knee and there is no reason to spend more scratch on it. The same
+sweep on 4-core x86_64 with synthetic weights peaks at 3.55x.
+
+On the CLI demo this took time-to-first-token from 3.63 s to 667 ms and cut
+prefill from 6.23 s to 1.22 s, roughly halving the wall clock of the whole run.
 
 Only the final position pays for the LM head. That projection is
 `vocab_size x hidden_size`, the largest matrix in the model, so running every
