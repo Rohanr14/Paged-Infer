@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use safetensors::SafeTensors;
 
-use rayon::prelude::*;
-
+use crate::attention::{AttnEntry, PagedAttention};
 use crate::gpu::{GpuContext, GpuLinear};
 use crate::math::{
     matvec_f32_weight_transposed_parallel, pack_bf16_to_f32, rms_norm, rope_rotate, rope_table,
@@ -784,12 +783,21 @@ impl<'a> LlamaWeights<'a> {
         let num_heads = config.num_attention_heads;
         let kv_group = config.kv_group();
         let layout = config.kv_layout_for_cache(kv_cache.len(), block_size);
-        let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Full causal attention unless a sliding window was explicitly asked for.
-        let attn_window = config.attention_window.unwrap_or(usize::MAX);
-        let start_t = (pos + 1).saturating_sub(attn_window);
-        let window_len = pos + 1 - start_t;
+        let entry = AttnEntry::new(block_table, pos, config.attention_window);
+        // At least one slot per lane even for a zero-width window, so the score
+        // buffer and the kernel's stride always agree.
+        let window_len = entry.window_len().max(1);
+        let attn = PagedAttention {
+            layout,
+            block_size,
+            num_heads,
+            head_dim,
+            kv_group,
+            score_stride: window_len,
+            heads_per_lane: PagedAttention::lane_width(kv_group, config.num_key_value_heads, 1),
+        };
 
         // One rotary table per token, shared by every head of every layer.
         rope_table(
@@ -869,51 +877,17 @@ impl<'a> LlamaWeights<'a> {
                 }
             }
 
-            // Attention runs one head per Rayon task. Every K/V write for this
-            // token completed above, so the cache is read-only here and the
-            // output slices are disjoint — no synchronization needed.
-            let kv_ref: &[f32] = &*kv_cache;
-            let q_ref: &[f32] = &scratch.q;
-            let attn_out = &mut scratch.attn_out;
-            let scores = &mut scratch.scores[..need];
-
-            attn_out
-                .par_chunks_mut(head_dim)
-                .zip(scores.par_chunks_mut(window_len))
-                .enumerate()
-                .for_each(|(h, (out_slice, score_slice))| {
-                    let kv_h = h / kv_group;
-                    let q_start = h * head_dim;
-                    let q_head = &q_ref[q_start..q_start + head_dim];
-
-                    for (si, t) in (start_t..=pos).enumerate() {
-                        score_slice[si] = match block_table.get_physical_location(t, block_size) {
-                            Some((pb, off)) => {
-                                let k_idx = layout.index(layer_idx, pb.index, off, kv_h, false);
-                                crate::math::dot(q_head, &kv_ref[k_idx..k_idx + head_dim]) * scale
-                            }
-                            // No physical block backs this position, so there is
-                            // nothing to attend to. It has to be masked out with
-                            // -inf: a score of 0.0 would instead survive the
-                            // softmax and take a full share of the weight.
-                            None => f32::NEG_INFINITY,
-                        };
-                    }
-
-                    crate::math::softmax_in_place(score_slice);
-
-                    out_slice.fill(0.0);
-                    for (si, t) in (start_t..=pos).enumerate() {
-                        let weight = score_slice[si];
-                        if weight == 0.0 {
-                            continue;
-                        }
-                        if let Some((pb, off)) = block_table.get_physical_location(t, block_size) {
-                            let v_idx = layout.index(layer_idx, pb.index, off, kv_h, true);
-                            crate::math::axpy(out_slice, weight, &kv_ref[v_idx..v_idx + head_dim]);
-                        }
-                    }
-                });
+            // The same kernel the batched path uses, with a batch of one. Every
+            // K/V write for this token completed above, so the cache is
+            // read-only here and the output slices are disjoint.
+            attn.run(
+                &mut scratch.attn_out,
+                &mut scratch.scores[..need],
+                &scratch.q,
+                kv_cache,
+                std::slice::from_ref(&entry),
+                layer_idx,
+            );
 
             if let Some(g) = gpu {
                 g.layers[layer_idx]
@@ -1020,12 +994,10 @@ impl<'a> LlamaWeights<'a> {
         let kv_group = config.kv_group();
         let half = head_dim / 2;
         let layout = config.kv_layout_for_cache(kv_cache.len(), block_size);
-        let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Sequences sit at different positions, so each needs its own rotary
         // table and its own attention window.
-        let attn_window = config.attention_window.unwrap_or(usize::MAX);
-        let mut starts = Vec::with_capacity(batch);
+        let mut entries = Vec::with_capacity(batch);
         let mut widest_window = 0;
         for (b, &pos) in positions.iter().enumerate() {
             rope_table(
@@ -1035,9 +1007,9 @@ impl<'a> LlamaWeights<'a> {
                 &mut scratch.rope_cos[b * half..(b + 1) * half],
                 &mut scratch.rope_sin[b * half..(b + 1) * half],
             );
-            let start = (pos + 1).saturating_sub(attn_window);
-            widest_window = widest_window.max(pos + 1 - start);
-            starts.push(start);
+            let entry = AttnEntry::new(block_tables[b], pos, config.attention_window);
+            widest_window = widest_window.max(entry.window_len());
+            entries.push(entry);
         }
 
         for (b, &token_id) in tokens.iter().enumerate() {
@@ -1050,9 +1022,20 @@ impl<'a> LlamaWeights<'a> {
         // One score lane per (sequence, head), sized to the widest window in the
         // batch so every lane has the same stride.
         let lanes = batch * num_heads;
+        let widest_window = widest_window.max(1);
         if scratch.scores.len() < lanes * widest_window {
             scratch.scores.resize(lanes * widest_window, 0.0);
         }
+
+        let attn = PagedAttention {
+            layout,
+            block_size,
+            num_heads,
+            head_dim,
+            kv_group,
+            score_stride: widest_window,
+            heads_per_lane: PagedAttention::lane_width(kv_group, num_kv_heads, batch),
+        };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             for b in 0..batch {
@@ -1125,55 +1108,14 @@ impl<'a> LlamaWeights<'a> {
 
             // Every KV write for this step is done, so the cache is read-only
             // below and the output slices are disjoint.
-            let kv_ref: &[f32] = &*kv_cache;
-            let q_ref: &[f32] = &scratch.q;
-            let attn_out = &mut scratch.attn_out[..batch * hidden];
-            let scores = &mut scratch.scores[..lanes * widest_window];
-            let starts_ref = &starts;
-
-            attn_out
-                .par_chunks_mut(head_dim)
-                .zip(scores.par_chunks_mut(widest_window))
-                .enumerate()
-                .for_each(|(lane, (out_slice, score_lane))| {
-                    let b = lane / num_heads;
-                    let h = lane % num_heads;
-                    let pos = positions[b];
-                    let start_t = starts_ref[b];
-                    let kv_h = h / kv_group;
-                    let table = block_tables[b];
-                    let q_start = b * hidden + h * head_dim;
-                    let q_head = &q_ref[q_start..q_start + head_dim];
-
-                    // This sequence may have a shorter window than the widest in
-                    // the batch; only its own span participates.
-                    let used = pos + 1 - start_t;
-                    let score_lane = &mut score_lane[..used];
-
-                    for (si, t) in (start_t..=pos).enumerate() {
-                        score_lane[si] = match table.get_physical_location(t, block_size) {
-                            Some((pb, off)) => {
-                                let k_idx = layout.index(layer_idx, pb.index, off, kv_h, false);
-                                crate::math::dot(q_head, &kv_ref[k_idx..k_idx + head_dim]) * scale
-                            }
-                            None => f32::NEG_INFINITY,
-                        };
-                    }
-
-                    crate::math::softmax_in_place(score_lane);
-
-                    out_slice.fill(0.0);
-                    for (si, t) in (start_t..=pos).enumerate() {
-                        let weight = score_lane[si];
-                        if weight == 0.0 {
-                            continue;
-                        }
-                        if let Some((pb, off)) = table.get_physical_location(t, block_size) {
-                            let v_idx = layout.index(layer_idx, pb.index, off, kv_h, true);
-                            crate::math::axpy(out_slice, weight, &kv_ref[v_idx..v_idx + head_dim]);
-                        }
-                    }
-                });
+            attn.run(
+                &mut scratch.attn_out[..batch * hidden],
+                &mut scratch.scores[..lanes * widest_window],
+                &scratch.q[..batch * hidden],
+                kv_cache,
+                &entries,
+                layer_idx,
+            );
 
             let attn_in = &scratch.attn_out[..batch * hidden];
             layer.attention.wo.apply_batched(

@@ -212,6 +212,10 @@ fn prefill_batched(
 
 fn main() -> anyhow::Result<()> {
     let steps = env_usize("BENCH_STEPS", 8);
+    // Wall-clock on a shared or thermally-limited machine is noisy enough to
+    // reorder adjacent batch sizes; taking the fastest of several runs removes
+    // interference, which can only ever have made a run slower.
+    let repeats = env_usize("BENCH_REPEATS", 3).max(1);
     let context = env_usize("BENCH_CONTEXT", 128);
     let batches: Vec<usize> = std::env::var("BENCH_BATCHES")
         .unwrap_or_else(|_| "1 2 4 8".to_string())
@@ -275,6 +279,7 @@ fn main() -> anyhow::Result<()> {
     println!("simd       : {}", simd::backend());
     println!("threads    : {}", rayon::current_num_threads());
     println!("context    : {context} tokens, {steps} decode steps per sequence");
+    println!("timing     : fastest of {repeats} runs per configuration (BENCH_REPEATS)");
     println!();
 
     println!(
@@ -288,8 +293,14 @@ fn main() -> anyhow::Result<()> {
         // Warm up the page cache and the thread pool before timing.
         run_batched(&weights, &mut h, batch, context, 1);
 
-        let seq_secs = run_sequential(&weights, &mut h, batch, context, steps);
-        let bat_secs = run_batched(&weights, &mut h, batch, context, steps);
+        // Fastest of `repeats`. Both configurations are re-measured on every
+        // repeat rather than once each, so a machine that gets busy partway
+        // through cannot hand one of them a better slot than the other.
+        let (mut seq_secs, mut bat_secs) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..repeats {
+            seq_secs = seq_secs.min(run_sequential(&weights, &mut h, batch, context, steps));
+            bat_secs = bat_secs.min(run_batched(&weights, &mut h, batch, context, steps));
+        }
 
         let tokens = (batch * steps) as f64;
         let seq_tps = tokens / seq_secs.max(1e-9);

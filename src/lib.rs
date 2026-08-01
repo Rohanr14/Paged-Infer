@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod detokenizer;
 pub mod engine;
 pub mod gpu;

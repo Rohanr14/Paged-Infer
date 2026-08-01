@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 130 tests, incl. golden parity
+cargo test                                        # 141 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -308,6 +308,91 @@ mid-prompt prefill after a cache hit, and an explicit causality check that a
 position inside a chunk cannot see the ones after it. Only the loop nesting
 changed.
 
+### Paged attention
+
+Batching cannot make attention cheaper. Every other operand in a decode step is
+shared — one weight matrix serves the whole batch — but the KV cache is not:
+each sequence has its own history, its own position, its own scattered blocks.
+There is nothing to amortize.
+
+What it can do is stop attention costing more than it has to. Two costs in the
+obvious implementation are pure overhead:
+
+**Grouped-query replication.** Under GQA, `kv_group` query heads share one
+key/value head — eight of them on TinyLlama. Parallelizing over
+`(sequence, query head)` gives each of those eight its own task, and each task
+streams *the same* K and V vectors out of the cache independently. Grouping
+them into one task reads it once.
+
+**Per-token address translation.** A token's physical slot is
+`block_table[t / block_size]` plus `t % block_size`: a division, a modulo and a
+bounds-checked lookup — per token, twice per pass, per head, per layer. The
+mapping is constant *within* a block, so it belongs outside the token loop.
+
+`src/attention.rs` does both, and picks how many query heads share a task from
+the batch size: wide lanes read the cache least, narrow lanes produce more tasks
+to keep cores busy.
+
+**The kernel alone**, 4-core x86_64 (AVX2+FMA), TinyLlama's attention shape,
+speedup over one-task-per-query-head (`attention_benchmark`, fastest of 60):
+
+| context | batch | d=2 | d=4 | d=8 | scheduler picks |
+|---:|---:|---:|---:|---:|:--|
+| 256 | 1 | 1.09× | **1.16×** | 0.74× | d=4 |
+| 256 | 8 | 1.01× | 0.99× | **1.09×** | d=8 |
+| 1024 | 1 | 1.28× | **1.47×** | 1.03× | d=4 |
+| 1024 | 8 | 1.23× | 1.43× | **1.57×** | d=8 |
+| 4096 | 1 | 1.19× | **1.38×** | 1.07× | d=4 |
+| 4096 | 8 | 1.44× | 1.53× | **1.86×** | d=8 |
+
+The batch-1 rows are the interesting ones: the widest lane *loses*. One sequence
+times four KV heads is four tasks, and four tasks on four threads leaves rayon
+nothing to steal, so the schedule runs at the speed of its slowest core. The
+scheduler picks the measured optimum in all six cells by requiring two tasks per
+thread rather than one.
+
+#### What it is worth end to end, which is much less
+
+Up to 1.86× on the kernel buys **2–3%** of a decode step at f32:
+
+| weights | context | batch | per-head | grouped | batched speedup |
+|:--|---:|---:|---:|---:|---:|
+| f32 | 128 | 8 | 178.3 tok/s | 171.4 tok/s | 3.30× → 3.29× |
+| f32 | 1536 | 8 | 142.5 tok/s | 145.9 tok/s | 3.02× → 3.05× |
+| f32 | 4096 | 8 | 114.0 tok/s | 116.7 tok/s | 2.63× → 2.77× |
+| **int8** | 4096 | 8 | 106.5 tok/s | **115.5 tok/s** | 2.46× → **2.61×** |
+
+Working backwards from the f32 rows, attention is only about **5% of a decode
+step** even at 4096 tokens of context — so a 1.86× kernel is worth 2%. The int8
+row is the same arithmetic with the weights cut 4×: attention becomes a much
+larger share of what is left, and the same change is suddenly worth 8.5%. The
+value of an attention optimization is set almost entirely by what it is being
+compared against.
+
+**This corrects a claim this README used to make.** The old text said attention
+not batching "is what caps the batched-decode speedup below the batch size."
+That is wrong. At 128 tokens of context attention is around 1% of the step, and
+removing it entirely would not move the ceiling. What actually caps it is the
+projection kernel: batching gives it an arithmetic intensity of `B/2`
+flop-per-byte, so it crosses from bandwidth-bound to issue-bound at roughly
+`B = 2C/BW` — batch 4–5 on both machines measured, which is exactly where the
+measured curve flattens. Attention is what caps it at *long* context and small
+weights, not in general.
+
+None of it changes a single arithmetic operation. Scores are still computed in
+increasing `t`, the softmax still runs over the whole window, the value
+accumulation still runs in increasing `t`. `tests/attention_tests.rs` holds the
+kernel against a deliberately naive reference written in the test file — one
+head at a time, one token at a time, addresses resolved per token — and demands
+**bit-identical** output across six head configurations, every legal lane width,
+ragged batches, sliding windows narrower than a block, unmapped blocks, and
+several positions of one sequence sharing a block table. The benchmark asserts
+it too, on every run, before printing a number.
+
+```bash
+cargo run --release --bin attention_benchmark   # sweeps the lane width
+```
+
 ```bash
 cargo run --release --bin batch_benchmark          # synthetic weights, no download
 MODEL_PATH=models/tinyllama-1.1b/model.safetensors cargo run --release --bin batch_benchmark
@@ -442,7 +527,7 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-130 tests, no model download required.
+141 tests, no model download required.
 
 | suite | covers |
 |---|---|
@@ -452,6 +537,7 @@ against a deliberately tight block pool:
 | `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
 | `speculative_tests` | speculative output is token-identical to greedy: draft depths, mixed batches, chunk splits, block boundaries, EOS mid-run, memory pressure |
 | `streaming_tests` | streamed deltas reconstruct the completion exactly, under speculation and forking; every sequence gets one terminal delta; cancellation returns blocks; warm-up leaves no trace |
+| `attention_tests` | the paged attention kernel is bit-identical to a naive per-head, per-token reference at every lane width: six head shapes, ragged batches, sub-block sliding windows, unmapped blocks, shared block tables |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
 | memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW |
@@ -596,10 +682,20 @@ blocks.
 
 ## Honest limitations
 
-- **Attention does not batch.** Each sequence has its own block table, position
-  and KV history, so there is no shared operand to amortize. It is parallelized
-  across (sequence, head) pairs instead. This is what caps the batched-decode
-  speedup below the batch size.
+- **Attention still cannot amortize across sequences**, because there is no
+  shared operand to amortize — each sequence has its own KV. The kernel removes
+  the redundant work (see *Paged attention*), but the floor it leaves is real.
+- **The batched-decode ceiling is the projection kernel, not attention.**
+  Batching raises its arithmetic intensity to `B/2` flop-per-byte, so it stops
+  being bandwidth-bound at around batch 4–5 and no amount of attention work
+  moves that. Lifting it needs a blocked/register-tiled matmul that reuses each
+  weight element across more of the batch before retiring it — which is the
+  honest next optimization, and a bigger one than this was.
+- **The attention kernel does not split the token axis.** With few sequences and
+  a multi-query model there can be fewer tasks than cores, and the lane
+  scheduler's only remedy is to narrow lanes, which costs traffic.
+  Flash-decoding-style splitting with a log-sum-exp combine would fix that, at
+  the price of no longer being bit-identical.
 - **The GPU path covers matvec only.** Attention, RMSNorm and SwiGLU stay on the
   CPU, and every call round-trips through a blocking readback — so it is
   currently a demonstration of a WGSL reduction kernel, not a fast end-to-end
@@ -635,10 +731,12 @@ src/
     prefix_cache.rs  content-addressed KV reuse
     kv_cache_manager.rs  admission, copy-on-write, eviction
     layout.rs        physical KV addressing
+  attention.rs       paged attention: GQA head grouping, block-wise addressing
   detokenizer.rs     incremental token → text for streaming
   speculative.rs     drafters and lossless greedy verification
   bin/
     http_server.rs         OpenAI-shaped API, SSE streaming, Prometheus
+    attention_benchmark.rs lane-width sweep for the paged attention kernel
     benchmark.rs           kernel attribution ladder
     batch_benchmark.rs     batched vs sequential decode
     prefix_cache_benchmark.rs
@@ -647,7 +745,7 @@ scripts/
   gen_golden_fixture.py    reference model + logits (NumPy)
   download_model.py        fetch TinyLlama 1.1B
     speculative_benchmark.rs   acceptance and speedup per workload
-tests/                     130 tests; fixtures/ holds the reference checkpoint
+tests/                     141 tests; fixtures/ holds the reference checkpoint
 ```
 
 ## License
