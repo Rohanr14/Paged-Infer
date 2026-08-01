@@ -333,27 +333,43 @@ mapping is constant *within* a block, so it belongs outside the token loop.
 the batch size: wide lanes read the cache least, narrow lanes produce more tasks
 to keep cores busy.
 
-**The kernel alone**, 4-core x86_64 (AVX2+FMA), TinyLlama's attention shape,
-speedup over one-task-per-query-head (`attention_benchmark`, fastest of 60):
+**The kernel alone**, TinyLlama's attention shape, speedup over
+one-task-per-query-head (`attention_benchmark`):
 
-| context | batch | d=2 | d=4 | d=8 | scheduler picks |
-|---:|---:|---:|---:|---:|:--|
-| 256 | 1 | 1.09× | **1.16×** | 0.74× | d=4 |
-| 256 | 8 | 1.01× | 0.99× | **1.09×** | d=8 |
-| 1024 | 1 | 1.28× | **1.47×** | 1.03× | d=4 |
-| 1024 | 8 | 1.23× | 1.43× | **1.57×** | d=8 |
-| 4096 | 1 | 1.19× | **1.38×** | 1.07× | d=4 |
-| 4096 | 8 | 1.44× | 1.53× | **1.86×** | d=8 |
+| context | batch | Apple M-series, 8 threads (NEON) | 4-core x86_64 (AVX2+FMA) |
+|---:|---:|---:|---:|
+| 256 | 1 | 1.65× (d=4) | 1.16× (d=4) |
+| 256 | 8 | 1.50× (d=4) | 1.09× (d=8) |
+| 1024 | 1 | 1.27× (d=8) | 1.47× (d=4) |
+| 1024 | 8 | 1.39× (d=8) | 1.57× (d=8) |
+| 4096 | 1 | 1.41× (d=8) | 1.38× (d=4) |
+| 4096 | 4 | 2.48× (d=8) | — |
+| 4096 | 8 | **2.65× (d=8)** | 1.86× (d=8) |
 
-The batch-1 rows are the interesting ones: the widest lane *loses*. One sequence
-times four KV heads is four tasks, and four tasks on four threads leaves rayon
-nothing to steal, so the schedule runs at the speed of its slowest core. The
-scheduler picks the measured optimum in all six cells by requiring two tasks per
-thread rather than one.
+The width in brackets is the one that actually won. Two things are worth
+reading off this table.
+
+**The widest lane is not always best.** On the 4-core machine at batch 1, `d=8`
+gives four tasks for four threads, rayon has nothing left to steal, and the
+schedule runs at the speed of its slowest core — `d=4` beats it by 30%. Reading
+the cache once is worthless if half the cores are idle waiting.
+
+**The optimum is a property of the machine, not just the shape**, and the two
+machines disagree in a way no single rule can reconcile. On the 8-thread
+machine `d=4` wins at 256 tokens of context and `d=8` wins at 1024 — *at every
+batch size*. A scheduler that sees only the batch size therefore cannot be
+right in both cells, which is a proof rather than a tuning failure. What it can
+do is be right where it counts: the shipped rule (two tasks per thread) picks
+the measured optimum in every cell at batch ≥ 4 and context ≥ 1024 on both
+machines, and gives up 6–19% of the *kernel* at batch 1 or short context —
+precisely the cells where attention is a negligible share of the step.
+`PAGED_INFER_ATTN_LANES_PER_THREAD` overrides it; `attention_benchmark` is how
+you would pick a value.
 
 #### What it is worth end to end, which is much less
 
-Up to 1.86× on the kernel buys **2–3%** of a decode step at f32:
+Up to 1.86× on the kernel buys **2–3%** of a decode step at f32 (4-core x86_64,
+`batch_benchmark`, fastest of 3):
 
 | weights | context | batch | per-head | grouped | batched speedup |
 |:--|---:|---:|---:|---:|---:|

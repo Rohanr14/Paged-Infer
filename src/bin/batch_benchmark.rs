@@ -4,8 +4,11 @@
 //! multiply-add per element. Running `B` sequences one at a time therefore reads
 //! the weights `B` times. Batching reads them once and reuses each row across
 //! the batch, so the ceiling is roughly `B`x — approached until the kernel stops
-//! being bandwidth-limited, with attention (which cannot batch) and the
-//! per-sequence elementwise work setting the floor.
+//! being bandwidth-limited. What ends it is the projection kernel's arithmetic
+//! intensity, which batching raises to about `B/2` flop per byte: past roughly
+//! `B = 2C/BW` it is issue-bound rather than bandwidth-bound. Attention (which
+//! cannot amortize across sequences) and the per-sequence elementwise work set
+//! the floor, but they are not what caps the curve at short context.
 //!
 //! Runs on synthetic weights by default so the comparison is available without
 //! a checkpoint, sized to exceed last-level cache — a cache-resident model would
@@ -366,7 +369,11 @@ fn main() -> anyhow::Result<()> {
     println!("and the parts that do not batch start to dominate -- attention (each");
     println!("sequence has its own KV, position and block table) plus the per-sequence");
     println!("RMSNorm, RoPE and SwiGLU. Context length moves this, but less than the");
-    println!("batch size does: measured here at batch 8, 3.8x at 32 tokens of context");
-    println!("against 3.3x at 512.");
+    println!("Do not read the ceiling as an attention limit. Batching raises the");
+    println!("projection kernel's arithmetic intensity to about B/2 flop per byte, so");
+    println!("it leaves the bandwidth-bound regime at roughly batch 2C/BW -- 4 to 5 on");
+    println!("the machines measured -- and no amount of attention work moves that.");
+    println!("Attention only dominates once the weights are small (int8) or the");
+    println!("context is long; QUANT=int8 with a long BENCH_CONTEXT is that regime.");
     Ok(())
 }
