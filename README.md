@@ -378,6 +378,14 @@ Up to 1.86× on the kernel buys **2–3%** of a decode step at f32 (4-core x86_6
 | f32 | 4096 | 8 | 114.0 tok/s | 116.7 tok/s | 2.63× → 2.77× |
 | **int8** | 4096 | 8 | 106.5 tok/s | **115.5 tok/s** | 2.46× → **2.61×** |
 
+And on Apple Silicon (8 threads, real TinyLlama, 22 layers, int8, 2048 tokens of
+context) — the regime where the step has left the bandwidth roof entirely:
+
+| | per-head | grouped | |
+|:--|---:|---:|---:|
+| batched decode | 39.27 tok/s | **43.44 tok/s** | **+10.6%** |
+| batched speedup | 1.37× | **1.48×** | |
+
 Working backwards from the f32 rows, attention is only about **5% of a decode
 step** even at 4096 tokens of context — so a 1.86× kernel is worth 2%. The int8
 row is the same arithmetic with the weights cut 4×: attention becomes a much
