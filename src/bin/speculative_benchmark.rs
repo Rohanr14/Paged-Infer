@@ -103,6 +103,8 @@ struct Measurement {
     tokens: usize,
     tokens_per_step: f64,
     acceptance: f64,
+    /// `(slowest - fastest) / fastest` across the repeats, as a fraction.
+    spread: f64,
 }
 
 /// A run this short measures scheduling overhead, not decoding.
@@ -131,7 +133,46 @@ fn measure(
         tokens: out.iter().map(|c| c.tokens.len()).sum(),
         tokens_per_step: spec.tokens_per_step(),
         acceptance: spec.acceptance_rate(),
+        spread: 0.0,
     }
+}
+
+/// Take the fastest of several identical runs.
+///
+/// What the engine *does* here is deterministic — the same prompt drafts the
+/// same tokens and accepts the same ones every time, so acceptance and
+/// tokens-per-step are exact and need no repeating. Wall clock is not: on a
+/// thermally-limited laptop streaming several GB of weights per token, repeats
+/// of one configuration have been observed 24% apart, which is wider than the
+/// difference between the draft depths being compared. A single measurement can
+/// therefore rank `K=2` above `K=4` on one run and below it on the next.
+///
+/// Interference is one-sided — nothing makes a run finish faster than it can —
+/// so the minimum is the best estimate of the cost with the noise removed. The
+/// spread is reported alongside so the reader can judge whether a gap is real.
+fn measure_best(
+    engine: &mut Engine<'_>,
+    prompt: &[u32],
+    max_tokens: usize,
+    draft_tokens: usize,
+    repeats: usize,
+) -> Measurement {
+    let mut best = measure(engine, prompt, max_tokens, draft_tokens);
+    let (mut lo, mut hi) = (best.decode_secs, best.decode_secs);
+    for _ in 1..repeats.max(1) {
+        let m = measure(engine, prompt, max_tokens, draft_tokens);
+        assert_eq!(
+            m.tokens, best.tokens,
+            "the same prompt produced a different token count across repeats"
+        );
+        lo = lo.min(m.decode_secs);
+        hi = hi.max(m.decode_secs);
+        if m.decode_secs < best.decode_secs {
+            best = m;
+        }
+    }
+    best.spread = if lo > 0.0 { (hi - lo) / lo } else { 0.0 };
+    best
 }
 
 fn main() -> anyhow::Result<()> {
@@ -140,6 +181,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_path = std::env::var("TOKENIZER_PATH")
         .unwrap_or_else(|_| "models/tinyllama-1.1b/tokenizer.json".to_string());
     let max_tokens = env_usize("SPEC_TOKENS", 64);
+    let repeats = env_usize("SPEC_REPEATS", 3).max(1);
     let drafts: Vec<usize> = std::env::var("SPEC_K")
         .unwrap_or_else(|_| "2 4 8".to_string())
         .split_whitespace()
@@ -236,6 +278,7 @@ fn main() -> anyhow::Result<()> {
     println!("drafter    : prompt-lookup (no draft model)");
     println!("simd       : {}", simd::backend());
     println!("decode     : greedy, {max_tokens} tokens per prompt");
+    println!("timing     : fastest of {repeats} runs per configuration (SPEC_REPEATS)");
     println!();
 
     for workload in &workloads {
@@ -246,7 +289,7 @@ fn main() -> anyhow::Result<()> {
             "drafts", "accepted", "tok/step", "decode", "speedup"
         );
 
-        let base = measure(&mut engine, &workload.tokens, max_tokens, 0);
+        let base = measure_best(&mut engine, &workload.tokens, max_tokens, 0, repeats);
         if base.tokens < MIN_USEFUL_TOKENS {
             println!(
                 "   skipped: the model stopped after {} token(s), so there is nothing to",
@@ -261,12 +304,14 @@ fn main() -> anyhow::Result<()> {
             "0 (off)", "-", base.tokens_per_step, base.decode_secs, 1.0
         );
 
+        let mut worst_spread = base.spread;
         for &k in &drafts {
-            let m = measure(&mut engine, &workload.tokens, max_tokens, k);
+            let m = measure_best(&mut engine, &workload.tokens, max_tokens, k, repeats);
             assert_eq!(
                 m.tokens, base.tokens,
                 "speculation changed the token count -- it must be lossless"
             );
+            worst_spread = worst_spread.max(m.spread);
             println!(
                 "   {:<9} {:>8.1}% {:>10.2} {:>11.3} s {:>8.2}x",
                 k,
@@ -274,6 +319,13 @@ fn main() -> anyhow::Result<()> {
                 m.tokens_per_step,
                 m.decode_secs,
                 base.decode_secs / m.decode_secs
+            );
+        }
+        if repeats > 1 {
+            println!(
+                "   (fastest of {repeats}; widest spread between repeats {:.0}% -- treat any \
+                 gap narrower than that as noise)",
+                worst_spread * 100.0
             );
         }
         println!();

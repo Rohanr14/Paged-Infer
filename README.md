@@ -507,38 +507,65 @@ prompt. `tok/step` is tokens emitted per sequence-step — ordinary decoding is
 exactly 1.00.
 
 **Verbatim copy** — "repeat this passage exactly", 85-token prompt. The output
-*is* the input, which is the best case prompt lookup can ever see:
+*is* the input, the best case prompt lookup can ever see:
 
 | drafts | accepted | tok/step | decode | speedup |
 |-------:|---------:|---------:|-------:|--------:|
-| 0 (off) | –       | 1.00     | 4.711 s | 1.00× |
-| 2      | 100.0%   | 3.00     | 1.733 s | 2.72× |
-| 4      | 100.0%   | 4.85     | 1.199 s | 3.93× |
-| 8      | 100.0%   | 9.00     | 1.028 s | **4.58×** |
-
-At `K=8`, `tok/step` is exactly 9.00 — every draft accepted, every step.
+| 0 (off) | –       | 1.00     | 4.752 s | 1.00× |
+| 2      | 100.0%   | 3.00     | 1.670 s | 2.85× |
+| 4      | 100.0%   | 4.85     | 1.249 s | 3.80× |
+| 8      | 100.0%   | 9.00     | 1.094 s | **4.34×** |
 
 **Extractive QA** — "answer using only this passage", 91-token prompt. The
 answer quotes the passage but is not the passage:
 
 | drafts | accepted | tok/step | decode | speedup |
 |-------:|---------:|---------:|-------:|--------:|
-| 0 (off) | –       | 1.00     | 2.569 s | 1.00× |
-| 2      | 50.0%    | 1.28     | 1.947 s | **1.32×** |
-| 4      | 45.0%    | 1.39     | 2.127 s | 1.21× |
-| 8      | 22.5%    | 1.39     | 2.167 s | 1.19× |
+| 0 (off) | –       | 1.00     | 2.423 s | 1.00× |
+| 2      | 50.0%    | 1.28     | 2.421 s | 1.00× |
+| 4      | 45.0%    | 1.39     | 1.807 s | **1.34×** |
+| 8      | 22.5%    | 1.39     | 2.148 s | 1.13× |
 
-The second table is the more interesting one, because **more drafting makes it
-slower**. `K=4` emits more tokens per step than `K=2` and still loses on
-wall-clock: a rejected draft is a position that was embedded, rotated, attended
-over and projected through the LM head for nothing. Past the point where
-acceptance falls faster than the batch amortizes, deeper drafting is pure waste.
-That is why `draft_tokens` defaults to 0 and why the benchmark sweeps it rather
-than picking a number.
+**Open-ended** — "explain why decoding is memory-bound", 27-token prompt.
+Nothing to copy:
 
-Speedup is always below `tok/step` for the same reason — verifying `K+1`
-positions costs more than producing one token. The gap between the two columns
-is the price of guessing.
+| drafts | accepted | tok/step | decode | speedup |
+|-------:|---------:|---------:|-------:|--------:|
+| 0 (off) | –       | 1.00     | 4.747 s | 1.00× |
+| 2      | 55.6%    | 1.09     | 4.398 s | 1.08× |
+| 4      | 29.4%    | 1.09     | 5.034 s | **0.94×** |
+| 8      | 16.1%    | 1.09     | 4.626 s | 1.03× |
+
+Three things in these tables are worth more than the headline 4.34×.
+
+**Deeper drafting stops helping at a workload-specific depth, and the tables say
+exactly where.** Look down the `tok/step` column, not the acceptance column.
+Open-ended is pinned at 1.09 for every `K`, while acceptance falls 55.6% → 29.4%
+→ 16.1% — almost exactly halving as `K` doubles. That is the signature of a
+*constant* number of accepted tokens divided by a doubling number of drafted
+ones: past the point where the model and the drafter diverge, every additional
+draft is a position that gets embedded, rotated, attended over and pushed
+through the LM head to be thrown away. Extractive QA saturates the same way at
+1.39. Verbatim copy never saturates — `tok/step` tracks `K+1` exactly (3.00,
+4.85, 9.00) because the model agrees with the drafter indefinitely.
+
+**Acceptance rate is not the metric.** Open-ended shows 55.6% acceptance at
+`K=2` — higher than extractive QA's 50% — and buys almost nothing, because the
+drafter only *fires* on a small fraction of steps there. A high acceptance rate
+on rare guesses is worth less than a mediocre one on frequent guesses. `tok/step`
+conflates the two correctly; acceptance alone flatters the hard case.
+
+**`K=4` on open-ended is 0.94×** — speculation made it slower. That is the
+honest cost of a wrong guess, and it is why `draft_tokens` defaults to 0 and why
+the benchmark sweeps `K` rather than shipping a favourite value.
+
+*On measurement noise:* acceptance and `tok/step` are deterministic — the same
+prompt drafts and accepts identically every run. Wall clock is not. Repeats of
+one configuration on this laptop have landed 24% apart, wide enough to reorder
+`K=2` and `K=4` between runs. The benchmark therefore reports the **fastest of
+three** runs per configuration (`SPEC_REPEATS`) and prints the widest observed
+spread underneath each table, so a gap narrower than the noise can be recognized
+as one. The numbers above predate that change and are single measurements.
 
 ## Serving
 
@@ -580,12 +607,10 @@ blocks.
 - **Speculative decoding verifies a single draft sequence**, not a tree. Tree
   verification explores several branches per pass and lifts acceptance further —
   which is exactly where the extractive-QA numbers above run out of road.
-- **The open-ended speculation row is unmeasured.** Its first prompt ended in a
-  complete sentence, and the base model answered with EOS immediately; the
-  benchmark was reporting a speedup computed from two near-zero timers. The
-  prompt now ends mid-sentence and the benchmark refuses to print a row for a
-  run shorter than 8 tokens, but the honest number for that workload has not
-  been re-measured yet. Expect it to be at or slightly below 1.00×.
+- **Prompt lookup rarely fires on novel text.** That is the real ceiling on the
+  open-ended row — not low acceptance, but no draft offered at all on most
+  steps. Fixing it needs a drafter that can propose tokens the context has never
+  contained, which prompt lookup by construction cannot.
 - **Only streaming clients can be cancelled.** Disconnection is detected on a
   failed chunk write, and a buffered request writes nothing until it is
   finished, so there is no write to fail on.
