@@ -153,6 +153,69 @@ pub mod x86 {
         total
     }
 
+    /// One weight row against `BT` activation vectors, loading `w` once.
+    ///
+    /// Accumulator structure is identical to [`dot`]: chunk `j` of every
+    /// 32-element group lands in `acc[b][j]`, the 8-element tail lands in
+    /// `acc[b][0]`, the reduction is `(0+1)+(2+3)`, and the scalar remainder is
+    /// added last in increasing index. `BT == 1` therefore reproduces [`dot`]
+    /// bit for bit.
+    ///
+    /// `BT` is bounded by the register file, not by taste: `1 + 4*BT` live
+    /// vectors must fit in 16 ymm registers or the accumulators spill and the
+    /// saved loads come straight back as stores.
+    ///
+    /// # Safety
+    /// Caller must have checked [`available`], and `x_block` must hold at least
+    /// `BT * stride` elements.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_multi<const BT: usize>(
+        w: &[f32],
+        x_block: &[f32],
+        stride: usize,
+    ) -> [f32; BT] {
+        let n = w.len().min(stride);
+        let pw = w.as_ptr();
+        let px = x_block.as_ptr();
+        let mut acc = [[_mm256_setzero_ps(); 4]; BT];
+
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, off) in [0usize, 8, 16, 24].into_iter().enumerate() {
+                let wv = _mm256_loadu_ps(pw.add(i + off));
+                for (b, acc_b) in acc.iter_mut().enumerate() {
+                    acc_b[j] = _mm256_fmadd_ps(
+                        wv,
+                        _mm256_loadu_ps(px.add(b * stride + i + off)),
+                        acc_b[j],
+                    );
+                }
+            }
+            i += 32;
+        }
+        while i + 8 <= n {
+            let wv = _mm256_loadu_ps(pw.add(i));
+            for (b, acc_b) in acc.iter_mut().enumerate() {
+                acc_b[0] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(px.add(b * stride + i)), acc_b[0]);
+            }
+            i += 8;
+        }
+
+        std::array::from_fn(|b| {
+            let sum = _mm256_add_ps(
+                _mm256_add_ps(acc[b][0], acc[b][1]),
+                _mm256_add_ps(acc[b][2], acc[b][3]),
+            );
+            let mut total = hsum(sum);
+            let mut k = i;
+            while k < n {
+                total += *pw.add(k) * *px.add(b * stride + k);
+                k += 1;
+            }
+            total
+        })
+    }
+
     /// int8 weights against f32 activations.
     ///
     /// `_mm256_cvtepi8_epi32` sign-extends 8 bytes straight to 8 lanes of i32,
@@ -196,6 +259,73 @@ pub mod x86 {
             i += 1;
         }
         total
+    }
+
+    /// One int8 weight row against `BT` activation vectors.
+    ///
+    /// The saving here is larger than in the f32 case. Every weight element has
+    /// to be widened from `i8` to `f32` before it can be multiplied — a load, a
+    /// sign-extend and a convert — and the naive nesting redoes all three once
+    /// per batch entry. Widening once and reusing the vector across the tile
+    /// removes `BT-1` copies of that work, not just `BT-1` loads.
+    ///
+    /// Accumulator structure matches [`dot_i8`] exactly, so `BT == 1`
+    /// reproduces it bit for bit.
+    ///
+    /// # Safety
+    /// Caller must have checked [`available`]; `x_block` must hold at least
+    /// `BT * stride` elements.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_i8_multi<const BT: usize>(
+        w: &[i8],
+        x_block: &[f32],
+        stride: usize,
+    ) -> [f32; BT] {
+        let n = w.len().min(stride);
+        let pw = w.as_ptr();
+        let px = x_block.as_ptr();
+        let mut acc = [[_mm256_setzero_ps(); 4]; BT];
+
+        #[inline(always)]
+        unsafe fn widen(p: *const i8) -> __m256 {
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(p as *const __m128i)))
+        }
+
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, off) in [0usize, 8, 16, 24].into_iter().enumerate() {
+                let wv = widen(pw.add(i + off));
+                for (b, acc_b) in acc.iter_mut().enumerate() {
+                    acc_b[j] = _mm256_fmadd_ps(
+                        wv,
+                        _mm256_loadu_ps(px.add(b * stride + i + off)),
+                        acc_b[j],
+                    );
+                }
+            }
+            i += 32;
+        }
+        while i + 8 <= n {
+            let wv = widen(pw.add(i));
+            for (b, acc_b) in acc.iter_mut().enumerate() {
+                acc_b[0] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(px.add(b * stride + i)), acc_b[0]);
+            }
+            i += 8;
+        }
+
+        std::array::from_fn(|b| {
+            let sum = _mm256_add_ps(
+                _mm256_add_ps(acc[b][0], acc[b][1]),
+                _mm256_add_ps(acc[b][2], acc[b][3]),
+            );
+            let mut total = hsum(sum);
+            let mut k = i;
+            while k < n {
+                total += *pw.add(k) as f32 * *px.add(b * stride + k);
+                k += 1;
+            }
+            total
+        })
     }
 
     /// # Safety
@@ -263,6 +393,57 @@ pub mod neon {
         total
     }
 
+    /// One weight row against `BT` activation vectors, loading `w` once.
+    /// Mirrors [`dot`]'s accumulator structure exactly, so `BT == 1`
+    /// reproduces it bit for bit. aarch64 has 32 vector registers, so `BT` can
+    /// go wider here than on AVX2 before `1 + 4*BT` accumulators spill.
+    ///
+    /// # Safety
+    /// Safe on any aarch64 target; `x_block` must hold at least `BT * stride`
+    /// elements.
+    pub unsafe fn dot_multi<const BT: usize>(
+        w: &[f32],
+        x_block: &[f32],
+        stride: usize,
+    ) -> [f32; BT] {
+        let n = w.len().min(stride);
+        let pw = w.as_ptr();
+        let px = x_block.as_ptr();
+        let mut acc = [[vdupq_n_f32(0.0); 4]; BT];
+
+        let mut i = 0;
+        while i + 16 <= n {
+            for j in 0..4 {
+                let wv = vld1q_f32(pw.add(i + 4 * j));
+                for b in 0..BT {
+                    acc[b][j] = vfmaq_f32(acc[b][j], wv, vld1q_f32(px.add(b * stride + i + 4 * j)));
+                }
+            }
+            i += 16;
+        }
+        while i + 4 <= n {
+            let wv = vld1q_f32(pw.add(i));
+            for (b, acc_b) in acc.iter_mut().enumerate() {
+                acc_b[0] = vfmaq_f32(acc_b[0], wv, vld1q_f32(px.add(b * stride + i)));
+            }
+            i += 4;
+        }
+
+        std::array::from_fn(|b| {
+            let sum = vaddq_f32(
+                vaddq_f32(acc[b][0], acc[b][1]),
+                vaddq_f32(acc[b][2], acc[b][3]),
+            );
+            let mut total = vaddvq_f32(sum);
+            let mut k = i;
+            while k < n {
+                total += *pw.add(k) * *px.add(b * stride + k);
+                k += 1;
+            }
+            total
+        })
+    }
+
     /// # Safety
     /// Safe on any aarch64 target; `unsafe` only because the intrinsics are.
     pub unsafe fn dot_i8(w: &[i8], x: &[f32]) -> f32 {
@@ -308,6 +489,70 @@ pub mod neon {
             i += 1;
         }
         total
+    }
+
+    /// One int8 weight row against `BT` activation vectors, widening each
+    /// weight element once instead of once per batch entry. Mirrors
+    /// [`dot_i8`]'s accumulator structure, so `BT == 1` reproduces it exactly.
+    ///
+    /// # Safety
+    /// Safe on any aarch64 target; `x_block` must hold at least `BT * stride`
+    /// elements.
+    pub unsafe fn dot_i8_multi<const BT: usize>(
+        w: &[i8],
+        x_block: &[f32],
+        stride: usize,
+    ) -> [f32; BT] {
+        let n = w.len().min(stride);
+        let pw = w.as_ptr();
+        let px = x_block.as_ptr();
+        let mut acc = [[vdupq_n_f32(0.0); 4]; BT];
+
+        #[inline(always)]
+        unsafe fn widen8(p: *const i8) -> (float32x4_t, float32x4_t) {
+            let wide = vmovl_s8(vld1_s8(p));
+            (
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide))),
+                vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide))),
+            )
+        }
+
+        let mut i = 0;
+        while i + 16 <= n {
+            let (lo, hi) = widen8(pw.add(i));
+            let (lo2, hi2) = widen8(pw.add(i + 8));
+            for (b, acc_b) in acc.iter_mut().enumerate() {
+                let xb = px.add(b * stride);
+                acc_b[0] = vfmaq_f32(acc_b[0], lo, vld1q_f32(xb.add(i)));
+                acc_b[1] = vfmaq_f32(acc_b[1], hi, vld1q_f32(xb.add(i + 4)));
+                acc_b[2] = vfmaq_f32(acc_b[2], lo2, vld1q_f32(xb.add(i + 8)));
+                acc_b[3] = vfmaq_f32(acc_b[3], hi2, vld1q_f32(xb.add(i + 12)));
+            }
+            i += 16;
+        }
+        while i + 8 <= n {
+            let (lo, hi) = widen8(pw.add(i));
+            for (b, acc_b) in acc.iter_mut().enumerate() {
+                let xb = px.add(b * stride);
+                acc_b[0] = vfmaq_f32(acc_b[0], lo, vld1q_f32(xb.add(i)));
+                acc_b[1] = vfmaq_f32(acc_b[1], hi, vld1q_f32(xb.add(i + 4)));
+            }
+            i += 8;
+        }
+
+        std::array::from_fn(|b| {
+            let sum = vaddq_f32(
+                vaddq_f32(acc[b][0], acc[b][1]),
+                vaddq_f32(acc[b][2], acc[b][3]),
+            );
+            let mut total = vaddvq_f32(sum);
+            let mut k = i;
+            while k < n {
+                total += *pw.add(k) as f32 * *px.add(b * stride + k);
+                k += 1;
+            }
+            total
+        })
     }
 
     /// # Safety
@@ -418,4 +663,64 @@ pub fn axpy(out: &mut [f32], weight: f32, v: &[f32]) {
     }
     #[allow(unreachable_code)]
     axpy_scalar(out, weight, v)
+}
+
+// ── one weight row against several activation vectors ────────────────────────
+//
+// The batched matmul's inner loop is `for b { dot(w_row, x_b) }`. That reloads
+// every element of `w_row` once per batch entry: at batch 8, eight passes over
+// the same row, each doing one load of `w` and one load of `x` per fused
+// multiply-add. Two loads to feed one FMA is the wrong ratio on every machine
+// measured — load ports retire two per cycle and FMAs also two per cycle, so
+// the loads take twice as long as the arithmetic they feed and the kernel is
+// issue-bound rather than bandwidth-bound. That is what stops batched decode
+// scaling past batch four or five, not anything to do with attention.
+//
+// `dot_multi` loads each element of `w` **once** and multiplies it into `BT`
+// independent accumulator sets, cutting the ratio from `2` loads per FMA
+// toward `1 + 1/BT`.
+//
+// The accumulator layout is copied from `dot` rather than simplified, on
+// purpose. Four accumulators per output, the same 32- (or 16-) element
+// chunking, the same `(acc0+acc1)+(acc2+acc3)` reduction, the same scalar tail
+// order — so `dot_multi::<1>` is `dot`, element for element, and the tiled
+// batched kernel stays bit-identical to the single-sequence one. A tile that
+// collapsed to one accumulator per output would be faster still and would
+// quietly break that.
+
+/// `out[j] = dot(w, &x_block[j * stride..][..stride])`, for `j` in `0..BT`.
+///
+/// `x_block` holds `BT` consecutive activation vectors of length `stride`.
+pub fn dot_multi<const BT: usize>(w: &[f32], x_block: &[f32], stride: usize) -> [f32; BT] {
+    debug_assert!(x_block.len() >= BT * stride);
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        return unsafe { x86::dot_multi::<BT>(w, x_block, stride) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon::dot_multi::<BT>(w, x_block, stride) };
+    }
+    #[allow(unreachable_code)]
+    dot_multi_scalar::<BT>(w, x_block, stride)
+}
+
+/// Portable reference: literally `BT` calls to [`dot_scalar`].
+pub fn dot_multi_scalar<const BT: usize>(w: &[f32], x_block: &[f32], stride: usize) -> [f32; BT] {
+    std::array::from_fn(|j| dot_scalar(w, &x_block[j * stride..(j + 1) * stride]))
+}
+
+/// `out[j] = dot_i8(w, &x_block[j * stride..][..stride])`, for `j` in `0..BT`.
+pub fn dot_i8_multi<const BT: usize>(w: &[i8], x_block: &[f32], stride: usize) -> [f32; BT] {
+    debug_assert!(x_block.len() >= BT * stride);
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        return unsafe { x86::dot_i8_multi::<BT>(w, x_block, stride) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon::dot_i8_multi::<BT>(w, x_block, stride) };
+    }
+    #[allow(unreachable_code)]
+    std::array::from_fn(|j| dot_i8_scalar(w, &x_block[j * stride..(j + 1) * stride]))
 }

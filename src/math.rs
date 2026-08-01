@@ -128,6 +128,23 @@ pub fn matvec_f32_weight_transposed_parallel(
     });
 }
 
+/// Activation vectors fed through one weight load, in the batched matmul.
+///
+/// Read once. Larger tiles issue fewer loads per fused multiply-add but keep
+/// `4 * tile` accumulators live, and spilling those hands the saved loads back
+/// as stores. `PAGED_INFER_MATMUL_TILE` exists so the ceiling can be found by
+/// measurement on a given machine; `1` turns tiling off.
+fn matmul_tile() -> usize {
+    static TILE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TILE.get_or_init(|| {
+        std::env::var("PAGED_INFER_MATMUL_TILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4)
+    })
+}
+
 /// Batched matvec: project `batch` activation vectors through one weight matrix.
 ///
 /// This is the whole point of batching decode. A matvec is memory-bound — it
@@ -156,34 +173,50 @@ pub fn matmat_f32_weight_transposed_parallel(
     assert_eq!(out_rb.len(), rows * batch);
     assert_eq!(weight.len(), rows * cols);
 
-    macro_rules! run {
-        ($dot:expr) => {
-            out_rb
-                .par_chunks_mut(batch)
-                .enumerate()
-                .for_each(|(r, out_row)| {
-                    let w_row = &weight[r * cols..(r + 1) * cols];
-                    for (b, slot) in out_row.iter_mut().enumerate() {
-                        *slot = $dot(w_row, &x_br[b * cols..(b + 1) * cols]);
-                    }
-                })
-        };
-    }
+    // Each weight row is loaded once and multiplied into `TILE` activation
+    // vectors at a time, instead of once per batch entry. The naive nesting
+    // issues two loads to feed every fused multiply-add — one for the weight,
+    // one for the activation — and a core that retires two loads and two FMAs
+    // per cycle is then waiting on its load ports, not its arithmetic. That is
+    // what caps batched decode around batch four or five.
+    //
+    // `TILE` is bounded by the register file: `dot_multi` keeps `4 * TILE`
+    // accumulators live, and spilling them would hand back the loads it saved.
+    // Four fits aarch64's 32 vector registers comfortably and AVX2's 16 tightly;
+    // the remainder of a ragged batch falls through to narrower tiles.
+    // `PAGED_INFER_MATMUL_TILE=1` disables tiling entirely, reproducing the
+    // one-dot-per-batch-entry nesting this replaced — which is what makes an
+    // honest A/B possible inside a single binary.
+    let tile = matmul_tile();
 
-    #[cfg(target_arch = "x86_64")]
-    if crate::simd::x86::available() {
-        run!(|w, x| unsafe { crate::simd::x86::dot(w, x) });
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        run!(|w, x| unsafe { crate::simd::neon::dot(w, x) });
-        return;
-    }
-    #[allow(unreachable_code)]
-    {
-        run!(crate::simd::dot_scalar);
-    }
+    out_rb
+        .par_chunks_mut(batch)
+        .enumerate()
+        .for_each(|(r, out_row)| {
+            let w_row = &weight[r * cols..(r + 1) * cols];
+            let mut b = 0;
+            if tile >= 4 {
+                while b + 4 <= batch {
+                    let block = &x_br[b * cols..(b + 4) * cols];
+                    out_row[b..b + 4]
+                        .copy_from_slice(&crate::simd::dot_multi::<4>(w_row, block, cols));
+                    b += 4;
+                }
+            }
+            if tile >= 2 {
+                while b + 2 <= batch {
+                    let block = &x_br[b * cols..(b + 2) * cols];
+                    out_row[b..b + 2]
+                        .copy_from_slice(&crate::simd::dot_multi::<2>(w_row, block, cols));
+                    b += 2;
+                }
+            }
+            // Ragged remainder, and the whole batch when tiling is off.
+            while b < batch {
+                out_row[b] = crate::simd::dot(w_row, &x_br[b * cols..(b + 1) * cols]);
+                b += 1;
+            }
+        })
 }
 
 /// [`matmat_f32_weight_transposed_parallel`] against int8 weights.
@@ -201,35 +234,44 @@ pub fn matmat_i8_weight_parallel(
     assert_eq!(weight.len(), rows * cols);
     assert_eq!(scales.len(), rows);
 
-    macro_rules! run {
-        ($dot:expr) => {
-            out_rb
-                .par_chunks_mut(batch)
-                .enumerate()
-                .for_each(|(r, out_row)| {
-                    let w_row = &weight[r * cols..(r + 1) * cols];
-                    let scale = scales[r];
-                    for (b, slot) in out_row.iter_mut().enumerate() {
-                        *slot = $dot(w_row, &x_br[b * cols..(b + 1) * cols]) * scale;
-                    }
-                })
-        };
-    }
+    // Same tiling as the f32 path, and worth more here: an int8 weight element
+    // must be loaded, sign-extended and converted to f32 before it can be
+    // multiplied, and the untiled nesting repeats all three once per batch
+    // entry. Tiling hoists the whole widening, not just the load.
+    let tile = matmul_tile();
 
-    #[cfg(target_arch = "x86_64")]
-    if crate::simd::x86::available() {
-        run!(|w, x| unsafe { crate::simd::x86::dot_i8(w, x) });
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        run!(|w, x| unsafe { crate::simd::neon::dot_i8(w, x) });
-        return;
-    }
-    #[allow(unreachable_code)]
-    {
-        run!(crate::simd::dot_i8_scalar);
-    }
+    out_rb
+        .par_chunks_mut(batch)
+        .enumerate()
+        .for_each(|(r, out_row)| {
+            let w_row = &weight[r * cols..(r + 1) * cols];
+            let scale = scales[r];
+            let mut b = 0;
+            if tile >= 4 {
+                while b + 4 <= batch {
+                    let block = &x_br[b * cols..(b + 4) * cols];
+                    let got = crate::simd::dot_i8_multi::<4>(w_row, block, cols);
+                    for (slot, v) in out_row[b..b + 4].iter_mut().zip(got) {
+                        *slot = v * scale;
+                    }
+                    b += 4;
+                }
+            }
+            if tile >= 2 {
+                while b + 2 <= batch {
+                    let block = &x_br[b * cols..(b + 2) * cols];
+                    let got = crate::simd::dot_i8_multi::<2>(w_row, block, cols);
+                    for (slot, v) in out_row[b..b + 2].iter_mut().zip(got) {
+                        *slot = v * scale;
+                    }
+                    b += 2;
+                }
+            }
+            while b < batch {
+                out_row[b] = crate::simd::dot_i8(w_row, &x_br[b * cols..(b + 1) * cols]) * scale;
+                b += 1;
+            }
+        })
 }
 
 /// `[row][batch]` -> `[batch][row]`.

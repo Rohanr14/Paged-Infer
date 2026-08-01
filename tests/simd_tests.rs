@@ -175,3 +175,98 @@ fn test_matvec_is_row_independent() {
         }
     }
 }
+
+/// `dot_multi` exists to load a weight row once instead of once per batch
+/// entry. It must be a pure scheduling change: the batched matmul is claimed
+/// bit-identical to the single-sequence path, and that claim dies the moment
+/// the tiled kernel sums in a different order. So it is not enough for it to be
+/// close to `dot` — it has to *be* `dot`, at every length, including the ragged
+/// tails where the vector loop stops and scalar arithmetic takes over.
+#[test]
+fn test_dot_multi_is_dot_at_every_length_and_tile_width() {
+    let mk = |seed: usize, n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 37 + seed * 101) % 251) as f32) * 0.013 - 1.6)
+            .collect()
+    };
+
+    // Lengths spanning both vector loops and every scalar-tail remainder:
+    // AVX2 chunks 32 then 8, NEON chunks 16 then 4.
+    for n in [
+        0usize, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 40, 63, 64, 65, 96, 129,
+    ] {
+        let w = mk(0, n);
+        for bt in 1..=6usize {
+            let mut block = Vec::with_capacity(bt * n);
+            for b in 0..bt {
+                block.extend(mk(b + 1, n));
+            }
+            let expect: Vec<f32> = (0..bt)
+                .map(|b| paged_infer::simd::dot(&w, &block[b * n..(b + 1) * n]))
+                .collect();
+
+            let got: Vec<f32> = match bt {
+                1 => paged_infer::simd::dot_multi::<1>(&w, &block, n).to_vec(),
+                2 => paged_infer::simd::dot_multi::<2>(&w, &block, n).to_vec(),
+                3 => paged_infer::simd::dot_multi::<3>(&w, &block, n).to_vec(),
+                4 => paged_infer::simd::dot_multi::<4>(&w, &block, n).to_vec(),
+                5 => paged_infer::simd::dot_multi::<5>(&w, &block, n).to_vec(),
+                _ => paged_infer::simd::dot_multi::<6>(&w, &block, n).to_vec(),
+            };
+            assert_eq!(got, expect, "n={n} tile={bt} diverged from dot");
+        }
+    }
+}
+
+#[test]
+fn test_dot_multi_matches_the_scalar_reference() {
+    // The vectorized kernels are checked against the portable one, which is
+    // just `BT` calls to `dot_scalar`. On a machine with SIMD this compares two
+    // different reduction trees, so it is a tolerance check rather than an
+    // equality one — unlike the test above, which compares like with like.
+    for n in [5usize, 32, 33, 64, 100] {
+        let w: Vec<f32> = (0..n).map(|i| ((i % 17) as f32) * 0.05 - 0.4).collect();
+        let block: Vec<f32> = (0..4 * n).map(|i| ((i % 23) as f32) * 0.03 - 0.3).collect();
+        let got = paged_infer::simd::dot_multi::<4>(&w, &block, n);
+        let expect = paged_infer::simd::dot_multi_scalar::<4>(&w, &block, n);
+        for (g, e) in got.iter().zip(expect.iter()) {
+            assert!((g - e).abs() < 1e-4, "n={n}: {g} vs {e}");
+        }
+    }
+}
+
+/// Same contract for the int8 tile: it hoists the widening out of the batch
+/// loop, which must not move a single bit of the result.
+#[test]
+fn test_dot_i8_multi_is_dot_i8_at_every_length_and_tile_width() {
+    for n in [
+        0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 40, 64, 65, 96, 129,
+    ] {
+        // Include the range edges: i8::MIN sign-extends wrongly if the widening
+        // is done with a zero-extend, and that bug hides at small magnitudes.
+        let w: Vec<i8> = (0..n)
+            .map(|i| match i % 5 {
+                0 => i8::MIN,
+                1 => i8::MAX,
+                2 => -1,
+                3 => 0,
+                _ => ((i * 31) % 127) as i8,
+            })
+            .collect();
+        for bt in [1usize, 2, 3, 4] {
+            let block: Vec<f32> = (0..bt * n)
+                .map(|i| (((i * 17) % 211) as f32) * 0.011 - 1.2)
+                .collect();
+            let expect: Vec<f32> = (0..bt)
+                .map(|b| paged_infer::simd::dot_i8(&w, &block[b * n..(b + 1) * n]))
+                .collect();
+            let got: Vec<f32> = match bt {
+                1 => paged_infer::simd::dot_i8_multi::<1>(&w, &block, n).to_vec(),
+                2 => paged_infer::simd::dot_i8_multi::<2>(&w, &block, n).to_vec(),
+                3 => paged_infer::simd::dot_i8_multi::<3>(&w, &block, n).to_vec(),
+                _ => paged_infer::simd::dot_i8_multi::<4>(&w, &block, n).to_vec(),
+            };
+            assert_eq!(got, expect, "n={n} tile={bt} diverged from dot_i8");
+        }
+    }
+}

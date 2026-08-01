@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 141 tests, incl. golden parity
+cargo test                                        # 144 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -269,6 +269,61 @@ do not batch take over: attention (each sequence has its own KV, position and
 block table) plus per-sequence RMSNorm, RoPE and SwiGLU. Context length moves
 this less than batch size does: at batch 8, 3.8x at 32 tokens of context against
 3.3x at 512.
+
+### Tiling the batched matmul
+
+The batched matmul had the wrong loop nesting, and it was the real ceiling on
+batched decode:
+
+```rust
+for b in 0..batch {
+    out[b] = dot(w_row, x[b]);   // w_row reloaded, once per batch entry
+}
+```
+
+Every element of `w_row` is loaded into a register, multiplied against **one**
+activation vector, and discarded — then loaded again for the next. That is two
+loads to feed each fused multiply-add, one for the weight and one for the
+activation. A core that retires two loads and two FMAs per cycle is then
+waiting on its load ports while its arithmetic sits idle, and no amount of
+memory bandwidth helps: the kernel has left the bandwidth-bound regime and
+become issue-bound. That, not attention, is what flattens the batching curve.
+
+`dot_multi` loads each weight element once and multiplies it into `TILE`
+independent accumulator sets, cutting the ratio from `2` loads per FMA toward
+`1 + 1/TILE`. The int8 path gets the same treatment and gains more from it: an
+`i8` weight must be loaded, sign-extended and converted before it can be
+multiplied, and the untiled nesting repeated all three per batch entry.
+
+`TILE` is bounded by the register file rather than by preference — `dot_multi`
+keeps `4 * TILE` accumulators live, and spilling them hands back the loads it
+saved. Four fits aarch64's 32 vector registers comfortably and AVX2's 16
+tightly.
+
+**4-core x86_64 (AVX2+FMA), `batch_benchmark`, fastest of 3:**
+
+| weights | context | batch | untiled | tiled | batched speedup |
+|:--|---:|---:|---:|---:|---:|
+| f32 | 128 | 8 | 171.7 tok/s | 187.3 tok/s | 3.28× → 3.53× |
+| f32 | 128 | 16 | 181.5 tok/s | 204.5 tok/s | 3.52× → 3.92× |
+| f32 | 128 | 32 | 243.9 tok/s | 262.2 tok/s | 4.68× → **4.97×** |
+| int8 | 1024 | 8 | 145.4 tok/s | 149.6 tok/s | 2.90× → 3.09× |
+| int8 | 1024 | 16 | 162.9 tok/s | **185.4 tok/s** | 3.22× → **3.81×** |
+
+7–14% throughput for a loop reordering, and the gain grows with batch size
+because that is how many activation vectors each weight load now serves.
+
+This is also a scheduling change and nothing more. `dot_multi::<1>` keeps the
+same four accumulators, the same 32-element chunking, the same
+`(acc0+acc1)+(acc2+acc3)` reduction and the same scalar-tail order as `dot`, so
+it *is* `dot`, element for element — `tests/simd_tests.rs` asserts equality at
+every length from 0 to 129 and every tile width from 1 to 6, for both the f32
+and int8 kernels. A tile that collapsed to one accumulator per output would
+have been faster still and would have quietly broken the bit-identity the
+batched path is claimed to have.
+
+`PAGED_INFER_MATMUL_TILE=1` turns tiling off, which is how the table above was
+measured: same binary, same run, one environment variable.
 
 ### Batched prefill
 
@@ -551,7 +606,7 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-141 tests, no model download required.
+144 tests, no model download required.
 
 | suite | covers |
 |---|---|
@@ -709,12 +764,11 @@ blocks.
 - **Attention still cannot amortize across sequences**, because there is no
   shared operand to amortize — each sequence has its own KV. The kernel removes
   the redundant work (see *Paged attention*), but the floor it leaves is real.
-- **The batched-decode ceiling is the projection kernel, not attention.**
-  Batching raises its arithmetic intensity to `B/2` flop-per-byte, so it stops
-  being bandwidth-bound at around batch 4–5 and no amount of attention work
-  moves that. Lifting it needs a blocked/register-tiled matmul that reuses each
-  weight element across more of the batch before retiring it — which is the
-  honest next optimization, and a bigger one than this was.
+- **The batched matmul is tiled across the batch but not across output rows.**
+  Tiling rows as well would cut activation loads the way tiling the batch cut
+  weight loads, but `4 * TILE` accumulators per output already crowd the AVX2
+  register file, so it needs the accumulator count per output to drop from four
+  to one — which would end the bit-identity with `dot`.
 - **The attention kernel does not split the token axis.** With few sequences and
   a multi-query model there can be fewer tasks than cores, and the lane
   scheduler's only remedy is to narrow lanes, which costs traffic.
@@ -769,7 +823,7 @@ scripts/
   gen_golden_fixture.py    reference model + logits (NumPy)
   download_model.py        fetch TinyLlama 1.1B
     speculative_benchmark.rs   acceptance and speedup per workload
-tests/                     141 tests; fixtures/ holds the reference checkpoint
+tests/                     144 tests; fixtures/ holds the reference checkpoint
 ```
 
 ## License
