@@ -38,6 +38,7 @@ fn fixture() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         attention_window: None,
         rope_style: Default::default(),
         quantization: Default::default(),
+        ..LlamaConfig::default()
     };
     let tokens = kv["tokens"]
         .split(',')

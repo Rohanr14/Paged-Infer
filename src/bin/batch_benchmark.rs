@@ -24,7 +24,7 @@ use paged_infer::model::{
     LlamaWeights, ModelLoader, PackedLinear, Projection, Quantization,
 };
 use paged_infer::simd;
-use paged_infer::tensor::Tensor;
+use paged_infer::tensor::{DType, Tensor};
 
 const BLOCK_SIZE: usize = 16;
 
@@ -48,7 +48,11 @@ fn synthetic_config() -> LlamaConfig {
 fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
     let embed: &'static [u8] =
         Box::leak(vec![0u8; config.vocab_size * config.hidden_size * 2].into_boxed_slice());
-    let token_embeddings = Tensor::new(embed, vec![config.vocab_size, config.hidden_size]);
+    let token_embeddings = Tensor::new(
+        embed,
+        vec![config.vocab_size, config.hidden_size],
+        DType::BF16,
+    );
 
     let h = config.hidden_size;
     let kv = config.kv_dim();
@@ -242,7 +246,7 @@ fn main() -> anyhow::Result<()> {
             _loader = ModelLoader::new(&_mmap)?;
             let config = LlamaConfig {
                 quantization,
-                ..LlamaConfig::beside_checkpoint(path)
+                ..LlamaConfig::beside_checkpoint(path)?
             };
             let w = _loader.load_weights(&config)?;
             (config, w)

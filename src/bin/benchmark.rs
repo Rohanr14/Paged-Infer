@@ -30,8 +30,10 @@ fn bench<F: FnMut()>(iters: usize, mut f: F) -> f64 {
 /// single-accumulator matvec. This is the naive thing to write.
 fn convert_then_matvec(out: &mut [f32], x: &[f32], w_bf16: &[u8], cols: usize) {
     let w: Vec<f32> = w_bf16
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
         .collect();
     for (r, o) in out.iter_mut().enumerate() {
         *o = simd::dot_naive(&w[r * cols..(r + 1) * cols], x);

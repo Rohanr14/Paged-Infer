@@ -28,3 +28,9 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+
+# Chat templates are Jinja2 programs shipped inside tokenizer_config.json;
+# rendering them faithfully needs a real Jinja engine. `pycompat` supplies the
+# Python string methods (`.strip()`, `.title()`) that HF templates lean on.
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }

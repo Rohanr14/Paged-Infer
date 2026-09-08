@@ -58,6 +58,7 @@ fn load_fixture() -> Fixture {
         // HF-format checkpoints require the rotate_half convention.
         rope_style: paged_infer::math::RopeStyle::Neox,
         quantization: Default::default(),
+        ..LlamaConfig::default()
     };
 
     let tokens: Vec<u32> = kv["tokens"]
@@ -68,8 +69,10 @@ fn load_fixture() -> Fixture {
 
     let raw = std::fs::read(dir.join("tiny_llama_golden.bin")).expect("golden logits");
     let golden: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     assert_eq!(golden.len(), tokens.len() * config.vocab_size);
 

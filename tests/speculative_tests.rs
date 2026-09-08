@@ -34,6 +34,7 @@ fn fixture() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         attention_window: None,
         rope_style: Default::default(),
         quantization: Default::default(),
+        ..LlamaConfig::default()
     };
     let tokens = kv["tokens"]
         .split(',')
@@ -70,7 +71,7 @@ fn generate(
     let weights = loader.load_weights(&config).unwrap();
     let mut engine = Engine::new(weights, config, engine_config);
     for p in prompts {
-        engine.submit_tokens(p.clone(), max_tokens, 1);
+        engine.submit_tokens(p.clone(), max_tokens, 1).unwrap();
     }
     let out = engine.run().unwrap();
     let mut by_request: Vec<(usize, Vec<u32>)> = out

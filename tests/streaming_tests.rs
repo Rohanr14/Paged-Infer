@@ -35,6 +35,7 @@ fn fixture() -> (LlamaConfig, Vec<u32>, Vec<u8>) {
         attention_window: None,
         rope_style: Default::default(),
         quantization: Default::default(),
+        ..LlamaConfig::default()
     };
     let tokens = kv["tokens"]
         .split(',')
@@ -105,8 +106,8 @@ fn drain(engine: &mut Engine<'_>) -> Streamed {
 fn test_streamed_tokens_reconstruct_the_completion_exactly() {
     let (_, tokens, _) = fixture();
     with_engine(base_config(), |mut engine| {
-        engine.submit_tokens(tokens[..12].to_vec(), 20, 1);
-        engine.submit_tokens(tokens[..25].to_vec(), 14, 1);
+        engine.submit_tokens(tokens[..12].to_vec(), 20, 1).unwrap();
+        engine.submit_tokens(tokens[..25].to_vec(), 14, 1).unwrap();
         let s = drain(&mut engine);
 
         assert_eq!(s.completions.len(), 2);
@@ -126,8 +127,8 @@ fn test_every_sequence_is_told_exactly_once_that_it_ended() {
     // waits forever. Exactly one delta per sequence carries a finish reason.
     let (_, tokens, _) = fixture();
     with_engine(base_config(), |mut engine| {
-        engine.submit_tokens(tokens[..10].to_vec(), 8, 1);
-        engine.submit_tokens(tokens[..16].to_vec(), 5, 1);
+        engine.submit_tokens(tokens[..10].to_vec(), 8, 1).unwrap();
+        engine.submit_tokens(tokens[..16].to_vec(), 5, 1).unwrap();
         let s = drain(&mut engine);
 
         assert_eq!(s.completions.len(), 2);
@@ -153,7 +154,7 @@ fn test_a_speculative_step_streams_the_whole_accepted_run() {
     }
 
     let plain = with_engine(base_config(), |mut engine| {
-        engine.submit_tokens(unit.clone(), 24, 1);
+        engine.submit_tokens(unit.clone(), 24, 1).unwrap();
         drain(&mut engine)
     });
     let spec = with_engine(
@@ -162,7 +163,7 @@ fn test_a_speculative_step_streams_the_whole_accepted_run() {
             ..base_config()
         },
         |mut engine| {
-            engine.submit_tokens(unit.clone(), 24, 1);
+            engine.submit_tokens(unit.clone(), 24, 1).unwrap();
             drain(&mut engine)
         },
     );
@@ -189,7 +190,7 @@ fn test_deltas_are_off_unless_asked_for() {
             ..base_config()
         },
         |mut engine| {
-            engine.submit_tokens(tokens[..12].to_vec(), 16, 1);
+            engine.submit_tokens(tokens[..12].to_vec(), 16, 1).unwrap();
             let s = drain(&mut engine);
             assert!(
                 s.per_sequence.is_empty(),
@@ -206,7 +207,7 @@ fn test_forked_samples_stream_under_distinct_sequence_ids() {
     // branches apart or a client interleaves four continuations into mush.
     let (_, tokens, _) = fixture();
     with_engine(base_config(), |mut engine| {
-        let request_id = engine.submit_tokens(tokens[..14].to_vec(), 12, 4);
+        let request_id = engine.submit_tokens(tokens[..14].to_vec(), 12, 4).unwrap();
         let s = drain(&mut engine);
         assert_eq!(request_id, 0);
         assert_eq!(s.completions.len(), 4);
@@ -223,8 +224,8 @@ fn test_cancelling_stops_generation_and_returns_the_blocks() {
     let (_, tokens, _) = fixture();
     with_engine(base_config(), |mut engine| {
         let total = engine.total_blocks();
-        let keep = engine.submit_tokens(tokens[..12].to_vec(), 40, 1);
-        let drop_me = engine.submit_tokens(tokens[..20].to_vec(), 40, 1);
+        let keep = engine.submit_tokens(tokens[..12].to_vec(), 40, 1).unwrap();
+        let drop_me = engine.submit_tokens(tokens[..20].to_vec(), 40, 1).unwrap();
 
         for _ in 0..4 {
             engine.step().unwrap();
@@ -260,8 +261,8 @@ fn test_cancelling_stops_generation_and_returns_the_blocks() {
 fn test_cancelling_a_queued_request_never_admits_it() {
     let (_, tokens, _) = fixture();
     with_engine(base_config(), |mut engine| {
-        let first = engine.submit_tokens(tokens[..12].to_vec(), 6, 1);
-        let queued = engine.submit_tokens(tokens[..12].to_vec(), 6, 1);
+        let first = engine.submit_tokens(tokens[..12].to_vec(), 6, 1).unwrap();
+        let queued = engine.submit_tokens(tokens[..12].to_vec(), 6, 1).unwrap();
         assert_eq!(engine.cancel_request(queued), 1);
 
         let out = engine.run().unwrap();
@@ -276,7 +277,7 @@ fn test_warm_up_leaves_no_trace() {
     // output, and counters that describe the workload rather than the warm-up.
     let (_, tokens, _) = fixture();
     let cold = with_engine(base_config(), |mut engine| {
-        engine.submit_tokens(tokens[..18].to_vec(), 16, 1);
+        engine.submit_tokens(tokens[..18].to_vec(), 16, 1).unwrap();
         engine.run().unwrap()
     });
 
@@ -287,7 +288,7 @@ fn test_warm_up_leaves_no_trace() {
         assert_eq!(engine.prefix_stats(), Default::default());
         assert_eq!(engine.available_blocks(), engine.total_blocks());
 
-        engine.submit_tokens(tokens[..18].to_vec(), 16, 1);
+        engine.submit_tokens(tokens[..18].to_vec(), 16, 1).unwrap();
         let warm = engine.run().unwrap();
         assert_eq!(warm.len(), cold.len());
         assert_eq!(
@@ -306,10 +307,10 @@ fn test_warm_up_still_lets_the_prefix_cache_work() {
     with_engine(base_config(), |mut engine| {
         engine.warm_up();
         let baseline = {
-            engine.submit_tokens(tokens[..20].to_vec(), 8, 1);
+            engine.submit_tokens(tokens[..20].to_vec(), 8, 1).unwrap();
             engine.run().unwrap()[0].tokens.clone()
         };
-        engine.submit_tokens(tokens[..20].to_vec(), 8, 1);
+        engine.submit_tokens(tokens[..20].to_vec(), 8, 1).unwrap();
         let reused = engine.run().unwrap()[0].tokens.clone();
 
         assert_eq!(baseline, reused, "prefix reuse changed the answer");
@@ -333,4 +334,104 @@ fn test_incremental_text_matches_a_single_decode() {
         emitted = c.to_string();
     }
     assert_eq!(joined, full);
+}
+
+#[test]
+fn test_cancellation_emits_exactly_one_terminal_delta() {
+    // A streaming client that is cancelled server-side (or whose sibling
+    // sample was) must still see its stream close. Cancellation used to reclaim
+    // the sequence without any terminal event.
+    let (_, tokens, _) = fixture();
+    let cfg = EngineConfig {
+        // So the pool is provably empty afterwards: no cache-held blocks.
+        enable_prefix_cache: false,
+        ..base_config()
+    };
+    with_engine(cfg, |mut engine| {
+        let id = engine.submit_tokens(tokens[..12].to_vec(), 40, 2).unwrap();
+        // One step admits (prefill token) and decodes (one more) both samples.
+        engine.step().unwrap();
+        let first: Vec<_> = engine.take_deltas();
+        assert_eq!(first.len(), 4, "both samples emitted two deltas");
+        assert!(first.iter().all(|d| d.finish_reason.is_none()));
+
+        assert_eq!(engine.cancel_request(id), 2);
+        let terminal = engine.take_deltas();
+        assert_eq!(terminal.len(), 2, "one terminal delta per sequence");
+        for d in &terminal {
+            assert_eq!(d.finish_reason, Some(FinishReason::Cancelled));
+            assert!(d.tokens.is_empty(), "cancellation invents no tokens");
+        }
+        let done = engine.take_completed();
+        assert_eq!(done.len(), 2);
+        assert!(done
+            .iter()
+            .all(|c| c.finish_reason == FinishReason::Cancelled));
+        assert!(done.iter().all(|c| c.tokens.len() == 2));
+
+        // And nothing further arrives for a cancelled request.
+        assert!(!engine.has_work());
+        assert_eq!(engine.available_blocks(), engine.total_blocks());
+    });
+}
+
+#[test]
+fn test_every_way_a_sequence_can_end_yields_exactly_one_terminal_delta() {
+    // Length, EOS, out-of-memory and cancellation, all in one run, each ending
+    // its stream exactly once.
+    let (_, tokens, _) = fixture();
+    // Learn what the model says so one request can be cut short by EOS.
+    let eos = with_engine(base_config(), |mut engine| {
+        engine.submit_tokens(tokens[..12].to_vec(), 8, 1).unwrap();
+        engine.run().unwrap()[0].tokens[2]
+    });
+    with_engine(
+        EngineConfig {
+            total_blocks: 6,
+            block_size: 8,
+            enable_prefix_cache: false,
+            eos_token: eos,
+            ..base_config()
+        },
+        |mut engine| {
+            let length = engine.submit_tokens(tokens[..10].to_vec(), 3, 1).unwrap();
+            let by_eos = engine.submit_tokens(tokens[..12].to_vec(), 8, 1).unwrap();
+            let cancelled = engine
+                .submit_tokens(tokens[20..30].to_vec(), 30, 1)
+                .unwrap();
+            let mut terminal: HashMap<usize, Vec<FinishReason>> = HashMap::new();
+            let mut steps = 0;
+            while engine.has_work() {
+                engine.step().unwrap();
+                steps += 1;
+                if steps == 2 {
+                    engine.cancel_request(cancelled);
+                }
+                for d in engine.take_deltas() {
+                    if let Some(r) = d.finish_reason {
+                        terminal.entry(d.request_id).or_default().push(r);
+                    }
+                }
+            }
+            let done = engine.take_completed();
+            assert_eq!(done.len(), 3);
+            for c in &done {
+                assert_eq!(
+                    terminal.get(&c.request_id).map(Vec::as_slice),
+                    Some(&[c.finish_reason][..]),
+                    "request {} did not end its stream exactly once",
+                    c.request_id
+                );
+            }
+            let reason = |id: usize| {
+                done.iter()
+                    .find(|c| c.request_id == id)
+                    .unwrap()
+                    .finish_reason
+            };
+            assert_eq!(reason(length), FinishReason::Length);
+            assert_eq!(reason(by_eos), FinishReason::Eos);
+            assert_eq!(reason(cancelled), FinishReason::Cancelled);
+        },
+    );
 }

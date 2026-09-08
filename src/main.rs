@@ -4,10 +4,11 @@ use anyhow::Result;
 use memmap2::MmapOptions;
 use paged_infer::engine::{Engine, EngineConfig};
 use paged_infer::model::{LlamaConfig, ModelLoader, Quantization};
+use paged_infer::profile::ModelProfile;
 use paged_infer::simd;
 use std::fs::File;
+use std::path::Path;
 use std::time::Instant;
-use tokenizers::Tokenizer;
 
 /// A realistically-sized system prompt.
 ///
@@ -65,8 +66,15 @@ fn main() -> Result<()> {
     };
     let config = LlamaConfig {
         quantization,
-        ..LlamaConfig::beside_checkpoint(&model_path)
+        ..LlamaConfig::beside_checkpoint(&model_path)?
     };
+    // Special tokens, context window and tokenizer come from the checkpoint's
+    // own files, not from constants that happen to match TinyLlama.
+    let profile = ModelProfile::from_parts(
+        config.clone(),
+        Path::new(&model_path),
+        Some(Path::new(&tokenizer_path)),
+    )?;
     let weights = loader.load_weights(&config)?;
     println!(
         "Mapped {} layers, {:.2} GB of {:?} weights ({:.2}x vs f32). SIMD backend: {}.",
@@ -77,13 +85,20 @@ fn main() -> Result<()> {
         simd::backend()
     );
 
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+    let tokenizer = profile.tokenizer()?.clone();
+    println!(
+        "Special tokens: bos={:?} eos={:?}; context {}.",
+        profile.bos_token,
+        profile.eos_tokens,
+        profile
+            .max_context
+            .map_or("unlimited".to_string(), |c| c.to_string())
+    );
 
     let engine_config = EngineConfig {
         total_blocks: 512,
         block_size: 16,
-        ..EngineConfig::default()
+        ..profile.engine_config()
     };
     let mut engine = Engine::new(weights, config, engine_config).with_tokenizer(tokenizer);
     println!(

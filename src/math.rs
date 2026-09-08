@@ -56,17 +56,21 @@ pub fn matvec_bf16_weight_transposed(
     for (r, out_r) in out.iter_mut().enumerate() {
         let row = &weight_bf16[r * cols * 2..(r + 1) * cols * 2];
         *out_r = row
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(x.iter())
-            .map(|(b, xv)| half::bf16::from_le_bytes([b[0], b[1]]).to_f32() * xv)
+            .map(|(b, xv)| half::bf16::from_le_bytes(*b).to_f32() * xv)
             .sum();
     }
 }
 
 pub fn pack_bf16_to_f32(weight_bf16: &[u8]) -> Vec<f32> {
     weight_bf16
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
         .collect()
 }
 
@@ -322,8 +326,81 @@ pub enum RopeStyle {
     Interleaved,
 }
 
+/// Rotary position scaling, as a checkpoint declares it under `rope_scaling`
+/// (older configs) or `rope_parameters` (newer ones).
+///
+/// Scaling changes the positional encoding the weights were trained against.
+/// Running a scaled checkpoint with unscaled tables is a different model, so a
+/// config that declares a variant not listed here is refused at load rather
+/// than silently run with the default.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RopeScaling {
+    #[default]
+    None,
+    /// Every position divided by `factor`: all frequencies scaled down alike.
+    Linear { factor: f32 },
+    /// Llama 3's frequency-dependent scaling. High frequencies are untouched,
+    /// low frequencies are divided by `factor`, and a smooth ramp joins them.
+    /// Transcribed from `transformers`' `_compute_llama3_parameters`.
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_position_embeddings: usize,
+    },
+}
+
+/// Inverse frequency of every rotation pair of a head, after scaling.
+///
+/// The unscaled value is computed exactly as [`rope_table`] always did, so a
+/// checkpoint without scaling gets bit-identical tables; the golden parity
+/// tests depend on that.
+pub fn rope_inv_freq(head_dim: usize, rope_theta: f32, scaling: RopeScaling) -> Vec<f32> {
+    let half = head_dim / 2;
+    let base = (0..half).map(|j| 1.0 / rope_theta.powf((2 * j) as f32 / head_dim as f32));
+    match scaling {
+        RopeScaling::None => base.collect(),
+        RopeScaling::Linear { factor } => base.map(|f| f / factor).collect(),
+        RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position_embeddings,
+        } => {
+            let original = original_max_position_embeddings as f32;
+            let low_freq_wavelen = original / low_freq_factor;
+            let high_freq_wavelen = original / high_freq_factor;
+            base.map(|inv_freq| {
+                let wavelen = 2.0 * std::f32::consts::PI / inv_freq;
+                if wavelen < high_freq_wavelen {
+                    inv_freq
+                } else if wavelen > low_freq_wavelen {
+                    inv_freq / factor
+                } else {
+                    let smooth = (original / wavelen - low_freq_factor)
+                        / (high_freq_factor - low_freq_factor);
+                    (1.0 - smooth) * inv_freq / factor + smooth * inv_freq
+                }
+            })
+            .collect()
+        }
+    }
+}
+
+/// `(cos, sin)` for one position from precomputed inverse frequencies — the
+/// per-token half of [`rope_table`], with the `powf` per pair hoisted out.
+pub fn rope_table_from(pos: usize, inv_freq: &[f32], cos: &mut [f32], sin: &mut [f32]) {
+    assert_eq!(cos.len(), inv_freq.len());
+    assert_eq!(sin.len(), inv_freq.len());
+    for (j, &freq) in inv_freq.iter().enumerate() {
+        let (s, c) = ((pos as f32) * freq).sin_cos();
+        cos[j] = c;
+        sin[j] = s;
+    }
+}
+
 /// Precompute `(cos, sin)` for one position: `head_dim / 2` entries, indexed by
-/// rotation pair rather than by dimension.
+/// rotation pair rather than by dimension. Unscaled rotary embeddings.
 ///
 /// Worth hoisting — a naive implementation recomputes these inside the head
 /// loop of every layer, which for TinyLlama is ~25k transcendental calls per

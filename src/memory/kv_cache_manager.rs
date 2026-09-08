@@ -35,6 +35,33 @@ pub struct Admission {
     pub allocated_blocks: usize,
 }
 
+/// Outcome of [`KvCacheManager::ensure_writable`].
+///
+/// The two "no copy happened" cases are deliberately distinct. An earlier
+/// version folded them into one `false`, and the scheduler could not tell "the
+/// block is already yours" from "the block is shared and there was nothing to
+/// clone it into" — so it wrote through the shared block either way, and every
+/// sibling mapping it read the last writer's KV state as its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a write through a block that could not be made private corrupts its other holders"]
+pub enum WriteAccess {
+    /// This sequence is the block's only holder. Writing in place is safe.
+    Private,
+    /// The block was shared; it has been cloned and the table now points at
+    /// the private copy. Writing is safe.
+    Copied,
+    /// The block is shared and no free block could be found to clone it into,
+    /// even after evicting cold cache entries. **The caller must not write.**
+    OutOfMemory,
+}
+
+impl WriteAccess {
+    /// True when the caller may write to the block.
+    pub fn is_writable(self) -> bool {
+        !matches!(self, WriteAccess::OutOfMemory)
+    }
+}
+
 pub struct KvCacheManager {
     allocator: BlockAllocator,
     sequences: HashMap<usize, SequenceAlloc>,
@@ -73,6 +100,20 @@ impl KvCacheManager {
 
     pub fn allocator(&self) -> &BlockAllocator {
         &self.allocator
+    }
+
+    /// True when more than one holder (a sequence or the prefix cache) maps
+    /// `block`, so a write through it needs a copy first.
+    pub fn is_shared(&self, block: PhysicalBlock) -> bool {
+        self.allocator.is_shared(block)
+    }
+
+    /// Whether writing `token_pos` through `table` would first need a copy.
+    /// False for an unmapped position: there is nothing there to share.
+    pub fn is_shared_position(&self, table: &BlockTable, token_pos: usize) -> bool {
+        table
+            .get_physical_location(token_pos, self.allocator.block_size)
+            .is_some_and(|(block, _)| self.allocator.is_shared(block))
     }
 
     pub fn prefix_stats(&self) -> PrefixCacheStats {
@@ -114,6 +155,25 @@ impl KvCacheManager {
     /// Returns `None` if the prompt cannot be housed even after evicting cold
     /// cache entries; the caller should queue the request rather than admit it.
     pub fn admit(&mut self, seq_id: usize, tokens: &[u32], now_tick: u64) -> Option<Admission> {
+        self.admit_with_headroom(seq_id, tokens, now_tick, 0)
+    }
+
+    /// [`KvCacheManager::admit`], refusing unless `headroom` blocks would
+    /// still be free afterwards.
+    ///
+    /// The headroom is not allocated — it is left in the pool for writes that
+    /// are already committed to: the next decode step of every live sequence,
+    /// and this prompt's own first step. Admitting a prompt into that reserve
+    /// would let it prefill and then strand a running sequence (or itself) one
+    /// block short at the very next step. Cold cache entries are evicted to
+    /// make room, exactly as for the prompt's own blocks.
+    pub fn admit_with_headroom(
+        &mut self,
+        seq_id: usize,
+        tokens: &[u32],
+        now_tick: u64,
+        headroom: usize,
+    ) -> Option<Admission> {
         let block_size = self.allocator.block_size;
         let total_blocks = tokens.len().div_ceil(block_size).max(1);
 
@@ -150,10 +210,11 @@ impl KvCacheManager {
         }
 
         let to_allocate = total_blocks - reused;
-        if self.allocator.available_blocks() < to_allocate
+        let wanted = to_allocate + headroom;
+        if self.allocator.available_blocks() < wanted
             && !self
                 .prefix_cache
-                .evict_until_available(&mut self.allocator, to_allocate)
+                .evict_until_available(&mut self.allocator, wanted)
         {
             // Roll back the references we took before giving up, so a rejected
             // admission leaves no trace.
@@ -283,9 +344,18 @@ impl KvCacheManager {
     /// Make the block holding `token_pos` privately writable.
     ///
     /// If another sequence (or the prefix cache) maps the same block, clone it
-    /// and repoint this sequence's table at the copy. Returns `true` if a copy
-    /// was made. Copying is why this is lazy: a fork that stops immediately
-    /// never pays it.
+    /// and repoint this sequence's table at the copy. Copying is why this is
+    /// lazy: a fork that stops immediately never pays it.
+    ///
+    /// The result says whether the caller may write. On
+    /// [`WriteAccess::OutOfMemory`] the table is unchanged, the block is still
+    /// shared, and writing to it would corrupt every other holder — the
+    /// scheduler has to defer or preempt instead.
+    ///
+    /// # Panics
+    ///
+    /// If `token_pos` is not mapped by `block_table`. Growing the mapping is
+    /// the caller's job and must happen first.
     pub fn ensure_writable(
         &mut self,
         seq_id: usize,
@@ -293,24 +363,32 @@ impl KvCacheManager {
         token_pos: usize,
         kv_cache: &mut [f32],
         layout: &KvLayout,
-    ) -> bool {
+    ) -> WriteAccess {
         let logical = token_pos / self.allocator.block_size;
-        let Some(slot) = block_table.slots().get(logical).copied() else {
-            return false;
-        };
+        let slot = block_table
+            .slots()
+            .get(logical)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "ensure_writable: position {token_pos} is not mapped ({} blocks of {})",
+                    block_table.len(),
+                    self.allocator.block_size
+                )
+            });
         if !self.allocator.is_shared(slot.block) {
-            return false;
+            return WriteAccess::Private;
         }
         if self.allocator.available_blocks() == 0
             && !self
                 .prefix_cache
                 .evict_until_available(&mut self.allocator, 1)
         {
-            // Nothing to clone into. The caller has to preempt something.
-            return false;
+            // Nothing to clone into. The caller has to defer or preempt.
+            return WriteAccess::OutOfMemory;
         }
         let Some(fresh) = self.allocator.allocate() else {
-            return false;
+            return WriteAccess::OutOfMemory;
         };
 
         layout.copy_block(kv_cache, slot.block, fresh);
@@ -323,7 +401,7 @@ impl KvCacheManager {
             }
         }
         self.cow_copies += 1;
-        true
+        WriteAccess::Copied
     }
 
     // ── lifecycle ────────────────────────────────────────────────────────────
@@ -565,8 +643,12 @@ mod tests {
         assert_eq!(child_table.slots()[1].block, parent_table.slots()[1].block);
 
         // The child writes at position 6, inside the shared partial block.
-        let copied = mgr.ensure_writable(2, &mut child_table, 6, &mut cache, &layout);
-        assert!(copied, "a shared block must be cloned before writing");
+        let access = mgr.ensure_writable(2, &mut child_table, 6, &mut cache, &layout);
+        assert_eq!(
+            access,
+            WriteAccess::Copied,
+            "a shared block must be cloned before writing"
+        );
         assert_ne!(child_table.slots()[1].block, parent_table.slots()[1].block);
         assert_eq!(mgr.cow_copies(), 1);
 
@@ -584,8 +666,75 @@ mod tests {
         assert_eq!(child_table.slots()[0].block, parent_table.slots()[0].block);
 
         // A second call is a no-op: the block is private now.
-        assert!(!mgr.ensure_writable(2, &mut child_table, 6, &mut cache, &layout));
+        assert_eq!(
+            mgr.ensure_writable(2, &mut child_table, 6, &mut cache, &layout),
+            WriteAccess::Private
+        );
         assert_eq!(mgr.cow_copies(), 1);
+    }
+
+    #[test]
+    fn test_a_shared_block_with_nothing_to_clone_into_is_reported_not_written() {
+        // The regression behind the sibling-corruption bug: with the pool
+        // exhausted, "already private" and "could not copy" used to be the
+        // same answer. They must be distinguishable, and the failed case must
+        // leave the mapping shared and untouched so the caller can see it.
+        let layout = KvLayout::new(1, 2, BS, 1, 2);
+        let mut cache = vec![0.0_f32; layout.total_floats()];
+        let mut mgr = KvCacheManager::new(2, BS);
+
+        let parent = mgr.admit(1, &[1, 2, 3, 4, 5, 6], 1).unwrap();
+        assert_eq!(mgr.available_blocks(), 0, "the pool should be full");
+        let mut child = mgr.fork(&parent.block_table, 2, 2);
+
+        let access = mgr.ensure_writable(2, &mut child, 5, &mut cache, &layout);
+        assert_eq!(access, WriteAccess::OutOfMemory);
+        assert!(!access.is_writable());
+        assert_eq!(
+            child.slots()[1].block,
+            parent.block_table.slots()[1].block,
+            "a failed copy must leave the child on the shared block"
+        );
+        assert_eq!(mgr.cow_copies(), 0);
+        assert_eq!(mgr.available_blocks(), 0, "a failed copy must not leak");
+
+        // Once the parent lets go, the child owns the block outright.
+        mgr.release_sequence(1);
+        assert_eq!(
+            mgr.ensure_writable(2, &mut child, 5, &mut cache, &layout),
+            WriteAccess::Private
+        );
+    }
+
+    #[test]
+    fn test_admission_headroom_is_left_free_not_allocated() {
+        let mut mgr = KvCacheManager::new(4, BS);
+        // Two blocks of prompt, two of headroom: exactly fits.
+        let a = mgr.admit_with_headroom(1, &[0, 1, 2, 3, 4, 5], 1, 2);
+        assert!(a.is_some());
+        assert_eq!(a.unwrap().allocated_blocks, 2);
+        assert_eq!(mgr.available_blocks(), 2, "headroom stays in the pool");
+
+        // One block of prompt plus two of headroom is more than the two left.
+        assert!(mgr.admit_with_headroom(2, &[9, 9], 2, 2).is_none());
+        assert_eq!(mgr.available_blocks(), 2, "a refusal leaves no trace");
+        // Without the reserve it would have fit.
+        assert!(mgr.admit_with_headroom(2, &[9, 9], 2, 1).is_some());
+    }
+
+    #[test]
+    fn test_admission_headroom_evicts_cold_cache_entries_to_make_room() {
+        let mut mgr = KvCacheManager::new(4, BS);
+        let a = mgr.admit(1, &[0, 1, 2, 3, 4, 5, 6, 7], 1).unwrap();
+        mgr.publish_prompt_blocks(&a.block_table);
+        mgr.release_sequence(1);
+        assert_eq!(mgr.available_blocks(), 2, "the cache holds two blocks");
+
+        // Prompt of one block plus three of headroom needs the cache gone.
+        let b = mgr.admit_with_headroom(2, &[50, 51], 2, 3);
+        assert!(b.is_some(), "cold cache entries should be given up first");
+        assert_eq!(mgr.available_blocks(), 3);
+        assert!(mgr.prefix_stats().evictions >= 2);
     }
 
     #[test]
@@ -595,7 +744,10 @@ mod tests {
         let mut mgr = KvCacheManager::new(8, BS);
         let admission = mgr.admit(1, &[1, 2, 3], 1).unwrap();
         let mut table = admission.block_table;
-        assert!(!mgr.ensure_writable(1, &mut table, 2, &mut cache, &layout));
+        assert_eq!(
+            mgr.ensure_writable(1, &mut table, 2, &mut cache, &layout),
+            WriteAccess::Private
+        );
         assert_eq!(mgr.cow_copies(), 0);
     }
 
