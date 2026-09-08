@@ -670,7 +670,15 @@ fn stream_sse(stream: &mut TcpStream, rx: Receiver<Event>, spec: StreamSpec, ctx
 
         generated += tokens.len();
         let text = match ctx.tokenizer.as_ref() {
-            Some(t) => detok[index].push(t, &tokens),
+            Some(t) => {
+                let mut text = detok[index].push(t, &tokens);
+                // The last chunk releases whatever the detokenizer was holding
+                // back as a possible fragment: nothing more is coming.
+                if finish.is_some() {
+                    text.push_str(&detok[index].finish());
+                }
+                text
+            }
             None => String::new(),
         };
         // A token that only completes half a character produces no text yet.
