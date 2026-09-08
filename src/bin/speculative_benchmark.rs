@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapOptions;
-use paged_infer::engine::{Engine, EngineConfig};
+use paged_infer::engine::{Engine, EngineConfig, FinishReason};
 use paged_infer::model::{LlamaConfig, ModelLoader, Quantization};
 use paged_infer::simd;
 use tokenizers::Tokenizer;
@@ -101,6 +101,10 @@ fn synthetic_workloads() -> Vec<Workload> {
 struct Measurement {
     decode_secs: f64,
     tokens: usize,
+    /// The generated ids and finish reason of every completion, in request
+    /// order. This is what "lossless" is checked against: two configurations
+    /// that produce the same *count* of tokens have proved nothing.
+    output: Vec<(Vec<u32>, FinishReason)>,
     tokens_per_step: f64,
     acceptance: f64,
     /// `(slowest - fastest) / fastest` across the repeats, as a fraction.
@@ -126,16 +130,51 @@ fn measure(
     engine
         .submit_tokens(prompt.to_vec(), max_tokens, 1)
         .expect("benchmark prompts fit the pool");
-    let out = engine.run().expect("generation should not fail");
+    let mut out = engine.run().expect("generation should not fail");
+    out.sort_by_key(|c| (c.request_id, c.sequence_id));
 
     let stats = engine.stats();
     let spec = engine.spec_stats();
     Measurement {
         decode_secs: stats.decode_time.as_secs_f64(),
         tokens: out.iter().map(|c| c.tokens.len()).sum(),
+        output: out
+            .iter()
+            .map(|c| (c.tokens.clone(), c.finish_reason))
+            .collect(),
         tokens_per_step: spec.tokens_per_step(),
         acceptance: spec.acceptance_rate(),
         spread: 0.0,
+    }
+}
+
+/// Every token and every finish reason must agree, or the comparison being
+/// timed is between two different outputs.
+fn assert_identical(what: &str, got: &Measurement, expected: &Measurement) {
+    assert_eq!(
+        got.output.len(),
+        expected.output.len(),
+        "{what}: a different number of completions"
+    );
+    for (i, ((g_tokens, g_reason), (e_tokens, e_reason))) in
+        got.output.iter().zip(&expected.output).enumerate()
+    {
+        assert_eq!(
+            g_reason, e_reason,
+            "{what}: completion {i} finished for a different reason"
+        );
+        if g_tokens != e_tokens {
+            let first = g_tokens
+                .iter()
+                .zip(e_tokens)
+                .position(|(a, b)| a != b)
+                .unwrap_or(g_tokens.len().min(e_tokens.len()));
+            panic!(
+                "{what}: completion {i} diverged at token {first}: got {:?}, expected {:?}",
+                &g_tokens[first.saturating_sub(2)..(first + 3).min(g_tokens.len())],
+                &e_tokens[first.saturating_sub(2)..(first + 3).min(e_tokens.len())]
+            );
+        }
     }
 }
 
@@ -163,10 +202,7 @@ fn measure_best(
     let (mut lo, mut hi) = (best.decode_secs, best.decode_secs);
     for _ in 1..repeats.max(1) {
         let m = measure(engine, prompt, max_tokens, draft_tokens);
-        assert_eq!(
-            m.tokens, best.tokens,
-            "the same prompt produced a different token count across repeats"
-        );
+        assert_identical("repeat of the same configuration", &m, &best);
         lo = lo.min(m.decode_secs);
         hi = hi.max(m.decode_secs);
         if m.decode_secs < best.decode_secs {
@@ -309,10 +345,10 @@ fn main() -> anyhow::Result<()> {
         let mut worst_spread = base.spread;
         for &k in &drafts {
             let m = measure_best(&mut engine, &workload.tokens, max_tokens, k, repeats);
-            assert_eq!(
-                m.tokens, base.tokens,
-                "speculation changed the token count -- it must be lossless"
-            );
+            // Lossless means the same tokens and the same stop, not the same
+            // count; a benchmark that only counted would happily time two
+            // different outputs against each other.
+            assert_identical(&format!("K={k} versus greedy"), &m, &base);
             worst_spread = worst_spread.max(m.spread);
             println!(
                 "   {:<9} {:>8.1}% {:>10.2} {:>11.3} s {:>8.2}x",
@@ -345,6 +381,7 @@ fn main() -> anyhow::Result<()> {
     println!("and there speculation costs a little and saves nothing. It is never a");
     println!("quality trade: a draft is accepted only when it matches what the model");
     println!("would have produced anyway, so the text is identical either way -- which");
-    println!("this benchmark asserts on every run.");
+    println!("this benchmark asserts on every run, token for token, including the finish");
+    println!("reason, against the greedy baseline and across repeats.");
     Ok(())
 }
