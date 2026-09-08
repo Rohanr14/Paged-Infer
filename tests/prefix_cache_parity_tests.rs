@@ -244,7 +244,11 @@ fn test_forked_samples_do_not_corrupt_each_other() {
         if pos >= paged_infer::memory::block_table::BlockTable::len(table) * BLOCK_SIZE {
             assert!(mgr.append_block(seq, table, 2));
         }
-        mgr.ensure_writable(seq, table, pos, &mut cache, &layout);
+        assert!(
+            mgr.ensure_writable(seq, table, pos, &mut cache, &layout)
+                .is_writable(),
+            "the pool is large enough that every write can be made private"
+        );
         weights.forward(next, pos, &config, table, &mut cache, BLOCK_SIZE, None)
     };
     let got_a = decode(0, &mut table_a, branch_a);

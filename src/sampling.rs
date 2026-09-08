@@ -17,11 +17,22 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// The constant the seed is mixed with. Public so a test can hand it back
+    /// in as the seed, which is the one input that used to break the generator.
+    pub const SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
     pub fn new(seed: u64) -> Self {
-        Self {
-            // A zero state is a fixed point for xorshift, so fold it away.
-            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        // A zero state is a fixed point for xorshift: every output is zero
+        // forever, and sampling then always picks the first-ranked token. The
+        // XOR alone only moves the problem, from seed 0 to seed `SEED_MIX`. Any
+        // bijection has exactly one preimage of zero, so a guard is the only
+        // complete fix; it costs one collision (`0` and `SEED_MIX` share a
+        // stream), which is harmless.
+        let mut state = seed ^ Self::SEED_MIX;
+        if state == 0 {
+            state = Self::SEED_MIX;
         }
+        Self { state }
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -209,6 +220,37 @@ mod tests {
         }
         let ratio = hits[0] as f64 / (hits[0] + hits[1]) as f64;
         assert!((ratio - 0.75).abs() < 0.02, "got {ratio}");
+    }
+
+    #[test]
+    fn test_no_seed_produces_the_absorbing_zero_state() {
+        // Seed 0 was always fine (the XOR moved it away from zero); the seed
+        // equal to the mixing constant landed exactly on zero and stayed there.
+        for seed in [0_u64, Rng::SEED_MIX, u64::MAX, 1] {
+            let mut rng = Rng::new(seed);
+            let outputs: Vec<u64> = (0..8).map(|_| rng.next_u64()).collect();
+            assert!(
+                outputs.iter().any(|&v| v != 0),
+                "seed {seed:#x} produced only zeros: {outputs:?}"
+            );
+            assert!(
+                outputs.windows(2).any(|w| w[0] != w[1]),
+                "seed {seed:#x} is stuck: {outputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sampling_with_the_mixing_constant_as_seed_still_explores() {
+        let mut s = Sampler::new(1.0, 1.0, 0, Rng::SEED_MIX);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(s.sample(&mut [1.0, 1.0, 1.0, 1.0]));
+        }
+        assert!(
+            seen.len() > 1,
+            "the seed equal to the mixing constant must not pin every draw to token 0"
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use memmap2::MmapOptions;
 use paged_infer::detokenizer::IncrementalDetokenizer;
-use paged_infer::engine::{Completion, Engine, EngineConfig, FinishReason};
+use paged_infer::engine::{Completion, Engine, EngineConfig, FinishReason, RequestOptions};
 use paged_infer::model::{LlamaConfig, ModelLoader, Quantization};
 use serde_json::{json, Value};
 use tokenizers::Tokenizer;
@@ -300,8 +300,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn admit(engine: &mut Engine<'_>, pending: &mut Vec<Pending>, job: Job) {
+    let options = RequestOptions {
+        temperature: job.temperature,
+        ..RequestOptions::default()
+    };
     let request_id =
-        engine.submit_tokens_with(job.tokens, job.max_tokens, job.samples, job.temperature);
+        match engine.submit_tokens_with(job.tokens, job.max_tokens, job.samples, options) {
+            Ok(id) => id,
+            // Dropping the reply channel tells the handler the request failed.
+            Err(_) => return,
+        };
     pending.push(Pending {
         request_id,
         samples: job.samples,

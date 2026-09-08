@@ -8,8 +8,35 @@
 //! Deliberately independent of tokenization: the scheduler works on token ids,
 //! and text is a thin convenience layer on top. That keeps the whole engine
 //! testable against a synthetic checkpoint without dragging in a real tokenizer.
+//!
+//! # Memory discipline
+//!
+//! Every KV write a step performs is either *mandatory* — the token a sequence
+//! already holds must land somewhere, or the sequence cannot advance at all —
+//! or *optional*, which is speculative drafting. The planner settles every
+//! mandatory write for every sequence before it spends a single block on an
+//! optional one, so a guess can never take the block a sibling needs.
+//!
+//! A sequence whose mandatory write cannot be satisfied does not write. It
+//! **defers**: it keeps its blocks, sits the step out, and is retried next
+//! step, when whatever finished this step has freed memory. Writing anyway is
+//! never an option — the block it would write is shared with a sibling or the
+//! prefix cache, and writing through it silently hands every other holder this
+//! sequence's KV state. When *no* sequence can advance the step would make no
+//! progress at all, so the planner **preempts**: the most recently created
+//! blocked sequence gives up its blocks and goes back to the head of the queue
+//! to be recomputed from its own tokens when memory allows. Only a sequence
+//! that could never be re-admitted — one whose tokens no longer fit in an empty
+//! pool — is terminated, with [`FinishReason::OutOfMemory`].
+//!
+//! Admission plays by the same rule: a prompt is admitted only if, after its
+//! blocks are mapped, enough remain free for every live sequence's next
+//! mandatory write and for the prompt's own first decode step. Without that a
+//! prompt could prefill and then strand a running sequence — or itself — one
+//! block short at the very next step.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -27,15 +54,28 @@ use crate::speculative::{verify_greedy, Drafter, PromptLookupDrafter, SpecStats}
 pub struct EngineConfig {
     pub total_blocks: usize,
     pub block_size: usize,
-    /// `0.0` is greedy. Forked samples override this upward, since identical
-    /// greedy branches would make forking pointless.
+    /// `0.0` is greedy. Multi-sample requests that do not ask for a
+    /// temperature themselves override this upward, since identical greedy
+    /// branches would make forking pointless; a request that explicitly asks
+    /// for `0.0` gets it.
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
     pub seed: u64,
     pub eos_token: u32,
-    /// Prepended to every prompt when set.
+    /// Further token ids that end generation, for checkpoints with more than
+    /// one end-of-turn token.
+    pub extra_eos_tokens: Vec<u32>,
+    /// Prepended to *text* prompts ([`Engine::submit`]) when the tokenizer did
+    /// not already add it. Token-id prompts ([`Engine::submit_tokens`]) are
+    /// complete model inputs and are never modified: the caller owns their
+    /// special tokens.
     pub bos_token: Option<u32>,
+    /// Longest sequence — prompt plus generated tokens — the model supports.
+    /// Prompts beyond it are rejected at submission; generation stops with
+    /// [`FinishReason::Length`] when it is reached. `None` leaves only the KV
+    /// pool as a limit.
+    pub max_context: Option<usize>,
     pub enable_prefix_cache: bool,
     /// Most sequences decoded in one batched pass. Larger batches amortize the
     /// weight traffic over more sequences; the cap bounds scratch memory, which
@@ -72,7 +112,9 @@ impl Default for EngineConfig {
             top_k: 0,
             seed: 0x5EED,
             eos_token: 2,
+            extra_eos_tokens: Vec::new(),
             bos_token: Some(1),
+            max_context: None,
             enable_prefix_cache: true,
             max_batch_size: 32,
             prefill_chunk_size: 32,
@@ -82,13 +124,96 @@ impl Default for EngineConfig {
     }
 }
 
+/// Per-request sampling overrides. `None` means "the engine default".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestOptions {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    /// Makes a request replayable on its own: the streams of its samples are
+    /// derived from this seed and the sample index alone, never from what else
+    /// the engine happened to be running.
+    pub seed: Option<u64>,
+}
+
+/// Why a request was refused at submission. Every variant is the caller's
+/// input being wrong, never an engine failure — a server maps these to a
+/// client error, not a 500.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitError {
+    EmptyPrompt,
+    ZeroMaxTokens,
+    /// A token id at or beyond the vocabulary. Never mapped or wrapped: the
+    /// caller meant something that does not exist.
+    InvalidToken {
+        index: usize,
+        token: u32,
+        vocab_size: usize,
+    },
+    /// Longer than the model's context window.
+    ExceedsContext {
+        prompt_tokens: usize,
+        max_context: usize,
+    },
+    /// The prompt (plus the first decode step of every sample) needs more
+    /// blocks than the whole pool holds. It could never be admitted, so it is
+    /// refused now rather than queued to stall everything behind it.
+    DoesNotFit {
+        prompt_tokens: usize,
+        num_samples: usize,
+        blocks_needed: usize,
+        total_blocks: usize,
+        block_size: usize,
+    },
+}
+
+impl fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubmitError::EmptyPrompt => write!(f, "cannot generate from an empty prompt"),
+            SubmitError::ZeroMaxTokens => write!(f, "max_tokens must be at least 1"),
+            SubmitError::InvalidToken {
+                index,
+                token,
+                vocab_size,
+            } => write!(
+                f,
+                "token id {token} at position {index} is outside the vocabulary of {vocab_size}"
+            ),
+            SubmitError::ExceedsContext {
+                prompt_tokens,
+                max_context,
+            } => write!(
+                f,
+                "a prompt of {prompt_tokens} tokens exceeds the model's context of {max_context}"
+            ),
+            SubmitError::DoesNotFit {
+                prompt_tokens,
+                num_samples,
+                blocks_needed,
+                total_blocks,
+                block_size,
+            } => write!(
+                f,
+                "a prompt of {prompt_tokens} tokens with {num_samples} sample(s) needs \
+                 {blocks_needed} KV blocks and does not fit in {total_blocks} blocks of \
+                 {block_size} tokens"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
-    /// The model emitted the end-of-sequence token.
+    /// The model emitted an end-of-sequence token.
     Eos,
-    /// The request's token budget ran out.
+    /// The request's token budget, or the model's context window, ran out.
     Length,
-    /// The KV cache could not grow to hold another token.
+    /// The KV cache could not hold another token, and the sequence could not
+    /// be resumed later either: even an empty pool would not hold what it had
+    /// already produced. Whatever was generated up to that point is returned.
     OutOfMemory,
     /// The caller gave up on the request — a disconnected streaming client,
     /// typically. Whatever was generated up to that point is still returned.
@@ -100,6 +225,10 @@ pub enum FinishReason {
 /// Usually one token. A speculative step that had drafts accepted emits the
 /// whole accepted run at once, which is exactly what a streaming client should
 /// see — the tokens really are all available at that instant.
+///
+/// Every sequence emits **exactly one** delta with `finish_reason` set, however
+/// it ends: end-of-sequence, budget, memory, or cancellation. A terminal delta
+/// may carry no tokens.
 #[derive(Debug, Clone)]
 pub struct TokenDelta {
     pub request_id: usize,
@@ -117,9 +246,13 @@ pub struct Completion {
     pub prompt_tokens: usize,
     pub tokens: Vec<u32>,
     pub finish_reason: FinishReason,
-    /// Admission through to the first sampled token — the prefill cost this
-    /// request actually paid, after prefix reuse.
+    /// Submission through to the first sampled token: what the client waited,
+    /// queueing included. Admission-to-first-token alone flattered a saturated
+    /// engine, where most of the wait is the queue.
     pub time_to_first_token: Duration,
+    /// Submission through to admission — the part of `time_to_first_token`
+    /// spent waiting for memory rather than computing.
+    pub queue_time: Duration,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -133,6 +266,15 @@ pub struct RunStats {
     pub prefill_time: Duration,
     pub decode_time: Duration,
     pub steps: usize,
+    /// Sequences that gave their blocks up under memory pressure and were
+    /// queued to be recomputed.
+    pub preemptions: usize,
+    /// Tokens re-prefilled to resume preempted sequences. The price of
+    /// preemption, kept separate from `prompt_tokens_prefilled` so the prefix
+    /// cache's savings are not misread.
+    pub recomputed_tokens: usize,
+    /// Sequence-steps that sat out because their next KV write had no block.
+    pub deferred_steps: usize,
 }
 
 impl RunStats {
@@ -145,13 +287,31 @@ impl RunStats {
     }
 }
 
+/// State a preempted sequence carries back to the queue, so that when it is
+/// re-admitted it continues rather than restarts: same sequence id (a
+/// streaming client's choice index depends on it), same sampler state, same
+/// output so far.
+struct Preempted {
+    sequence_id: usize,
+    prompt_len: usize,
+    generated: Vec<u32>,
+    sampler: Sampler,
+    drafter: Option<Box<dyn Drafter>>,
+    admitted_at: Instant,
+    first_token_at: Option<Instant>,
+}
+
 struct Request {
     id: usize,
     tokens: Vec<u32>,
     max_tokens: usize,
     num_samples: usize,
-    /// Overrides the engine default when set.
-    temperature: Option<f32>,
+    options: RequestOptions,
+    submitted_at: Instant,
+    /// Set when this entry re-admits a preempted sequence. Its `tokens` are
+    /// then the sequence's prompt *and* everything it generated, and the
+    /// prefill recomputes the KV the sequence gave up.
+    resume: Option<Preempted>,
 }
 
 struct Sequence {
@@ -164,10 +324,16 @@ struct Sequence {
     block_table: BlockTable,
     finished: Option<FinishReason>,
     sampler: Sampler,
+    submitted_at: Instant,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
     /// Present only when this sequence speculates.
     drafter: Option<Box<dyn Drafter>>,
+    /// The last step could not secure the block this sequence's next write
+    /// needs. It sat the step out and still holds its blocks.
+    deferred: bool,
+    /// Gave its blocks up this step; `reclaim` moves it back to the queue.
+    preempted: bool,
 }
 
 /// One sequence's contribution to a decode step: the token it already holds,
@@ -179,6 +345,29 @@ struct SpecGroup {
     positions: Vec<usize>,
     /// `tokens[1..]`, kept separately because verification only concerns these.
     drafts: Vec<u32>,
+}
+
+/// Why a sequence stopped, if it did, after `token` was appended.
+fn stop_reason(
+    eos: u32,
+    extra_eos: &[u32],
+    max_context: Option<usize>,
+    token: u32,
+    generated_len: usize,
+    max_tokens: usize,
+    seq_len: usize,
+) -> Option<FinishReason> {
+    if token == eos || extra_eos.contains(&token) {
+        Some(FinishReason::Eos)
+    } else if generated_len >= max_tokens {
+        Some(FinishReason::Length)
+    } else if max_context.is_some_and(|limit| seq_len > limit) {
+        // The token just appended would have to be written at position
+        // `seq_len - 1`, which the model has no rotary table for.
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
 }
 
 pub struct Engine<'a> {
@@ -203,6 +392,8 @@ pub struct Engine<'a> {
 
 impl<'a> Engine<'a> {
     pub fn new(weights: LlamaWeights<'a>, config: LlamaConfig, engine: EngineConfig) -> Self {
+        assert!(engine.block_size > 0, "block_size must be at least 1");
+        assert!(engine.total_blocks > 0, "total_blocks must be at least 1");
         let layout = config.kv_layout(engine.total_blocks, engine.block_size);
         let kv_cache = vec![0.0; layout.total_floats()];
         let kv = KvCacheManager::new(engine.total_blocks, engine.block_size)
@@ -266,6 +457,18 @@ impl<'a> Engine<'a> {
         (self.active.len(), self.waiting.len())
     }
 
+    /// Sequences that sat the last step out waiting for a KV block.
+    pub fn deferred_sequences(&self) -> usize {
+        self.active.iter().filter(|s| s.deferred).count()
+    }
+
+    /// The model's context window, or the pool's capacity if the model does
+    /// not declare one. No prompt longer than this can be submitted.
+    pub fn max_prompt_tokens(&self) -> usize {
+        let pool = self.engine.total_blocks * self.engine.block_size;
+        self.engine.max_context.map_or(pool, |c| c.min(pool))
+    }
+
     /// Stop generating for a request, freeing its blocks at the next step.
     ///
     /// A streaming client that hangs up would otherwise keep paying for tokens
@@ -274,15 +477,46 @@ impl<'a> Engine<'a> {
     ///
     /// Already-generated tokens are kept and the sequence completes normally
     /// with [`FinishReason::Cancelled`], so the caller still gets a well-formed
-    /// completion rather than a dangling request.
+    /// completion rather than a dangling request, and a streaming caller gets
+    /// the terminal delta that closes its stream. A request that was never
+    /// admitted simply disappears: it produced nothing to complete.
     pub fn cancel_request(&mut self, request_id: usize) -> usize {
-        let before = self.waiting.len();
-        self.waiting.retain(|r| r.id != request_id);
-        let mut stopped = before - self.waiting.len();
+        let mut stopped = 0;
+        let mut kept = VecDeque::with_capacity(self.waiting.len());
+        for req in std::mem::take(&mut self.waiting) {
+            if req.id != request_id {
+                kept.push_back(req);
+                continue;
+            }
+            stopped += 1;
+            // A preempted sequence waiting to resume had already produced
+            // output, and a client may already be streaming it.
+            if let Some(p) = req.resume {
+                self.record_delta(
+                    req.id,
+                    p.sequence_id,
+                    Vec::new(),
+                    Some(FinishReason::Cancelled),
+                );
+                let admitted_at = p.admitted_at;
+                let first = p.first_token_at.unwrap_or(admitted_at);
+                self.completed.push(Completion {
+                    request_id: req.id,
+                    sequence_id: p.sequence_id,
+                    prompt_tokens: p.prompt_len,
+                    tokens: p.generated,
+                    finish_reason: FinishReason::Cancelled,
+                    time_to_first_token: first.duration_since(req.submitted_at),
+                    queue_time: admitted_at.duration_since(req.submitted_at),
+                });
+            }
+        }
+        self.waiting = kept;
 
-        for seq in self.active.iter_mut() {
-            if seq.request_id == request_id && seq.finished.is_none() {
-                seq.finished = Some(FinishReason::Cancelled);
+        for idx in 0..self.active.len() {
+            let seq = &self.active[idx];
+            if seq.request_id == request_id && seq.finished.is_none() && !seq.preempted {
+                self.terminate(idx, FinishReason::Cancelled);
                 stopped += 1;
             }
         }
@@ -367,46 +601,112 @@ impl<'a> Engine<'a> {
         self.tick = 0;
     }
 
+    // ── submission ───────────────────────────────────────────────────────────
+
     /// Queue a prompt that is already tokenized. `num_samples` continuations are
     /// drawn from it; the prompt is prefilled once regardless.
+    ///
+    /// The ids are the complete model input: no BOS is inserted and nothing is
+    /// remapped. Every id must be inside the vocabulary and the prompt must be
+    /// one the pool can ever hold, or the request is refused here rather than
+    /// queued — a queued request that can never be admitted would stall every
+    /// request behind it.
     pub fn submit_tokens(
         &mut self,
         tokens: Vec<u32>,
         max_tokens: usize,
         num_samples: usize,
-    ) -> usize {
-        self.submit_tokens_with(tokens, max_tokens, num_samples, None)
+    ) -> Result<usize, SubmitError> {
+        self.submit_tokens_with(tokens, max_tokens, num_samples, RequestOptions::default())
     }
 
-    /// [`Engine::submit_tokens`] with a per-request sampling temperature.
-    /// `None` uses the engine default. A server needs this: temperature is a
-    /// property of the request, not of the engine.
+    /// [`Engine::submit_tokens`] with per-request sampling options. A server
+    /// needs this: temperature is a property of the request, not of the engine.
     pub fn submit_tokens_with(
         &mut self,
         tokens: Vec<u32>,
         max_tokens: usize,
         num_samples: usize,
-        temperature: Option<f32>,
-    ) -> usize {
-        assert!(!tokens.is_empty(), "cannot generate from an empty prompt");
+        options: RequestOptions,
+    ) -> Result<usize, SubmitError> {
+        let num_samples = num_samples.max(1);
+        self.validate(&tokens, max_tokens, num_samples)?;
         let id = self.next_request_id;
         self.next_request_id += 1;
-        let mut tokens = tokens;
-        if let Some(bos) = self.engine.bos_token {
-            tokens.insert(0, bos);
-        }
         self.waiting.push_back(Request {
             id,
             tokens,
             max_tokens,
-            num_samples: num_samples.max(1),
-            temperature,
+            num_samples,
+            options,
+            submitted_at: Instant::now(),
+            resume: None,
         });
-        id
+        Ok(id)
+    }
+
+    fn validate(
+        &self,
+        tokens: &[u32],
+        max_tokens: usize,
+        num_samples: usize,
+    ) -> Result<(), SubmitError> {
+        if tokens.is_empty() {
+            return Err(SubmitError::EmptyPrompt);
+        }
+        if max_tokens == 0 {
+            return Err(SubmitError::ZeroMaxTokens);
+        }
+        let vocab_size = self.config.vocab_size;
+        if let Some((index, &token)) = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, t)| **t as usize >= vocab_size)
+        {
+            return Err(SubmitError::InvalidToken {
+                index,
+                token,
+                vocab_size,
+            });
+        }
+        if let Some(max_context) = self.engine.max_context {
+            if tokens.len() > max_context {
+                return Err(SubmitError::ExceedsContext {
+                    prompt_tokens: tokens.len(),
+                    max_context,
+                });
+            }
+        }
+        let blocks_needed = self.first_step_blocks(tokens.len(), num_samples, max_tokens);
+        if blocks_needed > self.engine.total_blocks {
+            return Err(SubmitError::DoesNotFit {
+                prompt_tokens: tokens.len(),
+                num_samples,
+                blocks_needed,
+                total_blocks: self.engine.total_blocks,
+                block_size: self.engine.block_size,
+            });
+        }
+        Ok(())
     }
 
     /// Queue a text prompt. Requires a tokenizer.
+    ///
+    /// Special tokens are the tokenizer's business: it is asked to add them,
+    /// and the engine's `bos_token` is prepended only if the tokenizer did not
+    /// already put it there. Exactly one BOS reaches the model either way.
     pub fn submit(&mut self, prompt: &str, max_tokens: usize, num_samples: usize) -> Result<usize> {
+        self.submit_with(prompt, max_tokens, num_samples, RequestOptions::default())
+    }
+
+    /// [`Engine::submit`] with per-request sampling options.
+    pub fn submit_with(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        num_samples: usize,
+        options: RequestOptions,
+    ) -> Result<usize> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -414,7 +714,13 @@ impl<'a> Engine<'a> {
         let encoding = tokenizer
             .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        Ok(self.submit_tokens(encoding.get_ids().to_vec(), max_tokens, num_samples))
+        let mut ids = encoding.get_ids().to_vec();
+        if let Some(bos) = self.engine.bos_token {
+            if ids.first() != Some(&bos) {
+                ids.insert(0, bos);
+            }
+        }
+        Ok(self.submit_tokens_with(ids, max_tokens, num_samples, options)?)
     }
 
     pub fn decode_text(&self, tokens: &[u32]) -> Option<String> {
@@ -463,16 +769,40 @@ impl<'a> Engine<'a> {
         });
     }
 
+    /// End a live sequence for a reason other than its own output — memory or
+    /// cancellation — and tell any streaming consumer so. This and `commit` are
+    /// the only two places a sequence's `finished` is set, which is what keeps
+    /// "exactly one terminal delta per sequence" true.
+    fn terminate(&mut self, idx: usize, reason: FinishReason) {
+        let seq = &mut self.active[idx];
+        debug_assert!(
+            seq.finished.is_none(),
+            "sequence {} terminated twice",
+            seq.id
+        );
+        if seq.finished.is_some() {
+            return;
+        }
+        seq.finished = Some(reason);
+        let (rid, sid) = (seq.request_id, seq.id);
+        self.record_delta(rid, sid, Vec::new(), Some(reason));
+    }
+
     /// Drain both queues, returning every completion in finish order.
     pub fn run(&mut self) -> Result<Vec<Completion>> {
-        while !self.waiting.is_empty() || !self.active.is_empty() {
-            let before = self.waiting.len() + self.active.len();
+        while self.has_work() {
+            let waiting_before = self.waiting.len();
+            let was_idle = self.active.is_empty();
             self.step()?;
-            if self.waiting.len() + self.active.len() == before && self.active.is_empty() {
-                // Nothing running and nothing admissible: the smallest waiting
-                // prompt cannot fit in the whole cache, so it never will.
+            if was_idle && self.active.is_empty() && self.waiting.len() == waiting_before {
+                // Nothing was running, nothing finished, and the head of the
+                // queue still was not admitted. Submission refuses anything the
+                // empty pool cannot hold, so this is an invariant failure, not a
+                // condition the caller can hit — but a loop that spins forever
+                // is the worst possible way to report one.
                 anyhow::bail!(
-                    "a queued prompt does not fit in {} blocks of {} tokens",
+                    "a queued prompt cannot be admitted into {} blocks of {} tokens \
+                     even with the pool otherwise empty",
                     self.engine.total_blocks,
                     self.engine.block_size
                 );
@@ -491,19 +821,81 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    // ── memory arithmetic ────────────────────────────────────────────────────
+
+    /// Blocks a prompt's first decode step will have to allocate beyond the
+    /// prompt's own. The first sampled token comes off the prefill logits and
+    /// costs nothing; the step after it writes that token's KV at position
+    /// `prompt_len` for each of `num_samples` sequences — a fresh block each if
+    /// the prompt ends on a block boundary, otherwise a private copy of the
+    /// shared partial block for every sample but one. Zero when no decode step
+    /// will follow: a budget of one token, or a prompt already at the context
+    /// limit.
+    fn first_step_growth(&self, prompt_len: usize, num_samples: usize, budget: usize) -> usize {
+        let decodes = budget > 1
+            && self
+                .engine
+                .max_context
+                .is_none_or(|limit| prompt_len < limit);
+        if !decodes {
+            0
+        } else if prompt_len.is_multiple_of(self.engine.block_size) {
+            num_samples
+        } else {
+            num_samples - 1
+        }
+    }
+
+    /// Blocks a prompt occupies once admitted, plus its first-step growth: what
+    /// the pool must hold, in total, for the request to be admissible at all.
+    fn first_step_blocks(&self, prompt_len: usize, num_samples: usize, budget: usize) -> usize {
+        prompt_len.div_ceil(self.engine.block_size).max(1)
+            + self.first_step_growth(prompt_len, num_samples, budget)
+    }
+
+    /// Blocks the live sequences will have to allocate at their next step: one
+    /// for each whose held token lands past its mapping or in a block it does
+    /// not own outright. Admission must leave at least this many free.
+    fn next_step_reserve(&self) -> usize {
+        let block_size = self.engine.block_size;
+        self.active
+            .iter()
+            .filter(|s| s.finished.is_none() && !s.preempted)
+            .map(|s| {
+                let pos = s.token_ids.len() - 1;
+                match s.block_table.get_physical_location(pos, block_size) {
+                    Some((block, _)) => usize::from(self.kv.is_shared(block)),
+                    None => 1,
+                }
+            })
+            .sum()
+    }
+
     // ── admission and prefill ────────────────────────────────────────────────
 
     fn admit(&mut self) {
+        let mut reserved = self.next_step_reserve();
         while let Some(req) = self.waiting.front() {
-            let seq_id = self.next_sequence_id;
-            let Some(admission) = self.kv.admit(seq_id, &req.tokens, self.tick) else {
+            let seq_id = match &req.resume {
+                Some(p) => p.sequence_id,
+                None => self.next_sequence_id,
+            };
+            let budget = req.max_tokens - req.resume.as_ref().map_or(0, |p| p.generated.len());
+            let growth = self.first_step_growth(req.tokens.len(), req.num_samples, budget);
+            let Some(admission) =
+                self.kv
+                    .admit_with_headroom(seq_id, &req.tokens, self.tick, reserved + growth)
+            else {
                 // Out of memory even after reclaiming cold cache blocks. Wait
                 // for a live sequence to retire.
                 break;
             };
+            reserved += growth;
             let req = self.waiting.pop_front().expect("front was just checked");
+            if req.resume.is_none() {
+                self.next_sequence_id += 1;
+            }
             let vocab = self.config.vocab_size;
-            self.next_sequence_id += 1;
             let admitted_at = Instant::now();
 
             // Replay only what the cache did not cover. If the whole prompt was
@@ -522,9 +914,13 @@ impl<'a> Engine<'a> {
                 &mut self.batch_scratch,
             );
             self.stats.prefill_time += t0.elapsed();
-            self.stats.requests += 1;
-            self.stats.prompt_tokens += req.tokens.len();
-            self.stats.prompt_tokens_prefilled += req.tokens.len() - resume_at;
+            if req.resume.is_some() {
+                self.stats.recomputed_tokens += req.tokens.len() - resume_at;
+            } else {
+                self.stats.requests += 1;
+                self.stats.prompt_tokens += req.tokens.len();
+                self.stats.prompt_tokens_prefilled += req.tokens.len() - resume_at;
+            }
 
             // The prompt's blocks now hold real KV state; offer them up.
             self.kv.publish_prompt_blocks(&admission.block_table);
@@ -539,52 +935,138 @@ impl<'a> Engine<'a> {
                 tables.push((child, table));
             }
 
-            for (i, (sid, table)) in tables.into_iter().enumerate() {
-                // Siblings need distinct seeds, and greedy siblings would all
-                // replay the same continuation, so multi-sample requests get a
-                // non-zero temperature by default.
-                let requested = req.temperature.unwrap_or(self.engine.temperature);
-                let temperature = if req.num_samples > 1 && requested <= 0.0 {
-                    0.8
-                } else {
-                    requested
-                };
-                let mut sampler = Sampler::new(
-                    temperature,
-                    self.engine.top_p,
-                    self.engine.top_k,
-                    self.engine.seed ^ ((sid as u64) << 16) ^ i as u64,
-                );
-                let first = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
-                self.stats.generated_tokens += 1;
+            let Request {
+                id: request_id,
+                tokens: prompt,
+                max_tokens,
+                num_samples,
+                options,
+                submitted_at,
+                resume,
+            } = req;
 
-                let mut token_ids = req.tokens.clone();
-                token_ids.push(first);
-                let finished = (first == self.engine.eos_token)
-                    .then_some(FinishReason::Eos)
-                    .or((req.max_tokens <= 1).then_some(FinishReason::Length));
+            match resume {
+                Some(p) => {
+                    // Continue where it left off: its held token was replayed
+                    // as the tail of the prompt, and its sampler picks up its
+                    // own stream.
+                    debug_assert_eq!(tables.len(), 1, "a resumed sequence has no siblings");
+                    let (sid, table) = tables.pop().expect("one table");
+                    let mut sampler = p.sampler;
+                    let next = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
+                    self.stats.generated_tokens += 1;
+                    let mut generated = p.generated;
+                    generated.push(next);
+                    let mut token_ids = prompt;
+                    token_ids.push(next);
+                    let finished = stop_reason(
+                        self.engine.eos_token,
+                        &self.engine.extra_eos_tokens,
+                        self.engine.max_context,
+                        next,
+                        generated.len(),
+                        max_tokens,
+                        token_ids.len(),
+                    );
+                    self.active.push(Sequence {
+                        id: sid,
+                        request_id,
+                        prompt_len: p.prompt_len,
+                        token_ids,
+                        generated,
+                        max_tokens,
+                        block_table: table,
+                        finished,
+                        sampler,
+                        submitted_at,
+                        admitted_at: p.admitted_at,
+                        first_token_at: p.first_token_at,
+                        drafter: p.drafter,
+                        deferred: false,
+                        preempted: false,
+                    });
+                    self.record_delta(request_id, sid, vec![next], finished);
+                }
+                None => {
+                    for (i, (sid, table)) in tables.into_iter().enumerate() {
+                        let (mut sampler, greedy) = self.sampler_for(&options, num_samples, sid, i);
+                        let first = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
+                        self.stats.generated_tokens += 1;
 
-                self.active.push(Sequence {
-                    id: sid,
-                    request_id: req.id,
-                    prompt_len: req.tokens.len(),
-                    token_ids,
-                    generated: vec![first],
-                    max_tokens: req.max_tokens,
-                    block_table: table,
-                    finished,
-                    sampler,
-                    admitted_at,
-                    first_token_at: Some(Instant::now()),
-                    // Speculation is only sound under greedy; see EngineConfig.
-                    drafter: (self.engine.draft_tokens > 0 && temperature <= 0.0)
-                        .then(|| Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>),
-                });
-                // The token sampled off the prefill logits is a real emission —
-                // it is the one a streaming client is waiting on.
-                self.record_delta(req.id, sid, vec![first], finished);
+                        let mut token_ids = prompt.clone();
+                        token_ids.push(first);
+                        let finished = stop_reason(
+                            self.engine.eos_token,
+                            &self.engine.extra_eos_tokens,
+                            self.engine.max_context,
+                            first,
+                            1,
+                            max_tokens,
+                            token_ids.len(),
+                        );
+                        let first_token_at = Some(Instant::now());
+
+                        self.active.push(Sequence {
+                            id: sid,
+                            request_id,
+                            prompt_len: prompt.len(),
+                            token_ids,
+                            generated: vec![first],
+                            max_tokens,
+                            block_table: table,
+                            finished,
+                            sampler,
+                            submitted_at,
+                            admitted_at,
+                            first_token_at,
+                            // Speculation is only sound under greedy; see
+                            // EngineConfig.
+                            drafter: (self.engine.draft_tokens > 0 && greedy).then(|| {
+                                Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>
+                            }),
+                            deferred: false,
+                            preempted: false,
+                        });
+                        // The token sampled off the prefill logits is a real
+                        // emission — it is the one a streaming client is
+                        // waiting on.
+                        self.record_delta(request_id, sid, vec![first], finished);
+                    }
+                }
             }
         }
+    }
+
+    /// The sampler for sample `i` of a request, and whether it is greedy.
+    fn sampler_for(
+        &self,
+        options: &RequestOptions,
+        num_samples: usize,
+        sequence_id: usize,
+        i: usize,
+    ) -> (Sampler, bool) {
+        let requested = options.temperature;
+        let mut temperature = requested.unwrap_or(self.engine.temperature);
+        // Greedy siblings would all replay the same continuation, so a
+        // multi-sample request that did not choose a temperature gets a
+        // non-zero one. One that chose 0.0 asked for identical branches and
+        // gets them.
+        if num_samples > 1 && requested.is_none() && temperature <= 0.0 {
+            temperature = 0.8;
+        }
+        let top_p = options.top_p.unwrap_or(self.engine.top_p);
+        let top_k = options.top_k.unwrap_or(self.engine.top_k);
+        let seed = match options.seed {
+            // A request that brings its own seed must replay exactly on its
+            // own, whatever else the engine ran before it: derive from the
+            // sample index, not from the global sequence counter.
+            Some(seed) => seed ^ i as u64,
+            None => self.engine.seed ^ ((sequence_id as u64) << 16) ^ i as u64,
+        };
+        (
+            Sampler::new(temperature, top_p, top_k, seed),
+            temperature <= 0.0,
+        )
     }
 
     // ── decode ───────────────────────────────────────────────────────────────
@@ -609,79 +1091,59 @@ impl<'a> Engine<'a> {
         self.stats.decode_time += t0.elapsed();
     }
 
-    /// Draft, grow mappings, and resolve copy-on-write for everything that will
-    /// run this step.
+    /// Settle memory for the step: every mandatory write first, then whatever
+    /// optional speculation the remaining headroom allows.
+    ///
+    /// Returns the groups that will run. A sequence missing from the result
+    /// either finished, is deferred until memory frees up, or was preempted.
     fn plan_step(&mut self) -> Vec<SpecGroup> {
-        let block_size = self.engine.block_size;
-        let k = self.engine.draft_tokens;
-        let mut groups = Vec::with_capacity(self.active.len());
-
+        // Pass 1: the held token of every live sequence. Nothing optional is
+        // touched until all of these are settled, so a draft can never take
+        // the block a sibling needs to advance at all.
+        let mut runnable = Vec::with_capacity(self.active.len());
+        let mut deferred = Vec::new();
         for idx in 0..self.active.len() {
-            if self.active[idx].finished.is_some() {
+            if self.active[idx].finished.is_some() || self.active[idx].preempted {
                 continue;
             }
-            let seq_id = self.active[idx].id;
-            let pos = self.active[idx].token_ids.len() - 1;
+            if self.secure_held_token(idx) {
+                runnable.push(idx);
+            } else {
+                deferred.push(idx);
+            }
+        }
 
-            // Never draft past the request's token budget: a step emits one
-            // more token than it accepts.
-            let budget = self.active[idx]
-                .max_tokens
-                .saturating_sub(self.active[idx].generated.len());
-            let room = budget.saturating_sub(1);
-
-            let mut drafts = Vec::new();
-            if k > 0 && room > 0 {
-                // The drafter is moved out so it can be given the sequence's own
-                // token history without aliasing it.
-                if let Some(mut drafter) = self.active[idx].drafter.take() {
-                    drafts = drafter.draft(&self.active[idx].token_ids, k.min(room));
-                    drafts.truncate(room);
-                    self.active[idx].drafter = Some(drafter);
+        // Deadlock: something is waiting for memory and nothing can move, so
+        // no future step would free anything either. Preempt the newest
+        // waiter — least work to redo — and retry the rest with its blocks.
+        while runnable.is_empty() && !deferred.is_empty() {
+            let newest = (0..deferred.len())
+                .max_by_key(|&i| self.active[deferred[i]].id)
+                .expect("non-empty");
+            let victim = deferred.swap_remove(newest);
+            self.preempt(victim);
+            for idx in std::mem::take(&mut deferred) {
+                if self.secure_held_token(idx) {
+                    runnable.push(idx);
+                } else {
+                    deferred.push(idx);
                 }
             }
+        }
+        self.stats.deferred_steps += deferred.len();
 
-            // Positions this group writes: the held token, then each draft.
-            let span = drafts.len() + 1;
-            let needed_blocks = (pos + span).div_ceil(block_size);
-            let mut table = std::mem::take(&mut self.active[idx].block_table);
-            let mut out_of_memory = false;
-            while table.len() < needed_blocks {
-                if !self.kv.append_block(seq_id, &mut table, self.tick) {
-                    out_of_memory = true;
-                    break;
-                }
-            }
-            if out_of_memory {
-                // Drop the speculation rather than the request: one more token
-                // still fits if the mapping already covers it.
-                drafts.clear();
-                if table.len() * block_size <= pos {
-                    self.active[idx].block_table = table;
-                    self.active[idx].finished = Some(FinishReason::OutOfMemory);
-                    // Terminal, so a streaming client must hear about it here —
-                    // this sequence will never reach `commit`.
-                    let (rid, sid) = (self.active[idx].request_id, self.active[idx].id);
-                    self.record_delta(rid, sid, Vec::new(), Some(FinishReason::OutOfMemory));
-                    continue;
-                }
-            }
-
-            // Forked siblings map the same partial block. Split before writing,
-            // for every position this group touches.
-            for p in pos..pos + drafts.len() + 1 {
-                self.kv
-                    .ensure_writable(seq_id, &mut table, p, &mut self.kv_cache, &self.layout);
-            }
-            self.active[idx].block_table = table;
-            self.kv.touch(seq_id, self.tick);
-
+        // Pass 2: optional speculation, allowed only while a block per live
+        // sequence stays free for the *next* step's mandatory writes.
+        let live = runnable.len() + deferred.len();
+        let mut groups = Vec::with_capacity(runnable.len());
+        for idx in runnable {
+            let drafts = self.plan_drafts(idx, live);
             let held = *self.active[idx].token_ids.last().expect("never empty");
+            let pos = self.active[idx].token_ids.len() - 1;
             let mut tokens = Vec::with_capacity(drafts.len() + 1);
             tokens.push(held);
             tokens.extend_from_slice(&drafts);
             let positions = (pos..pos + tokens.len()).collect();
-
             groups.push(SpecGroup {
                 seq_idx: idx,
                 tokens,
@@ -690,6 +1152,116 @@ impl<'a> Engine<'a> {
             });
         }
         groups
+    }
+
+    /// Map and privately own the slot for the token a sequence already holds.
+    /// Returns false — and marks the sequence deferred — if that is not
+    /// possible right now, in which case nothing was written and the sequence
+    /// still holds exactly the blocks it had.
+    fn secure_held_token(&mut self, idx: usize) -> bool {
+        let block_size = self.engine.block_size;
+        let seq_id = self.active[idx].id;
+        let pos = self.active[idx].token_ids.len() - 1;
+        let mut table = std::mem::take(&mut self.active[idx].block_table);
+
+        let mut secured = true;
+        while pos >= table.len() * block_size {
+            if !self.kv.append_block(seq_id, &mut table, self.tick) {
+                secured = false;
+                break;
+            }
+        }
+        if secured {
+            // Forked siblings map the same partial block; split before
+            // writing. A block that could not be split must not be written.
+            secured = self
+                .kv
+                .ensure_writable(seq_id, &mut table, pos, &mut self.kv_cache, &self.layout)
+                .is_writable();
+        }
+        self.active[idx].block_table = table;
+        self.active[idx].deferred = !secured;
+        if secured {
+            self.kv.touch(seq_id, self.tick);
+        }
+        secured
+    }
+
+    /// Ask the drafter for guesses and map slots for as many of them as the
+    /// pool can spare. Drafts are optional: any that cannot be housed are
+    /// simply dropped, never deferred for.
+    fn plan_drafts(&mut self, idx: usize, live: usize) -> Vec<u32> {
+        let k = self.engine.draft_tokens;
+        if k == 0 || self.active[idx].drafter.is_none() {
+            return Vec::new();
+        }
+        let block_size = self.engine.block_size;
+        let seq_id = self.active[idx].id;
+        let pos = self.active[idx].token_ids.len() - 1;
+
+        // Never draft past the request's token budget or the model's context:
+        // a step emits one more token than it accepts.
+        let budget = self.active[idx]
+            .max_tokens
+            .saturating_sub(self.active[idx].generated.len());
+        let context_room = self
+            .engine
+            .max_context
+            .map_or(usize::MAX, |limit| limit.saturating_sub(pos + 1));
+        let room = budget.saturating_sub(1).min(context_room);
+        if room == 0 {
+            return Vec::new();
+        }
+
+        // The drafter is moved out so it can be given the sequence's own token
+        // history without aliasing it.
+        let mut drafter = self.active[idx].drafter.take().expect("checked above");
+        let mut drafts = drafter.draft(&self.active[idx].token_ids, k.min(room));
+        self.active[idx].drafter = Some(drafter);
+        drafts.truncate(room);
+
+        let mut table = std::mem::take(&mut self.active[idx].block_table);
+        let mut housed = 0;
+        for j in 0..drafts.len() {
+            let p = pos + 1 + j;
+            // Optional work may allocate only while one block per live
+            // sequence stays free for next step's mandatory writes.
+            let may_allocate = self.kv.available_blocks() > live;
+            if p >= table.len() * block_size
+                && (!may_allocate || !self.kv.append_block(seq_id, &mut table, self.tick))
+            {
+                break;
+            }
+            // A draft slot is normally private already — it sits in the held
+            // token's block, split in pass 1, or in a block appended just now.
+            // Should it ever need a copy, that copy is optional too.
+            if !may_allocate && self.kv.is_shared_position(&table, p) {
+                break;
+            }
+            if !self
+                .kv
+                .ensure_writable(seq_id, &mut table, p, &mut self.kv_cache, &self.layout)
+                .is_writable()
+            {
+                break;
+            }
+            housed = j + 1;
+        }
+        self.active[idx].block_table = table;
+        drafts.truncate(housed);
+        drafts
+    }
+
+    /// Take a sequence's blocks away so others can move. `reclaim` returns it
+    /// to the head of the queue to be recomputed, or completes it if it could
+    /// never be re-admitted.
+    fn preempt(&mut self, idx: usize) {
+        let seq_id = self.active[idx].id;
+        self.kv.release_sequence(seq_id);
+        self.active[idx].block_table = BlockTable::new();
+        self.active[idx].deferred = false;
+        self.active[idx].preempted = true;
+        self.stats.preemptions += 1;
     }
 
     /// Run every group's positions through the model and return, per group, the
@@ -762,6 +1334,10 @@ impl<'a> Engine<'a> {
 
     /// Accept the drafts the model agreed with and append the result.
     fn commit(&mut self, groups: &[SpecGroup], predictions: &[Vec<u32>]) {
+        let eos = self.engine.eos_token;
+        let extra_eos = std::mem::take(&mut self.engine.extra_eos_tokens);
+        let max_context = self.engine.max_context;
+
         for (g, group) in groups.iter().enumerate() {
             let verdict = verify_greedy(&group.drafts, &predictions[g]);
             let idx = group.seq_idx;
@@ -784,12 +1360,15 @@ impl<'a> Engine<'a> {
                 seq.generated.push(token);
                 seq.token_ids.push(token);
                 emitted.push(token);
-
-                if token == self.engine.eos_token {
-                    seq.finished = Some(FinishReason::Eos);
-                } else if seq.generated.len() >= seq.max_tokens {
-                    seq.finished = Some(FinishReason::Length);
-                }
+                seq.finished = stop_reason(
+                    eos,
+                    &extra_eos,
+                    max_context,
+                    token,
+                    seq.generated.len(),
+                    seq.max_tokens,
+                    seq.token_ids.len(),
+                );
             }
 
             // KV written for rejected drafts is left in place. It is never read:
@@ -802,39 +1381,95 @@ impl<'a> Engine<'a> {
             let (request_id, sequence_id, finished) = (seq.request_id, seq.id, seq.finished);
             self.record_delta(request_id, sequence_id, emitted, finished);
         }
+        self.engine.extra_eos_tokens = extra_eos;
     }
 
     // ── reclamation ──────────────────────────────────────────────────────────
 
     /// Free finished sequences immediately, so the next `step()` can admit
-    /// against the memory they held. Blocks the prefix cache still references
-    /// stay resident.
+    /// against the memory they held, and send preempted ones back to the
+    /// queue. Blocks the prefix cache still references stay resident.
     fn reclaim(&mut self) {
         let mut done = Vec::new();
-        self.active.retain(|seq| match seq.finished {
-            Some(reason) => {
-                done.push((
-                    seq.id,
-                    Completion {
-                        request_id: seq.request_id,
-                        sequence_id: seq.id,
-                        prompt_tokens: seq.prompt_len,
-                        tokens: seq.generated.clone(),
-                        finish_reason: reason,
-                        time_to_first_token: seq
-                            .first_token_at
-                            .unwrap_or(seq.admitted_at)
-                            .duration_since(seq.admitted_at),
-                    },
-                ));
-                false
+        let mut preempted = Vec::new();
+        for seq in std::mem::take(&mut self.active) {
+            if seq.finished.is_some() {
+                done.push(seq);
+            } else if seq.preempted {
+                preempted.push(seq);
+            } else {
+                self.active.push(seq);
             }
-            None => true,
-        });
-
-        for (seq_id, completion) in done {
-            self.kv.release_sequence(seq_id);
-            self.completed.push(completion);
         }
+
+        for seq in done {
+            self.kv.release_sequence(seq.id);
+            let reason = seq.finished.expect("finished");
+            self.completed.push(Self::completion_of(&seq, reason));
+        }
+
+        // Newest first, each to the front: the oldest ends up at the head, so
+        // resumption is in admission order.
+        preempted.sort_by_key(|s| std::cmp::Reverse(s.id));
+        for seq in preempted {
+            self.requeue(seq);
+        }
+    }
+
+    fn completion_of(seq: &Sequence, reason: FinishReason) -> Completion {
+        let first = seq.first_token_at.unwrap_or(seq.admitted_at);
+        Completion {
+            request_id: seq.request_id,
+            sequence_id: seq.id,
+            prompt_tokens: seq.prompt_len,
+            tokens: seq.generated.clone(),
+            finish_reason: reason,
+            time_to_first_token: first.duration_since(seq.submitted_at),
+            queue_time: seq.admitted_at.duration_since(seq.submitted_at),
+        }
+    }
+
+    /// Put a preempted sequence back at the head of the queue, or complete it
+    /// with `OutOfMemory` if not even an empty pool could take it back.
+    fn requeue(&mut self, seq: Sequence) {
+        let budget = seq.max_tokens - seq.generated.len();
+        let needed = self.first_step_blocks(seq.token_ids.len(), 1, budget);
+        if needed > self.engine.total_blocks {
+            let reason = FinishReason::OutOfMemory;
+            self.record_delta(seq.request_id, seq.id, Vec::new(), Some(reason));
+            self.completed.push(Self::completion_of(&seq, reason));
+            return;
+        }
+        let Sequence {
+            id,
+            request_id,
+            prompt_len,
+            token_ids,
+            generated,
+            max_tokens,
+            sampler,
+            submitted_at,
+            admitted_at,
+            first_token_at,
+            drafter,
+            ..
+        } = seq;
+        self.waiting.push_front(Request {
+            id: request_id,
+            tokens: token_ids,
+            max_tokens,
+            num_samples: 1,
+            options: RequestOptions::default(),
+            submitted_at,
+            resume: Some(Preempted {
+                sequence_id: id,
+                prompt_len,
+                generated,
+                sampler,
+                drafter,
+                admitted_at,
+                first_token_at,
+            }),
+        });
     }
 }

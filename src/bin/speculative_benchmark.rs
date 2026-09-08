@@ -123,7 +123,9 @@ fn measure(
 ) -> Measurement {
     engine.reset();
     engine.set_draft_tokens(draft_tokens);
-    engine.submit_tokens(prompt.to_vec(), max_tokens, 1);
+    engine
+        .submit_tokens(prompt.to_vec(), max_tokens, 1)
+        .expect("benchmark prompts fit the pool");
     let out = engine.run().expect("generation should not fail");
 
     let stats = engine.stats();

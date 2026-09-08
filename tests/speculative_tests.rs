@@ -70,7 +70,7 @@ fn generate(
     let weights = loader.load_weights(&config).unwrap();
     let mut engine = Engine::new(weights, config, engine_config);
     for p in prompts {
-        engine.submit_tokens(p.clone(), max_tokens, 1);
+        engine.submit_tokens(p.clone(), max_tokens, 1).unwrap();
     }
     let out = engine.run().unwrap();
     let mut by_request: Vec<(usize, Vec<u32>)> = out
