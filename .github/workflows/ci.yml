@@ -56,11 +56,15 @@ jobs:
       - run: pip install numpy
 
       # The committed fixtures are the references the whole test suite
-      # trusts. Regenerating them must reproduce the same bytes, or a
-      # reference has drifted from the generator that documents it.
-      - name: Regenerate and diff
+      # trusts, so their generators must still reproduce them. Weights, ids
+      # and the tokenizer are byte-exact; the reference logits are compared
+      # numerically, because a float32 NumPy matmul rounds differently on
+      # different BLAS builds and CPUs (see the generator's docstring).
+      - name: Check the golden fixture
+        run: python3 scripts/gen_golden_fixture.py --check
+
+      - name: Regenerate the tokenizer fixture and diff
         run: |
-          python3 scripts/gen_golden_fixture.py
           python3 scripts/gen_tokenizer_fixture.py
           git diff --exit-code -- tests/fixtures/
 

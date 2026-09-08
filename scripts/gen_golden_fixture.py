@@ -20,12 +20,27 @@ are permuted for at conversion time.
 Weights are rounded to bf16 *before* the reference runs, so the only remaining
 difference against the engine is floating-point summation order.
 
-Usage:  python3 scripts/gen_golden_fixture.py
+Usage:  python3 scripts/gen_golden_fixture.py            # (re)write the fixture
+        python3 scripts/gen_golden_fixture.py --check    # verify the committed one
+
+`--check` regenerates everything in memory and compares it with what is on
+disk. The weights, token ids, meta and config must match byte for byte: they
+come from a seeded generator and bf16 rounding, and any drift there means the
+reference no longer describes the fixture. The logits are compared
+*numerically*, to `LOGIT_TOLERANCE`: the reference is float32 NumPy, and the
+summation order inside a float32 matmul depends on the BLAS build and the CPU
+it picks kernels for, so two correct machines legitimately produce logits that
+differ in the last bits. Byte identity was never available for that file —
+CI on the default branch failed on it from the first run — and demanding it
+only made the check flaky. The tolerance is five times tighter than the
+engine's own parity bound and far below the fixture's smallest top-2 logit
+margin, which the check also reports.
 """
 
 import json
 import os
 import struct
+import sys
 
 import numpy as np
 
@@ -45,6 +60,10 @@ SEQ_LEN = 40
 HEAD_DIM = HIDDEN // HEADS
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures")
+
+# Largest |delta| allowed between the committed logits and a regeneration on
+# this machine. The Rust parity tests allow 5e-4 against the engine.
+LOGIT_TOLERANCE = 1e-4
 
 
 # ── bf16 helpers ─────────────────────────────────────────────────────────────
@@ -72,7 +91,7 @@ def quantize_bf16(x: np.ndarray) -> np.ndarray:
 # ── safetensors writer (the format is small enough not to need a dependency) ──
 
 
-def write_safetensors(path: str, tensors: dict) -> None:
+def safetensors_bytes(tensors: dict) -> bytes:
     header = {}
     blobs = []
     offset = 0
@@ -91,11 +110,12 @@ def write_safetensors(path: str, tensors: dict) -> None:
     pad = (-len(header_bytes)) % 8
     header_bytes += b" " * pad
 
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + b"".join(blobs)
+
+
+def write_safetensors(path: str, tensors: dict) -> None:
     with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(header_bytes)))
-        f.write(header_bytes)
-        for blob in blobs:
-            f.write(blob)
+        f.write(safetensors_bytes(tensors))
 
 
 # ── reference forward pass (NumPy transcription of HF modeling_llama) ─────────
@@ -225,26 +245,7 @@ def build_weights(rng) -> dict:
     return tensors
 
 
-def main() -> None:
-    os.makedirs(FIXTURE_DIR, exist_ok=True)
-    rng = np.random.default_rng(20240517)
-
-    tensors = build_weights(rng)
-    tokens = rng.integers(0, VOCAB, size=SEQ_LEN, dtype=np.uint32)
-
-    logits = reference_forward(tensors, tokens, interleaved=False)
-    interleaved = reference_forward(tensors, tokens, interleaved=True)
-
-    # The fixture is only useful if it can tell the two rotary conventions
-    # apart; assert that up front so a future regression can't pass silently.
-    spread = np.abs(logits - interleaved).max()
-    assert spread > 1e-2, f"fixture cannot discriminate rope conventions ({spread})"
-
-    write_safetensors(os.path.join(FIXTURE_DIR, "tiny_llama.safetensors"), tensors)
-
-    with open(os.path.join(FIXTURE_DIR, "tiny_llama_golden.bin"), "wb") as f:
-        f.write(logits.astype("<f4").tobytes())
-
+def meta_text(tokens: np.ndarray) -> str:
     meta = [
         f"hidden_size={HIDDEN}",
         f"num_hidden_layers={LAYERS}",
@@ -257,9 +258,10 @@ def main() -> None:
         f"seq_len={SEQ_LEN}",
         "tokens=" + ",".join(str(int(t)) for t in tokens),
     ]
-    with open(os.path.join(FIXTURE_DIR, "tiny_llama_meta.txt"), "w") as f:
-        f.write("\n".join(meta) + "\n")
+    return "\n".join(meta) + "\n"
 
+
+def config_text() -> str:
     # A HuggingFace-shaped config.json, so the fixture loads through the same
     # LlamaConfig::from_hf_config path a real checkpoint does.
     hf_config = {
@@ -275,15 +277,111 @@ def main() -> None:
         "rope_theta": THETA,
         "torch_dtype": "bfloat16",
     }
-    with open(os.path.join(FIXTURE_DIR, "config.json"), "w") as f:
-        json.dump(hf_config, f, indent=2)
-        f.write("\n")
+    return json.dumps(hf_config, indent=2) + "\n"
 
-    print(f"wrote fixtures to {os.path.normpath(FIXTURE_DIR)}")
+
+def generate():
+    rng = np.random.default_rng(20240517)
+    tensors = build_weights(rng)
+    tokens = rng.integers(0, VOCAB, size=SEQ_LEN, dtype=np.uint32)
+
+    logits = reference_forward(tensors, tokens, interleaved=False)
+    interleaved = reference_forward(tensors, tokens, interleaved=True)
+
+    # The fixture is only useful if it can tell the two rotary conventions
+    # apart; assert that up front so a future regression can't pass silently.
+    spread = np.abs(logits - interleaved).max()
+    assert spread > 1e-2, f"fixture cannot discriminate rope conventions ({spread})"
+    return tensors, tokens, logits, spread
+
+
+def describe(tokens, logits, spread) -> None:
     print(f"  tokens          : {list(int(t) for t in tokens)}")
     print(f"  logits          : {logits.shape}, range [{logits.min():.4f}, {logits.max():.4f}]")
     print(f"  argmax per pos  : {list(int(i) for i in logits.argmax(axis=-1))}")
     print(f"  rope convention discriminated by max|delta| = {spread:.4f}")
+
+
+def write(tensors, tokens, logits, spread) -> None:
+    os.makedirs(FIXTURE_DIR, exist_ok=True)
+    write_safetensors(os.path.join(FIXTURE_DIR, "tiny_llama.safetensors"), tensors)
+    with open(os.path.join(FIXTURE_DIR, "tiny_llama_golden.bin"), "wb") as f:
+        f.write(logits.astype("<f4").tobytes())
+    with open(os.path.join(FIXTURE_DIR, "tiny_llama_meta.txt"), "w") as f:
+        f.write(meta_text(tokens))
+    with open(os.path.join(FIXTURE_DIR, "config.json"), "w") as f:
+        f.write(config_text())
+    print(f"wrote fixtures to {os.path.normpath(FIXTURE_DIR)}")
+    describe(tokens, logits, spread)
+
+
+def check(tensors, tokens, logits, spread) -> int:
+    """Compare a fresh generation with the committed fixture. Returns an exit
+    status: 0 when the fixture is reproduced, 1 with the reasons otherwise."""
+    problems = []
+
+    def read(name: str, mode: str = "rb"):
+        with open(os.path.join(FIXTURE_DIR, name), mode) as f:
+            return f.read()
+
+    # Exact: everything that is a deterministic function of the seed.
+    for name, expected in [
+        ("tiny_llama.safetensors", safetensors_bytes(tensors)),
+        ("tiny_llama_meta.txt", meta_text(tokens).encode("utf-8")),
+        ("config.json", config_text().encode("utf-8")),
+    ]:
+        try:
+            actual = read(name)
+        except FileNotFoundError:
+            problems.append(f"{name}: missing")
+            continue
+        if actual != expected:
+            problems.append(f"{name}: differs from a fresh generation")
+
+    # Numerical: the logits, whose last bits depend on the machine's BLAS.
+    try:
+        committed = np.frombuffer(read("tiny_llama_golden.bin"), dtype="<f4")
+    except FileNotFoundError:
+        problems.append("tiny_llama_golden.bin: missing")
+        committed = None
+    if committed is not None:
+        if committed.size != logits.size:
+            problems.append(
+                f"tiny_llama_golden.bin: {committed.size} logits, expected {logits.size}"
+            )
+        else:
+            committed = committed.reshape(logits.shape)
+            delta = float(np.abs(committed - logits.astype(np.float32)).max())
+            top2 = np.sort(committed, axis=-1)
+            margin = float((top2[:, -1] - top2[:, -2]).min())
+            same_argmax = bool((committed.argmax(axis=-1) == logits.argmax(axis=-1)).all())
+            print(
+                f"  golden logits   : max|delta| = {delta:.3e} vs this machine "
+                f"(tolerance {LOGIT_TOLERANCE:.0e}); smallest top-2 margin {margin:.4f}"
+            )
+            if not np.isfinite(delta) or delta > LOGIT_TOLERANCE:
+                problems.append(
+                    f"tiny_llama_golden.bin: max|delta| {delta:.3e} exceeds {LOGIT_TOLERANCE:.0e}"
+                )
+            if not same_argmax:
+                problems.append("tiny_llama_golden.bin: greedy choice differs at some position")
+
+    describe(tokens, logits, spread)
+    if problems:
+        print("fixture check FAILED:")
+        for p in problems:
+            print(f"  - {p}")
+        print("regenerate with: python3 scripts/gen_golden_fixture.py")
+        return 1
+    print(f"fixture check passed against {os.path.normpath(FIXTURE_DIR)}")
+    return 0
+
+
+def main() -> None:
+    tensors, tokens, logits, spread = generate()
+    if "--check" in sys.argv[1:]:
+        sys.exit(check(tensors, tokens, logits, spread))
+    write(tensors, tokens, logits, spread)
 
 
 if __name__ == "__main__":

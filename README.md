@@ -669,9 +669,12 @@ against a deliberately tight block pool:
 
 CI runs `fmt`, `clippy -D warnings`, and the suite on **x86_64 (AVX2+FMA)** and
 **aarch64 (NEON)**, so a kernel that only works on the machine it was written on
-gets caught. A separate job regenerates the golden and tokenizer fixtures and
-diffs them — a committed reference is only trustworthy if its generator still
-reproduces it byte for byte.
+gets caught. A separate job regenerates the fixtures from their generators: the
+weights, token ids and tokenizer must come back byte for byte, and the reference
+logits within `1e-4` — a float32 NumPy matmul rounds differently on different
+BLAS builds and CPUs, so byte identity was never a property that file could
+have, and demanding it kept that job red on every runner that differed from the
+machine the fixture was made on.
 
 ---
 

@@ -42,18 +42,18 @@ impl DType {
         );
         match self {
             DType::BF16 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *o = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
+                for (o, b) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                    *o = half::bf16::from_le_bytes(*b).to_f32();
                 }
             }
             DType::F16 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *o = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for (o, b) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                    *o = half::f16::from_le_bytes(*b).to_f32();
                 }
             }
             DType::F32 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                for (o, b) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *o = f32::from_le_bytes(*b);
                 }
             }
         }

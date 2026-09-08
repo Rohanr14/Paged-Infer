@@ -56,17 +56,21 @@ pub fn matvec_bf16_weight_transposed(
     for (r, out_r) in out.iter_mut().enumerate() {
         let row = &weight_bf16[r * cols * 2..(r + 1) * cols * 2];
         *out_r = row
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(x.iter())
-            .map(|(b, xv)| half::bf16::from_le_bytes([b[0], b[1]]).to_f32() * xv)
+            .map(|(b, xv)| half::bf16::from_le_bytes(*b).to_f32() * xv)
             .sum();
     }
 }
 
 pub fn pack_bf16_to_f32(weight_bf16: &[u8]) -> Vec<f32> {
     weight_bf16
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
         .collect()
 }
 

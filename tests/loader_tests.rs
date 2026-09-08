@@ -57,8 +57,10 @@ fn fixture() -> Fixture {
         .collect();
     let golden = std::fs::read(dir.join("tiny_llama_golden.bin"))
         .unwrap()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     Fixture {
         config,
@@ -89,8 +91,10 @@ fn convert(bytes: &[u8], to: &str) -> Vec<u8> {
             offsets[1].as_u64().unwrap() as usize,
         );
         let values: Vec<f32> = data[s..e]
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
             .collect();
         let out: Vec<u8> = match to {
             "F16" => values
