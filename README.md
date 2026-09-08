@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 144 tests, incl. golden parity
+cargo test                                        # 217 tests, incl. golden parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -94,10 +94,22 @@ curl localhost:8080/metrics   # Prometheus text format
 curl localhost:8080/stats     # the same counters as JSON
 ```
 
-The engine reads the architecture from the checkpoint's own `config.json`, so
-any HuggingFace-format Llama checkpoint works, not just TinyLlama.
+The engine reads the architecture, special tokens, context window and chat
+template from the checkpoint's own files (`config.json`,
+`generation_config.json`, `tokenizer_config.json`), so it is not pinned to
+TinyLlama. What it accepts is a HuggingFace-format **Llama** checkpoint —
+`model_type: llama`, SiLU, no projection biases — stored as bf16, f16 or f32
+safetensors, with rotary scaling of type `default`, `linear` or `llama3`. Every
+tensor's dtype and shape is checked against the config before anything runs,
+and a config that declares something the kernels do not implement (another
+architecture, `yarn` scaling, `attention_bias`) is refused at load rather than
+run as a different model.
+
 `DRAFT_TOKENS=4` turns on speculative decoding, `QUANT=int8` quantizes the
-projections, and `WARMUP=0` disables the startup pass.
+projections, `WARMUP=0` disables the startup pass, and `KV_BLOCKS` /
+`BLOCK_SIZE` size the cache. The server's limits — `MAX_BODY_BYTES`,
+`MAX_CONNECTIONS`, `MAX_QUEUED_JOBS`, `TIMEOUT_SECS`, `MAX_TOKENS` — are
+documented at the top of `src/bin/http_server.rs`.
 
 ---
 
@@ -158,6 +170,30 @@ Drawing *n* continuations from one prompt maps the parent's blocks into each
 child instead of copying them. Nothing moves at fork time. The one block the
 siblings both write to is split lazily, on first write — so a sample that stops
 early never pays for a copy at all.
+
+### Memory discipline
+
+A write into a block the sequence does not own outright is never executed.
+`ensure_writable` returns a `must_use` verdict — private, copied, or out of
+memory — and the scheduler treats the last one as "do not write", not as "no
+copy needed" (which is how it was once read, and how several siblings ended up
+sharing one physical block under a full pool).
+
+Every step settles the *mandatory* write of every live sequence — the token it
+already holds — before spending a block on speculative drafts, and drafts may
+only allocate while a free block per live sequence remains for the next step.
+A sequence whose mandatory write cannot be satisfied **defers**: it keeps its
+blocks and sits the step out. If no sequence at all can move, the newest
+deferred one is **preempted** — its blocks are released and it returns to the
+head of the queue with its tokens, sampler state and sequence id, to be
+recomputed when memory allows. Only a sequence that would not fit an empty
+pool ends with `OutOfMemory`.
+
+Admission reserves headroom for the same reason: a prompt is admitted only if,
+after its blocks are mapped, enough remain free for every live sequence's next
+write and for the prompt's own first decode step. A request that could never be
+admitted — longer than the pool, or a fork whose copies cannot fit — is refused
+at submission instead of stalling the queue behind it.
 
 ---
 
@@ -461,12 +497,19 @@ weights, not in general.
 None of it changes a single arithmetic operation. Scores are still computed in
 increasing `t`, the softmax still runs over the whole window, the value
 accumulation still runs in increasing `t`. `tests/attention_tests.rs` holds the
-kernel against a deliberately naive reference written in the test file — one
-head at a time, one token at a time, addresses resolved per token — and demands
-**bit-identical** output across six head configurations, every legal lane width,
-ragged batches, sliding windows narrower than a block, unmapped blocks, and
-several positions of one sequence sharing a block table. The benchmark asserts
-it too, on every run, before printing a number.
+kernel against a deliberately naive schedule written in the test file — one
+head at a time, one token at a time, addresses resolved per token, built from
+the same `dot`/`softmax`/`axpy` primitives — and demands **bit-identical**
+output across six head configurations, every legal lane width, ragged batches,
+sliding windows narrower than a block, unmapped blocks, and several positions of
+one sequence sharing a block table. A second, fully independent f64 oracle with
+plain scalar sums is compared at a documented tolerance (`1e-4`, measured
+deviation `8e-7`) at head dimensions from 4 to 128: it shares no code with the
+kernel, so it can catch an arithmetic bug the first reference would faithfully
+reproduce — and it cannot be compared exactly, because the kernel's vector
+accumulators and fused multiply-adds round differently from a sequential sum.
+The benchmark asserts the exact comparison too, on every run, before printing a
+number.
 
 ```bash
 cargo run --release --bin attention_benchmark   # sweeps the lane width
@@ -606,26 +649,29 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-144 tests, no model download required.
+217 tests, no model download required.
 
 | suite | covers |
 |---|---|
 | `golden_parity_tests` | full forward pass vs the NumPy reference: decode, prefill, resumed prefill |
+| `loader_tests` | the same weights as bf16, f16 and f32 all match the reference; f64 is refused by name; shapes, layer counts and head dimensions that disagree with the config are refused before running; `config.json` parsing, including rotary scaling variants and unsupported features |
 | `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
 | `batched_decode_tests` | batched decode and prefill are bit-identical to the paths they replace: ragged batches, block boundaries, per-sequence windows, ragged chunks, resumed prefill, causality |
-| `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, memory-pressure staging, unfittable prompts, int8 |
+| `engine_tests` | the scheduler: token budgets, EOS, block-boundary growth, determinism, seeded sampling, queuing under pressure, forked siblings under a full pool producing exactly the unpressured output, preemption and `OutOfMemory` with every block returned, impossible prompts refused at submission, out-of-vocabulary ids, the context window, TTFT measured from submission, int8 |
 | `speculative_tests` | speculative output is token-identical to greedy: draft depths, mixed batches, chunk splits, block boundaries, EOS mid-run, memory pressure |
-| `streaming_tests` | streamed deltas reconstruct the completion exactly, under speculation and forking; every sequence gets one terminal delta; cancellation returns blocks; warm-up leaves no trace |
-| `attention_tests` | the paged attention kernel is bit-identical to a naive per-head, per-token reference at every lane width: six head shapes, ragged batches, sub-block sliding windows, unmapped blocks, shared block tables |
+| `streaming_tests` | streamed deltas reconstruct the completion exactly, under speculation and forking; every way a sequence can end — EOS, budget, memory, cancellation — yields exactly one terminal delta; cancellation returns blocks; warm-up leaves no trace |
+| `tokenizer_tests` | against a Llama-shaped tokenizer with byte fallback: every partition of emoji, CJK, whitespace and genuine-U+FFFD inputs streams to exactly the buffered decode; text prompts carry exactly one BOS whether or not the tokenizer adds it; chat renders the checkpoint's template and tokenizes as `apply_chat_template` does |
+| `http_server_tests` | the real server on an ephemeral port: bad ids and impossible prompts are 400s and serving continues; streaming reproduces the buffered tokens and ends with `[DONE]`; oversized bodies and headers, silent clients and excess connections are refused or timed out; a disconnected streamer's blocks return to the pool |
+| `attention_tests` | every lane width of the paged attention kernel is bit-identical to the per-token schedule built from the same primitives; all of them sit within a documented tolerance of an independent f64 oracle, at head dimensions from 4 to 128 including SIMD tails |
 | `simd_tests` | every kernel vs scalar at every length 0–80, `i8::MIN` sign extension, row independence |
 | `math_tests` | both rotary conventions, that they are *not* interchangeable, rotation preserves norm, masking |
-| memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW |
+| memory unit tests | refcount invariants, 5,000 leak-free cycles, hash chaining, LRU, CoW including the copy-failed case, admission headroom |
 
 CI runs `fmt`, `clippy -D warnings`, and the suite on **x86_64 (AVX2+FMA)** and
 **aarch64 (NEON)**, so a kernel that only works on the machine it was written on
-gets caught. A separate job regenerates the golden fixture and diffs it — a
-committed reference is only trustworthy if its generator still reproduces it
-byte for byte.
+gets caught. A separate job regenerates the golden and tokenizer fixtures and
+diffs them — a committed reference is only trustworthy if its generator still
+reproduces it byte for byte.
 
 ---
 
@@ -739,17 +785,37 @@ engine on one thread and funnels every connection into the same scheduler, so
 requests from *different clients* land in the same batch and share prefix-cache
 blocks.
 
+- **The model's own conventions.** BOS and EOS ids, the context window and the
+  chat template come from the checkpoint's files, resolved once into a
+  `ModelProfile`. Token-id requests are the complete model input and are never
+  modified; text prompts get exactly one BOS; chat requests are rendered through
+  the checkpoint's Jinja2 template and tokenized as `apply_chat_template` does.
+  A checkpoint without a template refuses chat requests rather than
+  approximating a format.
 - **Streaming.** `"stream": true` returns OpenAI-shaped server-sent events, one
   chunk per scheduler step. A speculative step that had four drafts accepted
   emits four tokens in one chunk — they really are all available at that
   instant. Detokenization is incremental but not per-token: a BPE token can
   carry a fragment of a UTF-8 character, so the whole prefix is decoded each
-  time and only the newly-appeared text is sent.
+  time, only the newly-appeared *stable* text is sent, and a trailing run of
+  replacement characters — the first bytes of an emoji — is held until the
+  character completes or the stream ends. The concatenated chunks equal the
+  buffered response exactly.
+- **Bounded.** Request heads, bodies (checked against `Content-Length` before
+  anything is allocated), concurrent connections, queued jobs, per-client
+  reply events and socket deadlines are all capped, and exceeding any of them
+  is an explicit response — 413, 431, 503 with `Retry-After`, 408 — never a
+  stall of the engine thread. Options the server does not implement (`stop`,
+  `logit_bias`, penalties, tools) are refused unless sent with their defaults;
+  `temperature`, `top_p`, `top_k`, `seed` and `n` are honoured per request.
 - **Cancellation.** A client that hangs up is noticed on the next chunk write,
-  and the engine stops: the sequence retires at the next step and its KV blocks
-  go back to the pool. Measured against the fixture, a stream abandoned after
-  four chunks stopped at 25 generated tokens out of a requested 4000, and the
-  pool returned to 511 of 512 blocks free.
+  and a client that stops reading falls behind its bounded reply queue; either
+  way the engine stops: the sequence retires at the next step and its KV blocks
+  go back to the pool. `tests/http_server_tests.rs` abandons a stream and waits
+  for every block to come back.
+- **Health that means something.** `/health` is 200 only while the engine
+  thread is alive and ready; a stream whose engine disappears carries an error
+  event instead of going silent.
 - **Warm-up.** `Engine::warm_up()` runs one throwaway prefill before the
   listener opens, so the rayon pool, the scratch arenas and the checkpoint's
   pages are all touched by something other than the first real request. It then
@@ -788,6 +854,16 @@ blocks.
 - **Only streaming clients can be cancelled.** Disconnection is detected on a
   failed chunk write, and a buffered request writes nothing until it is
   finished, so there is no write to fail on.
+- **Prefill is not chunked across steps.** A long prompt's prefill runs to
+  completion inside one `step()`, so sequences already decoding wait for it.
+  Decode-priority chunked prefill, with a per-step token budget, is the next
+  scheduling change; the engine now reports queue wait and deferred steps so
+  its effect can be measured.
+- **`llama3` rotary scaling is transcribed, not yet validated end to end.** The
+  formula follows `transformers` and is unit-tested for its shape; it has not
+  been compared against a real Llama 3 checkpoint's logits here.
+- **Chat templates get `system`, `user` and `assistant` turns with string
+  content.** Tool calls and multimodal content are refused.
 - **Sampled sequences never speculate.** Extending it there needs the
   rejection-sampling correction to stay distributionally exact.
 - **The prefix cache publishes prompt blocks only.** Blocks that fill during
@@ -798,9 +874,12 @@ blocks.
 
 ```
 src/
-  engine.rs          scheduler: admit → prefill → decode → reclaim
-  model.rs           Llama forward pass, weight loading, quantization
-  math.rs            RMSNorm, RoPE, SwiGLU, softmax, matvec dispatch
+  engine.rs          scheduler: admit → prefill → decode → reclaim; defer/preempt
+  model.rs           Llama forward pass, config parsing, dtype-checked loading
+  tensor.rs          checkpoint tensors with their dtype
+  profile.rs         the checkpoint's BOS/EOS, context window, chat template
+  serve.rs           bounded HTTP serving: parsing, validation, engine loop, SSE
+  math.rs            RMSNorm, RoPE (+ linear / llama3 scaling), SwiGLU, softmax
   simd.rs            AVX2/FMA and NEON kernels + scalar reference
   sampling.rs        temperature / top-p / top-k over a seeded RNG
   memory/
@@ -813,17 +892,19 @@ src/
   detokenizer.rs     incremental token → text for streaming
   speculative.rs     drafters and lossless greedy verification
   bin/
-    http_server.rs         OpenAI-shaped API, SSE streaming, Prometheus
+    http_server.rs         environment → ServeConfig; the logic is in serve.rs
     attention_benchmark.rs lane-width sweep for the paged attention kernel
     benchmark.rs           kernel attribution ladder
     batch_benchmark.rs     batched vs sequential decode
     prefix_cache_benchmark.rs
     e2e_benchmark.rs  eviction_benchmark.rs  gpu_benchmark.rs
+    speculative_benchmark.rs   acceptance and speedup per workload
 scripts/
   gen_golden_fixture.py    reference model + logits (NumPy)
+  gen_tokenizer_fixture.py Llama-shaped tokenizer fixture (stdlib)
   download_model.py        fetch TinyLlama 1.1B
-    speculative_benchmark.rs   acceptance and speedup per workload
-tests/                     144 tests; fixtures/ holds the reference checkpoint
+tests/                     217 tests; fixtures/ holds the reference checkpoint
+                           and tokenizer
 ```
 
 ## License
