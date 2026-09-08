@@ -86,7 +86,7 @@ fn main() -> anyhow::Result<()> {
         quantization,
         // Read the architecture from the checkpoint rather than assuming
         // TinyLlama's shape.
-        ..LlamaConfig::beside_checkpoint(&model_path)
+        ..LlamaConfig::beside_checkpoint(&model_path)?
     };
     let weights = loader.load_weights(&config)?;
 

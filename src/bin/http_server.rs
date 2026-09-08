@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
             // it has one, so the server is not pinned to a single model shape.
             let config = LlamaConfig {
                 quantization,
-                ..LlamaConfig::beside_checkpoint(&model_path)
+                ..LlamaConfig::beside_checkpoint(&model_path)?
             };
             let weights = loader.load_weights(&config)?;
             let mut engine = Engine::new(

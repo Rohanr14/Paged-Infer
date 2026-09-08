@@ -12,6 +12,7 @@
 
 use std::time::Instant;
 
+use paged_infer::tensor::DType;
 use paged_infer::{
     memory::{allocator::BlockAllocator, block_table::BlockTable},
     model::{
@@ -49,7 +50,11 @@ fn make_projection(rows: usize, cols: usize, val: f32) -> Projection {
 fn synthetic_weights(config: &LlamaConfig) -> LlamaWeights<'static> {
     let embed_bytes: &'static [u8] =
         Box::leak(vec![0u8; config.vocab_size * config.hidden_size * 2].into_boxed_slice());
-    let token_embeddings = Tensor::new(embed_bytes, vec![config.vocab_size, config.hidden_size]);
+    let token_embeddings = Tensor::new(
+        embed_bytes,
+        vec![config.vocab_size, config.hidden_size],
+        DType::BF16,
+    );
 
     let h = config.hidden_size;
     let kv = config.num_key_value_heads * (h / config.num_attention_heads);

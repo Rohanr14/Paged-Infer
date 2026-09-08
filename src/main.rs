@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     };
     let config = LlamaConfig {
         quantization,
-        ..LlamaConfig::beside_checkpoint(&model_path)
+        ..LlamaConfig::beside_checkpoint(&model_path)?
     };
     let weights = loader.load_weights(&config)?;
     println!(

@@ -58,6 +58,7 @@ fn load_fixture() -> Fixture {
         // HF-format checkpoints require the rotate_half convention.
         rope_style: paged_infer::math::RopeStyle::Neox,
         quantization: Default::default(),
+        ..LlamaConfig::default()
     };
 
     let tokens: Vec<u32> = kv["tokens"]

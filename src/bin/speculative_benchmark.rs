@@ -213,7 +213,7 @@ fn main() -> anyhow::Result<()> {
                 Ok("int8") => Quantization::Int8,
                 _ => Quantization::F32,
             },
-            ..LlamaConfig::beside_checkpoint(&model_path)
+            ..LlamaConfig::beside_checkpoint(&model_path)?
         }
     } else {
         let meta = std::fs::read_to_string(fixture_dir.join("tiny_llama_meta.txt"))?;

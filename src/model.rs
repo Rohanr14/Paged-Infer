@@ -4,12 +4,12 @@ use safetensors::SafeTensors;
 use crate::attention::{AttnEntry, PagedAttention};
 use crate::gpu::{GpuContext, GpuLinear};
 use crate::math::{
-    matvec_f32_weight_transposed_parallel, pack_bf16_to_f32, rms_norm, rope_rotate, rope_table,
-    swiglu, RopeStyle,
+    matvec_f32_weight_transposed_parallel, rms_norm, rope_inv_freq, rope_rotate, rope_table_from,
+    swiglu, RopeScaling, RopeStyle,
 };
 use crate::memory::block_table::BlockTable;
 use crate::memory::layout::KvLayout;
-use crate::tensor::Tensor;
+use crate::tensor::{DType, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -21,6 +21,15 @@ pub struct LlamaConfig {
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Rotary scaling the checkpoint was trained with. See [`RopeScaling`].
+    pub rope_scaling: RopeScaling,
+    /// The context window the checkpoint declares, when it does.
+    pub max_position_embeddings: Option<usize>,
+    /// Special tokens as `config.json` states them. A serving layer should
+    /// take these over any hardcoded default; the engine is told them through
+    /// its own config.
+    pub bos_token_id: Option<u32>,
+    pub eos_token_ids: Vec<u32>,
     /// Optional sliding-window attention.
     ///
     /// `None` is full causal attention, which is what Llama actually specifies.
@@ -35,6 +44,7 @@ pub struct LlamaConfig {
 }
 
 impl Default for LlamaConfig {
+    /// TinyLlama 1.1B's architecture.
     fn default() -> Self {
         Self {
             hidden_size: 2048,
@@ -45,6 +55,10 @@ impl Default for LlamaConfig {
             vocab_size: 32000,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            rope_scaling: RopeScaling::None,
+            max_position_embeddings: None,
+            bos_token_id: Some(1),
+            eos_token_ids: vec![2],
             attention_window: None,
             rope_style: RopeStyle::Neox,
             quantization: Quantization::F32,
@@ -61,45 +75,178 @@ impl LlamaConfig {
     /// is a missing-tensor error at load, or worse, a wrong-shaped load that
     /// runs and produces noise.
     ///
-    /// Fields absent from the file keep their [`Default`] value.
+    /// Strict on purpose. A file that is present but malformed, or that
+    /// declares a feature this engine does not implement (a non-Llama
+    /// `model_type`, projection biases, a rotary scaling variant other than
+    /// `default`, `linear` or `llama3`, an activation other than SiLU), is an
+    /// error — never a silent fallback to defaults, which would run a
+    /// different model than the one on disk.
     pub fn from_hf_config(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let json: serde_json::Value =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-
-        let default = Self::default();
-        let usize_at = |key: &str, fallback: usize| -> usize {
-            json[key].as_u64().map_or(fallback, |v| v as usize)
-        };
-        let f32_at =
-            |key: &str, fallback: f32| -> f32 { json[key].as_f64().map_or(fallback, |v| v as f32) };
-
-        let num_attention_heads = usize_at("num_attention_heads", default.num_attention_heads);
-        Ok(Self {
-            hidden_size: usize_at("hidden_size", default.hidden_size),
-            num_hidden_layers: usize_at("num_hidden_layers", default.num_hidden_layers),
-            num_attention_heads,
-            // Multi-head checkpoints omit this; it then equals the query heads.
-            num_key_value_heads: usize_at("num_key_value_heads", num_attention_heads),
-            intermediate_size: usize_at("intermediate_size", default.intermediate_size),
-            vocab_size: usize_at("vocab_size", default.vocab_size),
-            rms_norm_eps: f32_at("rms_norm_eps", default.rms_norm_eps),
-            rope_theta: f32_at("rope_theta", default.rope_theta),
-            // Not architecture: these are engine policy, so they keep defaults
-            // and are set by the caller.
-            attention_window: default.attention_window,
-            rope_style: default.rope_style,
-            quantization: default.quantization,
-        })
+        Self::from_hf_json(&json).with_context(|| format!("in {}", path.display()))
     }
 
-    /// Load the config sitting beside a checkpoint, or fall back to defaults
-    /// when the checkpoint ships without one.
-    pub fn beside_checkpoint(model_path: impl AsRef<std::path::Path>) -> Self {
+    /// [`LlamaConfig::from_hf_config`] on an already-parsed document.
+    pub fn from_hf_json(json: &serde_json::Value) -> Result<Self> {
+        use serde_json::Value;
+        anyhow::ensure!(json.is_object(), "config.json is not a JSON object");
+
+        if let Some(model_type) = json.get("model_type").and_then(Value::as_str) {
+            anyhow::ensure!(
+                model_type == "llama",
+                "model_type {model_type:?} is not supported; this engine implements the Llama \
+                 architecture (model_type \"llama\")"
+            );
+        }
+        if let Some(act) = json.get("hidden_act").and_then(Value::as_str) {
+            anyhow::ensure!(
+                act == "silu",
+                "hidden_act {act:?} is not supported; the feed-forward path is SwiGLU"
+            );
+        }
+        for key in ["attention_bias", "mlp_bias"] {
+            anyhow::ensure!(
+                json.get(key).and_then(Value::as_bool) != Some(true),
+                "{key} = true is not supported: the loader has no bias tensors"
+            );
+        }
+
+        let required = |key: &str| -> Result<usize> {
+            match json.get(key) {
+                Some(v) => v.as_u64().map(|v| v as usize).ok_or_else(|| {
+                    anyhow::anyhow!("{key} must be a non-negative integer, got {v}")
+                }),
+                None => anyhow::bail!("config.json is missing {key}"),
+            }
+        };
+        let optional = |key: &str| -> Result<Option<usize>> {
+            match json.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v.as_u64().map(|v| Some(v as usize)).ok_or_else(|| {
+                    anyhow::anyhow!("{key} must be a non-negative integer, got {v}")
+                }),
+            }
+        };
+        let optional_f32 = |key: &str| -> Result<Option<f32>> {
+            match json.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_f64()
+                    .map(|v| Some(v as f32))
+                    .ok_or_else(|| anyhow::anyhow!("{key} must be a number, got {v}")),
+            }
+        };
+
+        let hidden_size = required("hidden_size")?;
+        let num_hidden_layers = required("num_hidden_layers")?;
+        let num_attention_heads = required("num_attention_heads")?;
+        let intermediate_size = required("intermediate_size")?;
+        let vocab_size = required("vocab_size")?;
+        // Multi-head checkpoints omit this; it then equals the query heads.
+        let num_key_value_heads = optional("num_key_value_heads")?.unwrap_or(num_attention_heads);
+        // transformers' own defaults for the fields a config may omit.
+        let rms_norm_eps = optional_f32("rms_norm_eps")?.unwrap_or(1e-6);
+
+        if let Some(head_dim) = optional("head_dim")? {
+            anyhow::ensure!(
+                num_attention_heads > 0 && head_dim * num_attention_heads == hidden_size,
+                "head_dim {head_dim} is not hidden_size / num_attention_heads = {}; a \
+                 decoupled head dimension is not supported",
+                hidden_size.checked_div(num_attention_heads).unwrap_or(0)
+            );
+        }
+
+        let (rope_theta, rope_scaling) = parse_rope(json)?;
+        let max_position_embeddings = optional("max_position_embeddings")?;
+        let bos_token_id = optional("bos_token_id")?
+            .map(|v| u32::try_from(v).map_err(|_| anyhow::anyhow!("bos_token_id {v} overflows")))
+            .transpose()?;
+        let eos_token_ids = parse_token_ids(json.get("eos_token_id"), "eos_token_id")?;
+
+        let config = Self {
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            intermediate_size,
+            vocab_size,
+            rms_norm_eps,
+            rope_theta,
+            rope_scaling,
+            max_position_embeddings,
+            bos_token_id,
+            eos_token_ids,
+            // Not architecture: these are engine policy, so they keep defaults
+            // and are set by the caller.
+            attention_window: None,
+            rope_style: RopeStyle::Neox,
+            quantization: Quantization::F32,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load the config sitting beside a checkpoint.
+    ///
+    /// A checkpoint that ships without one gets the [`Default`] (TinyLlama)
+    /// shape, which the loader then checks against every tensor in the file —
+    /// so a wrong guess fails at load, not at inference. A `config.json` that is
+    /// present but cannot be used is an error.
+    pub fn beside_checkpoint(model_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let candidate = model_path.as_ref().with_file_name("config.json");
-        Self::from_hf_config(&candidate).unwrap_or_default()
+        if !candidate.exists() {
+            return Ok(Self::default());
+        }
+        Self::from_hf_config(&candidate)
+    }
+
+    /// Check the shape is one the kernels can run. Called by the loader; a
+    /// hand-built config that skips it fails later with a worse message.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.hidden_size > 0
+                && self.num_hidden_layers > 0
+                && self.num_attention_heads > 0
+                && self.num_key_value_heads > 0
+                && self.intermediate_size > 0
+                && self.vocab_size > 0,
+            "every model dimension must be positive: {self:?}"
+        );
+        anyhow::ensure!(
+            self.hidden_size.is_multiple_of(self.num_attention_heads),
+            "hidden_size {} is not a multiple of num_attention_heads {}",
+            self.hidden_size,
+            self.num_attention_heads
+        );
+        anyhow::ensure!(
+            self.num_attention_heads
+                .is_multiple_of(self.num_key_value_heads),
+            "num_attention_heads {} is not a multiple of num_key_value_heads {}",
+            self.num_attention_heads,
+            self.num_key_value_heads
+        );
+        anyhow::ensure!(
+            self.head_dim().is_multiple_of(2),
+            "head_dim {} must be even for rotary embeddings",
+            self.head_dim()
+        );
+        anyhow::ensure!(
+            self.rms_norm_eps > 0.0 && self.rope_theta > 0.0,
+            "rms_norm_eps and rope_theta must be positive"
+        );
+        anyhow::ensure!(
+            self.attention_window != Some(0),
+            "attention_window must be at least 1; use None for full attention"
+        );
+        anyhow::ensure!(
+            self.max_position_embeddings != Some(0),
+            "max_position_embeddings must be positive"
+        );
+        Ok(())
     }
 
     #[inline]
@@ -137,6 +284,126 @@ impl LlamaConfig {
     }
 }
 
+/// `rope_theta` and the scaling variant, from either the older `rope_scaling`
+/// object or the newer `rope_parameters` one (which also carries the theta).
+fn parse_rope(json: &serde_json::Value) -> Result<(f32, RopeScaling)> {
+    use serde_json::Value;
+    let object = |key: &str| -> Result<Option<&serde_json::Map<String, Value>>> {
+        match json.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(m)) => Ok(Some(m)),
+            Some(other) => anyhow::bail!("{key} must be an object, got {other}"),
+        }
+    };
+
+    let mut theta = match json.get("rope_theta") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_f64()
+                .ok_or_else(|| anyhow::anyhow!("rope_theta must be a number, got {v}"))?
+                as f32,
+        ),
+    };
+    let mut scaling = None;
+
+    if let Some(params) = object("rope_parameters")? {
+        if let Some(t) = params.get("rope_theta").filter(|v| !v.is_null()) {
+            theta = Some(
+                t.as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("rope_parameters.rope_theta must be a number"))?
+                    as f32,
+            );
+        }
+        scaling = Some(parse_rope_scaling(params, "rope_parameters")?);
+    }
+    if let Some(legacy) = object("rope_scaling")? {
+        let parsed = parse_rope_scaling(legacy, "rope_scaling")?;
+        match scaling {
+            Some(modern) => anyhow::ensure!(
+                modern == parsed,
+                "rope_scaling ({parsed:?}) and rope_parameters ({modern:?}) disagree"
+            ),
+            None => scaling = Some(parsed),
+        }
+    }
+    Ok((theta.unwrap_or(10_000.0), scaling.unwrap_or_default()))
+}
+
+fn parse_rope_scaling(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    what: &str,
+) -> Result<RopeScaling> {
+    let kind = obj
+        .get("rope_type")
+        .or_else(|| obj.get("type"))
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| anyhow::anyhow!("{what}.rope_type must be a string, got {v}"))
+        })
+        .transpose()?
+        .unwrap_or("default");
+    let number = |key: &str| -> Result<f32> {
+        obj.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .ok_or_else(|| anyhow::anyhow!("{what} of type {kind:?} needs a numeric {key}"))
+    };
+    match kind {
+        "default" => Ok(RopeScaling::None),
+        "linear" => {
+            let factor = number("factor")?;
+            anyhow::ensure!(factor > 0.0, "{what}.factor must be positive, got {factor}");
+            Ok(RopeScaling::Linear { factor })
+        }
+        "llama3" => {
+            let factor = number("factor")?;
+            let low_freq_factor = number("low_freq_factor")?;
+            let high_freq_factor = number("high_freq_factor")?;
+            let original = obj
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{what} of type \"llama3\" needs an integer original_max_position_embeddings"
+                    )
+                })? as usize;
+            anyhow::ensure!(
+                factor >= 1.0
+                    && low_freq_factor > 0.0
+                    && high_freq_factor > low_freq_factor
+                    && original > 0,
+                "{what} llama3 parameters are out of range: factor {factor}, low {low_freq_factor}, \
+                 high {high_freq_factor}, original {original}"
+            );
+            Ok(RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings: original,
+            })
+        }
+        other => anyhow::bail!(
+            "{what} type {other:?} is not supported (supported: default, linear, llama3); \
+             running this checkpoint with default rotary tables would be a different model"
+        ),
+    }
+}
+
+/// `eos_token_id` may be a single id, a list of them, or absent.
+fn parse_token_ids(value: Option<&serde_json::Value>, what: &str) -> Result<Vec<u32>> {
+    use serde_json::Value;
+    let one = |v: &Value| -> Result<u32> {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("{what} entries must be token ids, got {v}"))
+    };
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items.iter().map(one).collect(),
+        Some(v) => Ok(vec![one(v)?]),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PackedLinear {
     pub rows: usize,
@@ -152,7 +419,7 @@ impl PackedLinear {
         Self {
             rows,
             cols,
-            weight: pack_bf16_to_f32(t.raw_bytes()),
+            weight: t.to_f32_vec(),
         }
     }
 
@@ -395,37 +662,56 @@ impl<'a> ModelLoader<'a> {
         Ok(Self { tensors })
     }
 
+    /// Decode every tensor the architecture needs, checking each one's dtype
+    /// and shape against `config` before anything is computed with it.
+    ///
+    /// The checkpoint is the ground truth for what the weights *are*; the
+    /// config is the ground truth for what the engine will *do* with them. The
+    /// two have to agree exactly, or the failure is silent: a shape mismatch
+    /// would index the wrong elements, a dtype mismatch would decode the wrong
+    /// numbers, and either produces a model that runs and emits noise.
     pub fn load_weights(&self, config: &LlamaConfig) -> Result<LlamaWeights<'a>> {
-        let token_embeddings = self.tensor("model.embed_tokens.weight")?;
-        let final_norm = pack_bf16_to_f32(self.tensor("model.norm.weight")?.raw_bytes());
-        let lm_head_t = self
-            .tensor("lm_head.weight")
-            .or_else(|_| self.tensor("model.embed_tokens.weight"))?;
+        config.validate().context("model config is not usable")?;
+        let hidden = config.hidden_size;
+        let kv_dim = config.kv_dim();
+        let inter = config.intermediate_size;
+        let vocab = config.vocab_size;
+
+        let token_embeddings = self.tensor("model.embed_tokens.weight", &[vocab, hidden])?;
+        let final_norm = self.tensor("model.norm.weight", &[hidden])?.to_f32_vec();
+        // Tied embeddings ship no separate LM head; a present-but-wrong one is
+        // still an error rather than a fallback.
+        let lm_head_t = if self.has("lm_head.weight") {
+            self.tensor("lm_head.weight", &[vocab, hidden])?
+        } else {
+            token_embeddings.clone()
+        };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
+            let t = |name: &str, shape: &[usize]| self.tensor(&format!("{prefix}.{name}"), shape);
 
-            let attn_norm = self.tensor(&format!("{prefix}.input_layernorm.weight"))?;
-            let ffn_norm = self.tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let wq = self.tensor(&format!("{prefix}.self_attn.q_proj.weight"))?;
-            let wk = self.tensor(&format!("{prefix}.self_attn.k_proj.weight"))?;
-            let wv = self.tensor(&format!("{prefix}.self_attn.v_proj.weight"))?;
-            let wo = self.tensor(&format!("{prefix}.self_attn.o_proj.weight"))?;
-            let w1 = self.tensor(&format!("{prefix}.mlp.gate_proj.weight"))?;
-            let w2 = self.tensor(&format!("{prefix}.mlp.down_proj.weight"))?;
-            let w3 = self.tensor(&format!("{prefix}.mlp.up_proj.weight"))?;
+            let attn_norm = t("input_layernorm.weight", &[hidden])?;
+            let ffn_norm = t("post_attention_layernorm.weight", &[hidden])?;
+            let wq = t("self_attn.q_proj.weight", &[hidden, hidden])?;
+            let wk = t("self_attn.k_proj.weight", &[kv_dim, hidden])?;
+            let wv = t("self_attn.v_proj.weight", &[kv_dim, hidden])?;
+            let wo = t("self_attn.o_proj.weight", &[hidden, hidden])?;
+            let w1 = t("mlp.gate_proj.weight", &[inter, hidden])?;
+            let w2 = t("mlp.down_proj.weight", &[hidden, inter])?;
+            let w3 = t("mlp.up_proj.weight", &[inter, hidden])?;
 
             let q = config.quantization;
             layers.push(LayerWeights {
-                attention_norm: pack_bf16_to_f32(attn_norm.raw_bytes()),
+                attention_norm: attn_norm.to_f32_vec(),
                 attention: AttentionWeights {
                     wq: Projection::from_tensor(&wq, q),
                     wk: Projection::from_tensor(&wk, q),
                     wv: Projection::from_tensor(&wv, q),
                     wo: Projection::from_tensor(&wo, q),
                 },
-                ffn_norm: pack_bf16_to_f32(ffn_norm.raw_bytes()),
+                ffn_norm: ffn_norm.to_f32_vec(),
                 feed_forward: FeedForwardWeights {
                     w1: Projection::from_tensor(&w1, q),
                     w2: Projection::from_tensor(&w2, q),
@@ -433,6 +719,18 @@ impl<'a> ModelLoader<'a> {
                 },
             });
         }
+
+        // A config that under-counts the layers would load a truncated model
+        // that runs. Refuse it.
+        let beyond = format!(
+            "model.layers.{}.input_layernorm.weight",
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            !self.has(&beyond),
+            "checkpoint has more than the {} layers config.json declares",
+            config.num_hidden_layers
+        );
 
         Ok(LlamaWeights {
             token_embeddings,
@@ -445,19 +743,29 @@ impl<'a> ModelLoader<'a> {
         })
     }
 
-    fn tensor(&self, name: &str) -> Result<Tensor<'a>> {
+    fn has(&self, name: &str) -> bool {
+        self.tensors.tensor(name).is_ok()
+    }
+
+    /// A named tensor, with its dtype decoded and its shape checked.
+    fn tensor(&self, name: &str, shape: &[usize]) -> Result<Tensor<'a>> {
         let view = self
             .tensors
             .tensor(name)
             .with_context(|| format!("missing tensor: {name}"))?;
-        Ok(Tensor::new(view.data(), view.shape().to_vec()))
-    }
-}
-
-fn bf16_bytes_into_f32(raw: &[u8], out: &mut [f32]) {
-    debug_assert_eq!(raw.len(), out.len() * 2);
-    for (o, b) in out.iter_mut().zip(raw.chunks_exact(2)) {
-        *o = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
+        let dtype = DType::from_safetensors(view.dtype()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "tensor {name} is stored as {:?}; only BF16, F16 and F32 checkpoints are supported",
+                view.dtype()
+            )
+        })?;
+        anyhow::ensure!(
+            view.shape() == shape,
+            "tensor {name} has shape {:?} but config.json implies {:?}",
+            view.shape(),
+            shape
+        );
+        Ok(Tensor::new(view.data(), view.shape().to_vec(), dtype))
     }
 }
 
@@ -482,6 +790,9 @@ pub struct ForwardScratch {
     scores: Vec<f32>,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    /// Per-pair rotary frequencies, scaled as the config declares. Fixed for
+    /// the model, so computed once here rather than per token.
+    rope_inv_freq: Vec<f32>,
     pub logits: Vec<f32>,
 }
 
@@ -503,6 +814,7 @@ impl ForwardScratch {
             scores: Vec::new(),
             rope_cos: vec![0.0; half],
             rope_sin: vec![0.0; half],
+            rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta, config.rope_scaling),
             logits: vec![0.0; config.vocab_size],
         }
     }
@@ -531,6 +843,7 @@ pub struct BatchScratch {
     /// positions, so they cannot share a table the way one sequence's heads do.
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    rope_inv_freq: Vec<f32>,
     scores: Vec<f32>,
     pub logits: Vec<f32>,
 }
@@ -562,6 +875,7 @@ impl BatchScratch {
             stage: vec![0.0; capacity * widest],
             rope_cos: vec![0.0; capacity * half],
             rope_sin: vec![0.0; capacity * half],
+            rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta, config.rope_scaling),
             scores: Vec::new(),
             logits: vec![0.0; capacity * config.vocab_size],
         }
@@ -583,6 +897,15 @@ impl BatchScratch {
 }
 
 impl<'a> LlamaWeights<'a> {
+    /// The embedding of `token`, decoded from the checkpoint's own dtype.
+    ///
+    /// Out-of-vocabulary ids are a panic, not a wrap-around: the engine refuses
+    /// them at submission, so one arriving here is a bug, and silently reading
+    /// `token % vocab` would turn that bug into plausible-looking output.
+    pub fn embed_into(&self, token: u32, out: &mut [f32]) {
+        self.token_embeddings.row_into(token as usize, out);
+    }
+
     /// Bytes the projection weights occupy as stored.
     pub fn weight_bytes(&self) -> usize {
         let mut total = 0;
@@ -800,18 +1123,14 @@ impl<'a> LlamaWeights<'a> {
         };
 
         // One rotary table per token, shared by every head of every layer.
-        rope_table(
+        rope_table_from(
             pos,
-            head_dim,
-            config.rope_theta,
+            &scratch.rope_inv_freq,
             &mut scratch.rope_cos,
             &mut scratch.rope_sin,
         );
 
-        let token = (token_id as usize) % config.vocab_size;
-        let embed_bytes =
-            &self.token_embeddings.raw_bytes()[token * hidden * 2..(token + 1) * hidden * 2];
-        bf16_bytes_into_f32(embed_bytes, &mut scratch.x);
+        self.embed_into(token_id, &mut scratch.x);
 
         let need = num_heads * window_len;
         if scratch.scores.len() < need {
@@ -1000,10 +1319,9 @@ impl<'a> LlamaWeights<'a> {
         let mut entries = Vec::with_capacity(batch);
         let mut widest_window = 0;
         for (b, &pos) in positions.iter().enumerate() {
-            rope_table(
+            rope_table_from(
                 pos,
-                head_dim,
-                config.rope_theta,
+                &scratch.rope_inv_freq,
                 &mut scratch.rope_cos[b * half..(b + 1) * half],
                 &mut scratch.rope_sin[b * half..(b + 1) * half],
             );
@@ -1013,10 +1331,7 @@ impl<'a> LlamaWeights<'a> {
         }
 
         for (b, &token_id) in tokens.iter().enumerate() {
-            let token = (token_id as usize) % config.vocab_size;
-            let bytes =
-                &self.token_embeddings.raw_bytes()[token * hidden * 2..(token + 1) * hidden * 2];
-            bf16_bytes_into_f32(bytes, &mut scratch.x[b * hidden..(b + 1) * hidden]);
+            self.embed_into(token_id, &mut scratch.x[b * hidden..(b + 1) * hidden]);
         }
 
         // One score lane per (sequence, head), sized to the widest window in the
