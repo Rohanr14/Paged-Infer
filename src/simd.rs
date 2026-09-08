@@ -413,10 +413,10 @@ pub mod neon {
 
         let mut i = 0;
         while i + 16 <= n {
-            for j in 0..4 {
-                let wv = vld1q_f32(pw.add(i + 4 * j));
-                for b in 0..BT {
-                    acc[b][j] = vfmaq_f32(acc[b][j], wv, vld1q_f32(px.add(b * stride + i + 4 * j)));
+            for (j, off) in [0usize, 4, 8, 12].into_iter().enumerate() {
+                let wv = vld1q_f32(pw.add(i + off));
+                for (b, acc_b) in acc.iter_mut().enumerate() {
+                    acc_b[j] = vfmaq_f32(acc_b[j], wv, vld1q_f32(px.add(b * stride + i + off)));
                 }
             }
             i += 16;
@@ -582,16 +582,20 @@ pub mod neon {
 /// Name of the kernel family that will actually run here. Reported by the
 /// benchmarks so a number is never attributed to the wrong code path.
 pub fn backend() -> &'static str {
+    // Each `cfg` block is the whole function body on its architecture, so
+    // every arm is a plain tail expression: an explicit `return` here is a
+    // `needless_return` lint error on the target where that block is last.
     #[cfg(target_arch = "x86_64")]
     {
         if x86::available() {
-            return "avx2+fma";
+            "avx2+fma"
+        } else {
+            "scalar (no avx2/fma)"
         }
-        "scalar (no avx2/fma)"
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return "neon";
+        "neon"
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -607,7 +611,7 @@ pub fn vectorized() -> bool {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return true;
+        true
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
