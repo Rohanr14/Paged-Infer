@@ -7,6 +7,7 @@ pub mod memory;
 pub mod model;
 pub mod profile;
 pub mod sampling;
+pub mod serve;
 pub mod simd;
 pub mod speculative;
 pub mod tensor;
