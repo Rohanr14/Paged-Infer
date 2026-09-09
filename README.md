@@ -54,7 +54,7 @@ zeroed. The model could not see the prompt.
 Nothing below needs model weights:
 
 ```bash
-cargo test                                        # 217 tests, incl. golden parity
+cargo test                                        # includes golden and Transformers parity
 cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
@@ -649,11 +649,14 @@ against a deliberately tight block pool:
 
 ## Correctness and testing
 
-217 tests, no model download required.
+The default suite needs no model download. A separate ignored test checks the
+full Llama 3.2 1B checkpoint against pinned Transformers logits.
 
 | suite | covers |
 |---|---|
 | `golden_parity_tests` | full forward pass vs the NumPy reference: decode, prefill, resumed prefill |
+| `transformers_reference_tests` | pinned Transformers 4.52.4 RoPE frequencies, tables and Q/K rotations through position 131071; tiny scaled-model logits; whole/resumed prefill; an unscaled negative control; opt-in real Llama 3.2 1B parity |
+| `rope_reference_tests` | independent f64 checks at both Llama 3 scaling cutoffs and inside the transition band, with head dimensions 64/128 and scaling factors 8/32 |
 | `loader_tests` | the same weights as bf16, f16 and f32 all match the reference; f64 is refused by name; shapes, layer counts and head dimensions that disagree with the config are refused before running; `config.json` parsing, including rotary scaling variants and unsupported features |
 | `prefix_cache_parity_tests` | reuse is numerically invisible; CoW isolation under the real model; a colliding suffix with a different history is *not* reused |
 | `batched_decode_tests` | batched decode and prefill are bit-identical to the paths they replace: ragged batches, block boundaries, per-sequence windows, ragged chunks, resumed prefill, causality |
@@ -674,7 +677,19 @@ weights, token ids and tokenizer must come back byte for byte, and the reference
 logits within `1e-4` — a float32 NumPy matmul rounds differently on different
 BLAS builds and CPUs, so byte identity was never a property that file could
 have, and demanding it kept that job red on every runner that differed from the
-machine the fixture was made on.
+machine the fixture was made on. Another job executes pinned Transformers on
+the existing tiny weights and checks the committed RoPE/logit fixtures, without
+downloading a real model. Configurations, source identities and inputs are
+checked exactly; numerical outputs use documented bounds.
+
+**Llama 3.2 1B, verified against an actual checkpoint.** On Apple Silicon,
+float32 CPU inference over the original BF16 weights matched all 60 reference
+greedy choices, with maximum absolute logit error `8.1e-5`. Whole and resumed
+batched prefill matched too. Disabling scaling changes reference logits by
+`0.391`, demonstrating that the comparison can detect the missing feature.
+This is a short-context end-to-end check plus separate rotary checks through
+position 131071; it does not establish full 128K-context generation parity.
+See [reference versions, tolerances, and reproduction commands](docs/llama3-reference-validation.md).
 
 ---
 
@@ -862,9 +877,10 @@ blocks.
   Decode-priority chunked prefill, with a per-step token budget, is the next
   scheduling change; the engine now reports queue wait and deferred steps so
   its effect can be measured.
-- **`llama3` rotary scaling is transcribed, not yet validated end to end.** The
-  formula follows `transformers` and is unit-tested for its shape; it has not
-  been compared against a real Llama 3 checkpoint's logits here.
+- **Long-context end-to-end parity remains unmeasured.** Llama 3.2 1B now
+  matches pinned Transformers logits on a real 60-position sequence. Rotary
+  tables and rotations are checked independently through position 131071;
+  full-context generation at that length has not been validated.
 - **Chat templates get `system`, `user` and `assistant` turns with string
   content.** Tool calls and multimodal content are refused.
 - **Sampled sequences never speculate.** Extending it there needs the

@@ -428,6 +428,110 @@ fn test_unsupported_or_malformed_rope_scaling_is_an_error_not_a_default() {
 }
 
 #[test]
+fn test_json_parameters_that_overflow_f32_are_refused() {
+    // These are valid JSON/f64 numbers; conversion to f32 must not turn them
+    // into accepted infinite RoPE or RMSNorm parameters.
+    for key in ["rope_theta", "rms_norm_eps"] {
+        let mut json = base_config_json();
+        json[key] = json!(1e300);
+        let error = parse(json).expect_err("f32 overflow must fail config validation");
+        assert!(error.to_string().contains(key), "{error:#}");
+    }
+    for representation in ["rope_scaling", "rope_parameters"] {
+        for key in ["factor", "low_freq_factor", "high_freq_factor"] {
+            let mut json = base_config_json();
+            json[representation] = json!({
+                "rope_type": "llama3",
+                "factor": 32.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            });
+            json[representation][key] = json!(1e300);
+            assert!(parse(json).is_err(), "{representation}.{key} overflow");
+        }
+        let mut json = base_config_json();
+        json[representation] = json!({"rope_type": "linear", "factor": 1e300});
+        assert!(parse(json).is_err(), "{representation} linear overflow");
+    }
+    let mut json = base_config_json();
+    json["rope_parameters"] = json!({"rope_type": "default", "rope_theta": 1e300});
+    assert!(parse(json).is_err(), "nested theta overflow");
+}
+
+#[test]
+fn test_hand_built_configs_reject_invalid_rope_and_normalization_parameters() {
+    let base = fixture().config;
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+        let theta = LlamaConfig {
+            rope_theta: invalid,
+            ..base.clone()
+        };
+        assert!(theta.validate().is_err(), "rope_theta {invalid}");
+        let eps = LlamaConfig {
+            rms_norm_eps: invalid,
+            ..base.clone()
+        };
+        assert!(eps.validate().is_err(), "rms_norm_eps {invalid}");
+
+        let variants = [
+            RopeScaling::Linear { factor: invalid },
+            RopeScaling::Llama3 {
+                factor: invalid,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_max_position_embeddings: 8192,
+            },
+            RopeScaling::Llama3 {
+                factor: 32.0,
+                low_freq_factor: invalid,
+                high_freq_factor: 4.0,
+                original_max_position_embeddings: 8192,
+            },
+            RopeScaling::Llama3 {
+                factor: 32.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: invalid,
+                original_max_position_embeddings: 8192,
+            },
+        ];
+        for rope_scaling in variants {
+            let config = LlamaConfig {
+                rope_scaling,
+                ..base.clone()
+            };
+            assert!(config.validate().is_err(), "{rope_scaling:?}");
+        }
+    }
+    for rope_scaling in [
+        RopeScaling::Llama3 {
+            factor: 0.5,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+        },
+        RopeScaling::Llama3 {
+            factor: 32.0,
+            low_freq_factor: 4.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+        },
+        RopeScaling::Llama3 {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 0,
+        },
+    ] {
+        let config = LlamaConfig {
+            rope_scaling,
+            ..base.clone()
+        };
+        assert!(config.validate().is_err(), "{rope_scaling:?}");
+    }
+}
+
+#[test]
 fn test_features_the_engine_does_not_implement_are_refused() {
     let cases: Vec<(&str, Value)> = vec![
         ("model_type", json!("qwen2")),
