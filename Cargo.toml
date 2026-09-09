@@ -34,3 +34,7 @@ serde = { version = "1", features = ["derive"] }
 # Python string methods (`.strip()`, `.title()`) that HF templates lean on.
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+[dev-dependencies]
+# Assert the numerical oracle and engine loaded the same checkpoint bytes.
+sha2 = "0.10"

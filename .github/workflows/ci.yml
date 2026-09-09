@@ -68,6 +68,31 @@ jobs:
           python3 scripts/gen_tokenizer_fixture.py
           git diff --exit-code -- tests/fixtures/
 
+  transformers-reference:
+    name: pinned Transformers reference is reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: scripts/requirements-reference.txt
+
+      # The CPU wheel avoids downloading CUDA packages. The ordinary Rust test
+      # matrix consumes the small committed fixtures on both architectures;
+      # this job checks their independent oracle, without downloading weights.
+      - name: Install pinned CPU reference
+        run: |
+          pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r scripts/requirements-reference.txt
+
+      - name: Check oracle comparison safeguards
+        run: python3 -m unittest discover -s scripts -p 'test_llama3_reference.py'
+
+      - name: Regenerate and check numerical fixtures
+        run: python3 scripts/gen_llama3_reference.py --check
+
   benchmarks:
     name: benchmarks run
     runs-on: ubuntu-latest

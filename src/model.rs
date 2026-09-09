@@ -234,10 +234,16 @@ impl LlamaConfig {
             "head_dim {} must be even for rotary embeddings",
             self.head_dim()
         );
-        anyhow::ensure!(
-            self.rms_norm_eps > 0.0 && self.rope_theta > 0.0,
-            "rms_norm_eps and rope_theta must be positive"
-        );
+        for (name, value) in [
+            ("rms_norm_eps", self.rms_norm_eps),
+            ("rope_theta", self.rope_theta),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && value > 0.0,
+                "{name} must be finite and positive, got {value}"
+            );
+        }
+        validate_rope_scaling(self.rope_scaling, "rope_scaling")?;
         anyhow::ensure!(
             self.attention_window != Some(0),
             "attention_window must be at least 1; use None for full attention"
@@ -348,12 +354,11 @@ fn parse_rope_scaling(
             .map(|v| v as f32)
             .ok_or_else(|| anyhow::anyhow!("{what} of type {kind:?} needs a numeric {key}"))
     };
-    match kind {
-        "default" => Ok(RopeScaling::None),
+    let scaling = match kind {
+        "default" => RopeScaling::None,
         "linear" => {
             let factor = number("factor")?;
-            anyhow::ensure!(factor > 0.0, "{what}.factor must be positive, got {factor}");
-            Ok(RopeScaling::Linear { factor })
+            RopeScaling::Linear { factor }
         }
         "llama3" => {
             let factor = number("factor")?;
@@ -367,26 +372,50 @@ fn parse_rope_scaling(
                         "{what} of type \"llama3\" needs an integer original_max_position_embeddings"
                     )
                 })? as usize;
-            anyhow::ensure!(
-                factor >= 1.0
-                    && low_freq_factor > 0.0
-                    && high_freq_factor > low_freq_factor
-                    && original > 0,
-                "{what} llama3 parameters are out of range: factor {factor}, low {low_freq_factor}, \
-                 high {high_freq_factor}, original {original}"
-            );
-            Ok(RopeScaling::Llama3 {
+            RopeScaling::Llama3 {
                 factor,
                 low_freq_factor,
                 high_freq_factor,
                 original_max_position_embeddings: original,
-            })
+            }
         }
         other => anyhow::bail!(
             "{what} type {other:?} is not supported (supported: default, linear, llama3); \
              running this checkpoint with default rotary tables would be a different model"
         ),
+    };
+    validate_rope_scaling(scaling, what)?;
+    Ok(scaling)
+}
+
+/// Shared by parsed and hand-built configs so neither can reach the rotary
+/// kernels with invalid parameters. A finite JSON f64 can overflow on the f32
+/// conversion; a positivity check alone would accept the resulting infinity.
+fn validate_rope_scaling(scaling: RopeScaling, what: &str) -> Result<()> {
+    match scaling {
+        RopeScaling::None => {}
+        RopeScaling::Linear { factor } => anyhow::ensure!(
+            factor.is_finite() && factor > 0.0,
+            "{what}.factor must be finite and positive, got {factor}"
+        ),
+        RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position_embeddings: original,
+        } => anyhow::ensure!(
+            factor.is_finite()
+                && factor >= 1.0
+                && low_freq_factor.is_finite()
+                && low_freq_factor > 0.0
+                && high_freq_factor.is_finite()
+                && high_freq_factor > low_freq_factor
+                && original > 0,
+            "{what} llama3 parameters must be finite and in range: factor {factor}, \
+             low {low_freq_factor}, high {high_freq_factor}, original {original}"
+        ),
     }
+    Ok(())
 }
 
 /// `eos_token_id` may be a single id, a list of them, or absent.
