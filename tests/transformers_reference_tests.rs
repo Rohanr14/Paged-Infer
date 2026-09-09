@@ -331,7 +331,7 @@ fn assert_logits(
         )
     };
     assert_eq!(
-        argmax(actual),
+        paged_infer::sampling::argmax(actual),
         argmax(expected),
         "{path} position {position}: greedy token mismatch"
     );
