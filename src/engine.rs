@@ -50,7 +50,8 @@ use crate::model::{BatchScratch, LlamaConfig, LlamaWeights};
 use crate::sampling::Sampler;
 use crate::speculative::{verify_greedy, Drafter, PromptLookupDrafter, SpecStats};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
     pub total_blocks: usize,
     pub block_size: usize,
@@ -125,7 +126,8 @@ impl Default for EngineConfig {
 }
 
 /// Per-request sampling overrides. `None` means "the engine default".
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RequestOptions {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -205,7 +207,8 @@ impl fmt::Display for SubmitError {
 
 impl std::error::Error for SubmitError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     /// The model emitted an end-of-sequence token.
     Eos,
@@ -450,6 +453,19 @@ impl<'a> Engine<'a> {
     /// Blocks not currently mapped by a sequence or held by the prefix cache.
     pub fn available_blocks(&self) -> usize {
         self.kv.available_blocks()
+    }
+
+    /// Peak simultaneously occupied physical KV blocks, including transient
+    /// allocations within a step and blocks retained by the prefix cache.
+    /// Reset and warmup clear this counter. This does not measure process RSS
+    /// or the fixed backing allocation reported by [`Self::kv_cache_bytes`].
+    pub fn peak_allocated_blocks(&self) -> usize {
+        self.kv.peak_allocated_blocks()
+    }
+
+    /// Whether generated tokens and terminal events are available as deltas.
+    pub fn is_streaming(&self) -> bool {
+        self.engine.stream_tokens
     }
 
     /// Sequences decoding right now, and requests still queued behind them.

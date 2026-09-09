@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "clock": "steps",
+  "events": [
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "three-continuations",
+      "tokens": [
+        1,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "max_tokens": 12,
+      "samples": 3,
+      "seed": 42
+    },
+    {
+      "type": "submit",
+      "at": 3,
+      "id": "two-continuations",
+      "tokens": [
+        1,
+        3,
+        4,
+        5,
+        6
+      ],
+      "max_tokens": 12,
+      "samples": 2,
+      "seed": 75
+    }
+  ]
+}

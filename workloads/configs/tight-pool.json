@@ -1,0 +1,9 @@
+{
+  "name": "tight-pool",
+  "engine": {
+    "total_blocks": 6,
+    "block_size": 4,
+    "max_batch_size": 4,
+    "prefill_chunk_size": 8
+  }
+}

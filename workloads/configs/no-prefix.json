@@ -1,0 +1,10 @@
+{
+  "name": "no-prefix",
+  "engine": {
+    "total_blocks": 64,
+    "block_size": 4,
+    "max_batch_size": 8,
+    "prefill_chunk_size": 8,
+    "enable_prefix_cache": false
+  }
+}

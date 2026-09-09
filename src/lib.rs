@@ -6,6 +6,7 @@ pub mod math;
 pub mod memory;
 pub mod model;
 pub mod profile;
+pub mod replay;
 pub mod sampling;
 pub mod serve;
 pub mod simd;

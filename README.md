@@ -59,7 +59,12 @@ cargo run --release --bin benchmark               # kernel attribution ladder
 cargo run --release --bin batch_benchmark         # batched vs sequential decode
 cargo run --release --bin prefix_cache_benchmark  # what prefix caching is worth
 cargo run --release --bin speculative_benchmark   # lossless speculative decoding
+cargo run --release --bin workload_replay -- --threads 4 --verify # timed request traces
 ```
+
+The [workload replay guide](docs/workload-replay.md) covers reproducible arrivals,
+cancellations, forks and KV pressure, with exact output comparison and JSONL
+reports of latency tails, useful completed throughput and allocation peaks.
 
 With weights:
 

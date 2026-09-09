@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "clock": "steps",
+  "events": [
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-0",
+      "tokens": [
+        1,
+        5,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 100
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-1",
+      "tokens": [
+        1,
+        6,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 101
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-2",
+      "tokens": [
+        1,
+        7,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 102
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-3",
+      "tokens": [
+        1,
+        8,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 103
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-4",
+      "tokens": [
+        1,
+        9,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 104
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-5",
+      "tokens": [
+        1,
+        10,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 105
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-6",
+      "tokens": [
+        1,
+        11,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 106
+    },
+    {
+      "type": "submit",
+      "at": 0,
+      "id": "burst-7",
+      "tokens": [
+        1,
+        12,
+        9,
+        11,
+        4
+      ],
+      "max_tokens": 16,
+      "samples": 1,
+      "seed": 107
+    }
+  ]
+}

@@ -43,6 +43,26 @@ jobs:
       - name: Report the SIMD backend actually selected
         run: cargo test --release --test simd_tests test_reports_a_backend -- --nocapture
 
+      - name: Replay fixture workloads and verify full outputs
+        run: |
+          cargo run --release --bin workload_replay -- --threads 2 --workload workloads/mixed.json --config workloads/configs/baseline.json --config workloads/configs/no-prefix.json --repeats 2 --verify --output mixed-replay.jsonl
+          cargo run --release --bin workload_replay -- --threads 2 --workload workloads/pressure.json --config workloads/configs/tight-pool.json --repeats 2 --verify --output pressure-replay.jsonl
+          cargo run --release --bin workload_replay -- --threads 2 --workload workloads/cancellation.json --repeats 2 --verify --output cancellation-replay.jsonl
+
+      # Frame padding forces transport pressure without a real-model download.
+      # The identical fully-drained stream must also complete, ruling out a
+      # serializer that cannot keep up even with a healthy client.
+      - name: Stalled-reader socket probe
+        run: cargo run --release --bin stalled_reader_probe > stalled-reader.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workload-reports-${{ matrix.os }}
+          path: |
+            *-replay.jsonl
+            stalled-reader.json
+
   golden-fixture:
     name: golden fixture is reproducible
     runs-on: ubuntu-latest
