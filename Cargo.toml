@@ -35,6 +35,9 @@ serde = { version = "1", features = ["derive"] }
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
-[dev-dependencies]
-# Assert the numerical oracle and engine loaded the same checkpoint bytes.
+# Fingerprint replay inputs and assert reference checkpoint identity.
+sha2 = "0.10"
+
+[build-dependencies]
+# Capture a deterministic source fingerprint alongside the build toolchain.
 sha2 = "0.10"

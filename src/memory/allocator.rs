@@ -18,6 +18,7 @@ pub struct BlockAllocator {
     total_blocks: usize,
     free_blocks: VecDeque<PhysicalBlock>,
     ref_counts: Vec<u32>,
+    peak_allocated_blocks: usize,
 }
 
 impl BlockAllocator {
@@ -34,6 +35,7 @@ impl BlockAllocator {
             total_blocks,
             free_blocks,
             ref_counts: vec![0; total_blocks],
+            peak_allocated_blocks: 0,
         }
     }
 
@@ -42,6 +44,7 @@ impl BlockAllocator {
         let block = self.free_blocks.pop_front()?;
         debug_assert_eq!(self.ref_counts[block.index], 0, "free block had references");
         self.ref_counts[block.index] = 1;
+        self.peak_allocated_blocks = self.peak_allocated_blocks.max(self.allocated_blocks());
         Some(block)
     }
 
@@ -97,6 +100,18 @@ impl BlockAllocator {
         self.total_blocks - self.free_blocks.len()
     }
 
+    /// Maximum simultaneously occupied physical blocks since construction or
+    /// the last reset. References shared by sequences or the prefix cache count
+    /// once. Allocation-time tracking includes blocks freed before a step ends.
+    pub fn peak_allocated_blocks(&self) -> usize {
+        self.peak_allocated_blocks
+    }
+
+    /// Start a new measurement interval, including blocks that remain occupied.
+    pub fn reset_peak_allocated_blocks(&mut self) {
+        self.peak_allocated_blocks = self.allocated_blocks();
+    }
+
     #[inline]
     fn check(&self, block: PhysicalBlock) {
         assert!(
@@ -122,6 +137,41 @@ mod tests {
 
         allocator.free(block);
         assert_eq!(allocator.available_blocks(), 100);
+    }
+
+    #[test]
+    fn test_peak_counts_physical_blocks_and_survives_reclamation() {
+        let mut allocator = BlockAllocator::new(2, 16);
+        assert_eq!(allocator.peak_allocated_blocks(), 0);
+        let first = allocator.allocate().unwrap();
+        allocator.incref(first);
+        assert_eq!(allocator.peak_allocated_blocks(), 1);
+        let second = allocator.allocate().unwrap();
+        assert_eq!(allocator.peak_allocated_blocks(), 2);
+        assert!(allocator.allocate().is_none());
+        allocator.free(first);
+        allocator.free(first);
+        allocator.free(second);
+        assert_eq!(allocator.allocated_blocks(), 0);
+        assert_eq!(allocator.peak_allocated_blocks(), 2);
+
+        allocator.reset_peak_allocated_blocks();
+        assert_eq!(allocator.peak_allocated_blocks(), 0);
+        allocator.allocate().unwrap();
+        assert_eq!(allocator.peak_allocated_blocks(), 1);
+    }
+
+    #[test]
+    fn test_peak_reset_includes_blocks_still_occupied() {
+        let mut allocator = BlockAllocator::new(3, 16);
+        let first = allocator.allocate().unwrap();
+        allocator.allocate().unwrap();
+        allocator.free(first);
+        assert_eq!(allocator.peak_allocated_blocks(), 2);
+        allocator.reset_peak_allocated_blocks();
+        assert_eq!(allocator.peak_allocated_blocks(), 1);
+        allocator.allocate().unwrap();
+        assert_eq!(allocator.peak_allocated_blocks(), 2);
     }
 
     #[test]

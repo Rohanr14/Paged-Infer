@@ -98,6 +98,11 @@ impl KvCacheManager {
         self.allocator.total_blocks()
     }
 
+    /// Maximum occupied physical blocks since construction or the last clear.
+    pub fn peak_allocated_blocks(&self) -> usize {
+        self.allocator.peak_allocated_blocks()
+    }
+
     pub fn allocator(&self) -> &BlockAllocator {
         &self.allocator
     }
@@ -142,6 +147,7 @@ impl KvCacheManager {
         self.prefix_cache.clear(&mut self.allocator);
         self.prefix_cache.reset_stats();
         self.cow_copies = 0;
+        self.allocator.reset_peak_allocated_blocks();
         debug_assert_eq!(
             self.allocator.available_blocks(),
             self.allocator.total_blocks()
