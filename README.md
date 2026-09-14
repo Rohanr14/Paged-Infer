@@ -65,6 +65,8 @@ cargo run --release --bin workload_replay -- --threads 4 --verify # timed reques
 The [workload replay guide](docs/workload-replay.md) covers reproducible arrivals,
 cancellations, forks and KV pressure, with exact output comparison and JSONL
 reports of latency tails, useful completed throughput and allocation peaks.
+The [chunked prefill guide](docs/chunked-prefill.md) describes decode priority,
+the per-step prefill allowance and a replay comparison between chunk budgets.
 
 With weights:
 
@@ -113,8 +115,10 @@ run as a different model.
 `DRAFT_TOKENS=4` turns on speculative decoding, `QUANT=int8` quantizes the
 projections, `WARMUP=0` disables the startup pass, and `KV_BLOCKS` /
 `BLOCK_SIZE` size the cache. The server's limits — `MAX_BODY_BYTES`,
-`MAX_CONNECTIONS`, `MAX_QUEUED_JOBS`, `TIMEOUT_SECS`, `MAX_TOKENS` — are
+`MAX_CONNECTIONS`, `MAX_QUEUED_JOBS`, `MAX_JOBS_PER_STEP`, `TIMEOUT_SECS`, `MAX_TOKENS` — are
 documented at the top of `src/bin/http_server.rs`.
+`PREFILL_TOKENS_PER_STEP` bounds prompt work between scheduler returns;
+`PREFILL_CHUNK_SIZE` independently controls the model's matrix batch size.
 
 ---
 
@@ -123,7 +127,7 @@ documented at the top of `src/bin/http_server.rs`.
 ```
                     ┌───────────────────────────────────────────┐
    request ────────►│  Engine::step()                           │
-                    │    admit → prefill → decode → reclaim     │
+                    │    decode → reclaim → bounded prefill     │
                     └───────────┬───────────────────────────────┘
                                 │
                     ┌───────────▼───────────────────────────────┐
@@ -815,10 +819,11 @@ blocks.
   the checkpoint's Jinja2 template and tokenized as `apply_chat_template` does.
   A checkpoint without a template refuses chat requests rather than
   approximating a format.
-- **Streaming.** `"stream": true` returns OpenAI-shaped server-sent events, one
-  chunk per scheduler step. A speculative step that had four drafts accepted
-  emits four tokens in one chunk — they really are all available at that
-  instant. Detokenization is incremental but not per-token: a BPE token can
+- **Streaming.** `"stream": true` returns OpenAI-shaped server-sent events.
+  Each sequence's output is delivered when a step emits tokens; steps that only
+  advance prefill emit none. A speculative batch contains accepted drafts plus
+  the model's next token, unless a stop condition ends it sooner.
+  Detokenization is incremental but not per-token: a BPE token can
   carry a fragment of a UTF-8 character, so the whole prefix is decoded each
   time, only the newly-appeared *stable* text is sent, and a trailing run of
   replacement characters — the first bytes of an emoji — is held until the
@@ -839,14 +844,19 @@ blocks.
 - **Health that means something.** `/health` is 200 only while the engine
   thread is alive and ready; a stream whose engine disappears carries an error
   event instead of going silent.
-- **Warm-up.** `Engine::warm_up()` runs one throwaway prefill before the
-  listener opens, so the rayon pool, the scratch arenas and the checkpoint's
+- **Warm-up.** `Engine::warm_up()` runs one throwaway prefill on the engine
+  thread before readiness becomes true, so the rayon pool, the scratch arenas and the checkpoint's
   pages are all touched by something other than the first real request. It then
   returns the cache and every counter to its initial state — `tests/streaming_tests.rs`
   asserts a warmed engine is indistinguishable from a fresh one. `WARMUP=0`
   disables it, which is how you measure what it was worth.
 - **Metrics.** `/metrics` speaks Prometheus text format (counters carry
   `_total`, so `rate()` works); `/stats` returns the same numbers as JSON.
+- **Decode priority.** Existing sequences decode before each bounded prefill
+  slice. One unfinished prompt retains its progress across steps; new arrivals
+  wait behind it. Mandatory decode can reclaim its mapping under KV pressure.
+  HTTP intake also has a per-step cap, including rejected and cancelled jobs.
+  See [chunked prefill](docs/chunked-prefill.md) for controls and counters.
 
 ## Honest limitations
 
@@ -877,11 +887,10 @@ blocks.
 - **Only streaming clients can be cancelled.** Disconnection is detected on a
   failed chunk write, and a buffered request writes nothing until it is
   finished, so there is no write to fail on.
-- **Prefill is not chunked across steps.** A long prompt's prefill runs to
-  completion inside one `step()`, so sequences already decoding wait for it.
-  Decode-priority chunked prefill, with a per-step token budget, is the next
-  scheduling change; the engine now reports queue wait and deferred steps so
-  its effect can be measured.
+- **The prefill allowance bounds tokens, not elapsed time.** A scheduler step
+  still finishes its decode work and prefill slice before returning. One long
+  prompt can also keep shorter waiting prompts behind it; retained prefill is
+  FIFO. KV pressure may discard its progress and require recomputation.
 - **Long-context end-to-end parity remains unmeasured.** Llama 3.2 1B now
   matches pinned Transformers logits on a real 60-position sequence. Rotary
   tables and rotations are checked independently through position 131071;
@@ -898,7 +907,7 @@ blocks.
 
 ```
 src/
-  engine.rs          scheduler: admit → prefill → decode → reclaim; defer/preempt
+  engine.rs          scheduler: decode priority, resumable prefill, defer/preempt
   model.rs           Llama forward pass, config parsing, dtype-checked loading
   tensor.rs          checkpoint tensors with their dtype
   profile.rs         the checkpoint's BOS/EOS, context window, chat template

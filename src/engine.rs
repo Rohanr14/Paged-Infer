@@ -1,9 +1,9 @@
 //! The serving loop: iteration-level scheduling over a paged KV cache.
 //!
-//! One `step()` admits whatever fits, prefills it, advances every live sequence
-//! by one token, and reclaims what finished — so a request that completes frees
-//! its blocks for the next admission immediately, rather than at the end of some
-//! fixed batch. That is what continuous batching means in practice.
+//! One `step()` advances existing decoders, reclaims finished allocations, then
+//! performs a bounded amount of prefill. A retained FIFO prompt cursor lets the
+//! caller deliver tokens and handle cancellation between prompt slices. Requests
+//! whose prefill completes begin ordinary decode on the following step.
 //!
 //! Deliberately independent of tokenization: the scheduler works on token ids,
 //! and text is a thin convenience layer on top. That keeps the whole engine
@@ -86,6 +86,11 @@ pub struct EngineConfig {
     /// trade as `max_batch_size`, along the position axis instead of the
     /// sequence axis.
     pub prefill_chunk_size: usize,
+    /// Maximum prompt positions computed across all requests in one step.
+    /// Existing decoders run first and do not spend this allowance. This is a
+    /// prefill work bound, not a bound on total decode work or elapsed time.
+    /// Separate from `prefill_chunk_size`, which controls matrix batching.
+    pub max_prefill_tokens_per_step: usize,
     /// Draft tokens to propose per step. `0` disables speculative decoding.
     ///
     /// Only greedy sequences speculate: acceptance is defined as "the model
@@ -119,6 +124,7 @@ impl Default for EngineConfig {
             enable_prefix_cache: true,
             max_batch_size: 32,
             prefill_chunk_size: 32,
+            max_prefill_tokens_per_step: 32,
             draft_tokens: 0,
             stream_tokens: false,
         }
@@ -252,9 +258,11 @@ pub struct Completion {
     /// Submission through to the first sampled token: what the client waited,
     /// queueing included. Admission-to-first-token alone flattered a saturated
     /// engine, where most of the wait is the queue.
+    /// If `tokens` is empty (for example, cancellation during prefill), no first
+    /// token exists: this stores the admission wait and is not a TTFT sample.
     pub time_to_first_token: Duration,
     /// Submission through to admission — the part of `time_to_first_token`
-    /// spent waiting for memory rather than computing.
+    /// spent waiting for initial admission, including memory and FIFO delays.
     pub queue_time: Duration,
 }
 
@@ -262,9 +270,19 @@ pub struct Completion {
 pub struct RunStats {
     pub requests: usize,
     pub prompt_tokens: usize,
-    /// Prompt tokens that went through the model. The gap against
-    /// `prompt_tokens` is what the prefix cache saved.
+    /// Actual fresh-request prompt positions processed, including retries of
+    /// discarded partial prefills. May exceed `prompt_tokens`; unfinished or
+    /// cancelled suffixes have not been processed. Cache reuse is explicit.
     pub prompt_tokens_prefilled: usize,
+    /// Positions actually skipped via prefix reuse on each fresh request's
+    /// initial admission. Uncomputed/cancelled suffixes are never cache hits.
+    pub prompt_tokens_reused: usize,
+    /// Unfinished prompt mappings discarded to make mandatory decode writable.
+    pub prefill_preemptions: usize,
+    /// Scheduler slices processed, including resumption and retries.
+    pub prefill_chunks: usize,
+    /// Actual prefill positions computed in the most recent engine step.
+    pub last_prefill_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_time: Duration,
     pub decode_time: Duration,
@@ -272,9 +290,10 @@ pub struct RunStats {
     /// Sequences that gave their blocks up under memory pressure and were
     /// queued to be recomputed.
     pub preemptions: usize,
-    /// Tokens re-prefilled to resume preempted sequences. The price of
-    /// preemption, kept separate from `prompt_tokens_prefilled` so the prefix
-    /// cache's savings are not misread.
+    /// Inputs processed for resumed decoding sequences, plus repeated positions
+    /// after partial-prefill eviction. The latter overlap with
+    /// `prompt_tokens_prefilled`; these counters must not be summed as disjoint
+    /// populations.
     pub recomputed_tokens: usize,
     /// Sequence-steps that sat out because their next KV write had no block.
     pub deferred_steps: usize,
@@ -282,7 +301,7 @@ pub struct RunStats {
 
 impl RunStats {
     pub fn prompt_tokens_reused(&self) -> usize {
-        self.prompt_tokens - self.prompt_tokens_prefilled
+        self.prompt_tokens_reused
     }
 
     pub fn decode_tokens_per_second(&self) -> f64 {
@@ -315,6 +334,23 @@ struct Request {
     /// then the sequence's prompt *and* everything it generated, and the
     /// prefill recomputes the KV the sequence gave up.
     resume: Option<Preempted>,
+    /// Assigned once on first admission, before prefill can yield. Retained
+    /// across partial-prefill eviction so default RNG streams and sample IDs
+    /// do not change when memory pressure changes the schedule.
+    sequence_ids: Vec<usize>,
+    admitted_at: Option<Instant>,
+    /// Furthest prompt position previously computed (or borrowed from cache).
+    /// Reprocessing earlier positions after eviction is counted as recompute.
+    prefill_high_water: usize,
+}
+
+/// One prompt owns the FIFO prefill lane until completion or cancellation.
+/// All its blocks are mapped up front, but new hashes are published only once
+/// every layer's KV for the entire prompt is complete.
+struct Prefilling {
+    request: Request,
+    block_table: BlockTable,
+    cursor: usize,
 }
 
 struct Sequence {
@@ -383,6 +419,7 @@ pub struct Engine<'a> {
     batch_scratch: BatchScratch,
     tokenizer: Option<Tokenizer>,
     waiting: VecDeque<Request>,
+    prefilling: Option<Prefilling>,
     active: Vec<Sequence>,
     completed: Vec<Completion>,
     deltas: Vec<TokenDelta>,
@@ -397,6 +434,10 @@ impl<'a> Engine<'a> {
     pub fn new(weights: LlamaWeights<'a>, config: LlamaConfig, engine: EngineConfig) -> Self {
         assert!(engine.block_size > 0, "block_size must be at least 1");
         assert!(engine.total_blocks > 0, "total_blocks must be at least 1");
+        assert!(
+            engine.max_prefill_tokens_per_step > 0,
+            "prefill token budget must be at least 1"
+        );
         let layout = config.kv_layout(engine.total_blocks, engine.block_size);
         let kv_cache = vec![0.0; layout.total_floats()];
         let kv = KvCacheManager::new(engine.total_blocks, engine.block_size)
@@ -414,6 +455,7 @@ impl<'a> Engine<'a> {
             batch_scratch,
             tokenizer: None,
             waiting: VecDeque::new(),
+            prefilling: None,
             active: Vec::new(),
             completed: Vec::new(),
             deltas: Vec::new(),
@@ -470,7 +512,20 @@ impl<'a> Engine<'a> {
 
     /// Sequences decoding right now, and requests still queued behind them.
     pub fn queue_depth(&self) -> (usize, usize) {
-        (self.active.len(), self.waiting.len())
+        (
+            self.active.len(),
+            self.waiting.len() + self.prefilling_requests(),
+        )
+    }
+
+    pub fn prefilling_requests(&self) -> usize {
+        usize::from(self.prefilling.is_some())
+    }
+
+    pub fn pending_prefill_tokens(&self) -> usize {
+        self.prefilling
+            .as_ref()
+            .map_or(0, |p| p.request.tokens.len() - p.cursor)
     }
 
     /// Sequences that sat the last step out waiting for a KV block.
@@ -502,33 +557,20 @@ impl<'a> Engine<'a> {
         for req in std::mem::take(&mut self.waiting) {
             if req.id != request_id {
                 kept.push_back(req);
-                continue;
-            }
-            stopped += 1;
-            // A preempted sequence waiting to resume had already produced
-            // output, and a client may already be streaming it.
-            if let Some(p) = req.resume {
-                self.record_delta(
-                    req.id,
-                    p.sequence_id,
-                    Vec::new(),
-                    Some(FinishReason::Cancelled),
-                );
-                let admitted_at = p.admitted_at;
-                let first = p.first_token_at.unwrap_or(admitted_at);
-                self.completed.push(Completion {
-                    request_id: req.id,
-                    sequence_id: p.sequence_id,
-                    prompt_tokens: p.prompt_len,
-                    tokens: p.generated,
-                    finish_reason: FinishReason::Cancelled,
-                    time_to_first_token: first.duration_since(req.submitted_at),
-                    queue_time: admitted_at.duration_since(req.submitted_at),
-                });
+            } else {
+                stopped += self.cancel_unfinished_prefill(req);
             }
         }
         self.waiting = kept;
-
+        if self
+            .prefilling
+            .as_ref()
+            .is_some_and(|p| p.request.id == request_id)
+        {
+            let prefill = self.prefilling.take().expect("matching prefill");
+            self.kv.release_sequence(prefill.request.sequence_ids[0]);
+            stopped += self.cancel_unfinished_prefill(prefill.request);
+        }
         for idx in 0..self.active.len() {
             let seq = &self.active[idx];
             if seq.request_id == request_id && seq.finished.is_none() && !seq.preempted {
@@ -540,12 +582,59 @@ impl<'a> Engine<'a> {
         stopped
     }
 
+    /// Never-admitted requests retain the original request-level cancellation
+    /// contract. Once admitted, every reserved sample gets one terminal event,
+    /// even if prefill has not yet produced its first token.
+    fn cancel_unfinished_prefill(&mut self, req: Request) -> usize {
+        if let Some(p) = req.resume {
+            self.record_delta(
+                req.id,
+                p.sequence_id,
+                Vec::new(),
+                Some(FinishReason::Cancelled),
+            );
+            self.completed.push(Completion {
+                request_id: req.id,
+                sequence_id: p.sequence_id,
+                prompt_tokens: p.prompt_len,
+                tokens: p.generated,
+                finish_reason: FinishReason::Cancelled,
+                time_to_first_token: p
+                    .first_token_at
+                    .unwrap_or(p.admitted_at)
+                    .duration_since(req.submitted_at),
+                queue_time: p.admitted_at.duration_since(req.submitted_at),
+            });
+            return 1;
+        }
+        let Some(admitted_at) = req.admitted_at else {
+            return 1;
+        };
+        for &sid in &req.sequence_ids {
+            self.record_delta(req.id, sid, Vec::new(), Some(FinishReason::Cancelled));
+            self.completed.push(Completion {
+                request_id: req.id,
+                sequence_id: sid,
+                prompt_tokens: req.tokens.len(),
+                tokens: Vec::new(),
+                finish_reason: FinishReason::Cancelled,
+                // No sampled token exists. Consumers must check tokens before
+                // reporting TTFT (the replay driver does so).
+                time_to_first_token: admitted_at.duration_since(req.submitted_at),
+                queue_time: admitted_at.duration_since(req.submitted_at),
+            });
+        }
+        req.sequence_ids.len()
+    }
+
     pub fn spec_stats(&self) -> SpecStats {
         self.spec
     }
 
-    /// Change how many tokens are drafted per step. Takes effect for requests
-    /// admitted after this call.
+    /// Change the depth used by active drafters. A fresh greedy sequence gets
+    /// a drafter when its prefill completes if this depth is nonzero; changing
+    /// it later does not add a drafter to an existing non-speculating sequence.
+    /// Resumed sequences retain their original drafter.
     pub fn set_draft_tokens(&mut self, draft_tokens: usize) {
         self.engine.draft_tokens = draft_tokens;
     }
@@ -556,6 +645,7 @@ impl<'a> Engine<'a> {
     /// reload a multi-gigabyte checkpoint between them.
     pub fn reset(&mut self) {
         self.waiting.clear();
+        self.prefilling = None;
         self.active.clear();
         self.completed.clear();
         self.deltas.clear();
@@ -657,6 +747,9 @@ impl<'a> Engine<'a> {
             options,
             submitted_at: Instant::now(),
             resume: None,
+            sequence_ids: Vec::new(),
+            admitted_at: None,
+            prefill_high_water: 0,
         });
         Ok(id)
     }
@@ -745,7 +838,7 @@ impl<'a> Engine<'a> {
 
     /// True while anything is queued or running.
     pub fn has_work(&self) -> bool {
-        !self.waiting.is_empty() || !self.active.is_empty()
+        !self.waiting.is_empty() || self.prefilling.is_some() || !self.active.is_empty()
     }
 
     /// Take the completions finished since the last call.
@@ -808,9 +901,13 @@ impl<'a> Engine<'a> {
     pub fn run(&mut self) -> Result<Vec<Completion>> {
         while self.has_work() {
             let waiting_before = self.waiting.len();
-            let was_idle = self.active.is_empty();
+            let was_idle = self.active.is_empty() && self.prefilling.is_none();
             self.step()?;
-            if was_idle && self.active.is_empty() && self.waiting.len() == waiting_before {
+            if was_idle
+                && self.active.is_empty()
+                && self.prefilling.is_none()
+                && self.waiting.len() == waiting_before
+            {
                 // Nothing was running, nothing finished, and the head of the
                 // queue still was not admitted. Submission refuses anything the
                 // empty pool cannot hold, so this is an invariant failure, not a
@@ -827,11 +924,14 @@ impl<'a> Engine<'a> {
         Ok(std::mem::take(&mut self.completed))
     }
 
-    /// Admit, decode one token per live sequence, reclaim.
+    /// Decode existing sequences, reclaim, then spend the bounded prefill
+    /// allowance. Token delivery and cancellation can run between these calls.
     pub fn step(&mut self) -> Result<()> {
         self.tick += 1;
-        self.admit();
+        self.stats.last_prefill_tokens = 0;
         self.decode();
+        self.reclaim();
+        self.advance_prefill();
         self.reclaim();
         self.stats.steps += 1;
         Ok(())
@@ -889,165 +989,223 @@ impl<'a> Engine<'a> {
 
     // ── admission and prefill ────────────────────────────────────────────────
 
-    fn admit(&mut self) {
-        let mut reserved = self.next_step_reserve();
-        while let Some(req) = self.waiting.front() {
-            let seq_id = match &req.resume {
-                Some(p) => p.sequence_id,
-                None => self.next_sequence_id,
-            };
-            let budget = req.max_tokens - req.resume.as_ref().map_or(0, |p| p.generated.len());
-            let growth = self.first_step_growth(req.tokens.len(), req.num_samples, budget);
-            let Some(admission) =
-                self.kv
-                    .admit_with_headroom(seq_id, &req.tokens, self.tick, reserved + growth)
-            else {
-                // Out of memory even after reclaiming cold cache blocks. Wait
-                // for a live sequence to retire.
-                break;
-            };
-            reserved += growth;
-            let req = self.waiting.pop_front().expect("front was just checked");
-            if req.resume.is_none() {
-                self.next_sequence_id += 1;
+    /// Admit only the head request. A partial prompt keeps the lane across
+    /// iterations; newer arrivals cannot continually overtake it.
+    fn start_prefill(&mut self) -> bool {
+        let Some(req) = self.waiting.front() else {
+            return false;
+        };
+        let seq_id = req
+            .sequence_ids
+            .first()
+            .copied()
+            .or_else(|| req.resume.as_ref().map(|p| p.sequence_id))
+            .unwrap_or(self.next_sequence_id);
+        let budget = req.max_tokens - req.resume.as_ref().map_or(0, |p| p.generated.len());
+        let growth = self.first_step_growth(req.tokens.len(), req.num_samples, budget);
+        let reserved = self.next_step_reserve();
+        let Some(admission) =
+            self.kv
+                .admit_with_headroom(seq_id, &req.tokens, self.tick, reserved + growth)
+        else {
+            return false;
+        };
+        let mut req = self.waiting.pop_front().expect("front was checked");
+        let cursor = admission.cached_tokens.min(req.tokens.len() - 1);
+        if req.sequence_ids.is_empty() {
+            if let Some(p) = &req.resume {
+                req.sequence_ids.push(p.sequence_id);
+            } else {
+                req.sequence_ids =
+                    (self.next_sequence_id..self.next_sequence_id + req.num_samples).collect();
+                self.next_sequence_id += req.num_samples;
             }
-            let vocab = self.config.vocab_size;
-            let admitted_at = Instant::now();
+        }
+        if req.admitted_at.is_none() {
+            req.admitted_at = Some(Instant::now());
+            if req.resume.is_none() {
+                self.stats.requests += 1;
+                self.stats.prompt_tokens += req.tokens.len();
+                self.stats.prompt_tokens_reused += cursor;
+            }
+        }
+        req.prefill_high_water = req.prefill_high_water.max(cursor);
+        self.prefilling = Some(Prefilling {
+            request: req,
+            block_table: admission.block_table,
+            cursor,
+        });
+        true
+    }
 
-            // Replay only what the cache did not cover. If the whole prompt was
-            // cached we still need logits, so the last token is recomputed --
-            // its KV is rewritten with identical values.
-            let resume_at = admission.cached_tokens.min(req.tokens.len() - 1);
-            let t0 = Instant::now();
-            self.weights.prefill_batched(
-                &req.tokens[resume_at..],
-                resume_at,
+    fn advance_prefill(&mut self) {
+        let mut remaining = self.engine.max_prefill_tokens_per_step;
+        while remaining > 0 {
+            if self.prefilling.is_none() && !self.start_prefill() {
+                break;
+            }
+            let mut prefill = self.prefilling.take().expect("prefill present");
+            let end = prefill
+                .cursor
+                .saturating_add(remaining)
+                .min(prefill.request.tokens.len());
+            let count = end - prefill.cursor;
+            let complete = end == prefill.request.tokens.len();
+            let started = Instant::now();
+            self.weights.prefill_range(
+                &prefill.request.tokens[prefill.cursor..end],
+                prefill.cursor,
                 &self.config,
-                &admission.block_table,
+                &prefill.block_table,
                 &mut self.kv_cache,
                 self.engine.block_size,
                 self.engine.prefill_chunk_size,
                 &mut self.batch_scratch,
+                complete,
             );
-            self.stats.prefill_time += t0.elapsed();
-            if req.resume.is_some() {
-                self.stats.recomputed_tokens += req.tokens.len() - resume_at;
+            self.stats.prefill_time += started.elapsed();
+            self.stats.prefill_chunks += 1;
+            self.stats.last_prefill_tokens += count;
+            if prefill.request.resume.is_some() {
+                self.stats.recomputed_tokens += count;
             } else {
-                self.stats.requests += 1;
-                self.stats.prompt_tokens += req.tokens.len();
-                self.stats.prompt_tokens_prefilled += req.tokens.len() - resume_at;
+                self.stats.prompt_tokens_prefilled += count;
+                self.stats.recomputed_tokens += end
+                    .min(prefill.request.prefill_high_water)
+                    .saturating_sub(prefill.cursor);
             }
-
-            // The prompt's blocks now hold real KV state; offer them up.
-            self.kv.publish_prompt_blocks(&admission.block_table);
-
-            // Extra samples map the parent's blocks rather than re-prefilling.
-            // Nothing is copied here — divergence is paid for lazily, per block.
-            let mut tables = vec![(seq_id, admission.block_table)];
-            for _ in 1..req.num_samples {
-                let child = self.next_sequence_id;
-                self.next_sequence_id += 1;
-                let table = self.kv.fork(&tables[0].1, child, self.tick);
-                tables.push((child, table));
+            prefill.request.prefill_high_water = prefill.request.prefill_high_water.max(end);
+            prefill.cursor = end;
+            remaining -= count;
+            if complete {
+                // Sample immediately: any later model call reuses the logits
+                // scratch. Publication happens only after ALL prompt KV is valid.
+                self.finish_prefill(prefill);
+                self.reclaim();
+            } else {
+                self.prefilling = Some(prefill);
             }
+        }
+    }
 
-            let Request {
-                id: request_id,
-                tokens: prompt,
-                max_tokens,
-                num_samples,
-                options,
-                submitted_at,
-                resume,
-            } = req;
+    /// Decode gets first claim on memory as well as execution. A partial
+    /// prompt is unpublished and can be replayed later without changing output.
+    fn evict_prefill(&mut self) -> bool {
+        let Some(prefill) = self.prefilling.take() else {
+            return false;
+        };
+        self.kv.release_sequence(prefill.request.sequence_ids[0]);
+        self.stats.prefill_preemptions += 1;
+        self.waiting.push_front(prefill.request);
+        true
+    }
 
-            match resume {
-                Some(p) => {
-                    // Continue where it left off: its held token was replayed
-                    // as the tail of the prompt, and its sampler picks up its
-                    // own stream.
-                    debug_assert_eq!(tables.len(), 1, "a resumed sequence has no siblings");
-                    let (sid, table) = tables.pop().expect("one table");
-                    let mut sampler = p.sampler;
-                    let next = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
+    fn finish_prefill(&mut self, prefill: Prefilling) {
+        let req = prefill.request;
+        let admitted_at = req.admitted_at.expect("admission timestamp retained");
+        let vocab = self.config.vocab_size;
+        self.kv.publish_prompt_blocks(&prefill.block_table);
+        let mut tables = vec![(req.sequence_ids[0], prefill.block_table)];
+        for &child in &req.sequence_ids[1..] {
+            let table = self.kv.fork(&tables[0].1, child, self.tick);
+            tables.push((child, table));
+        }
+        let Request {
+            id: request_id,
+            tokens: prompt,
+            max_tokens,
+            num_samples,
+            options,
+            submitted_at,
+            resume,
+            ..
+        } = req;
+
+        match resume {
+            Some(p) => {
+                // Continue where it left off: its held token was replayed
+                // as the tail of the prompt, and its sampler picks up its
+                // own stream.
+                debug_assert_eq!(tables.len(), 1, "a resumed sequence has no siblings");
+                let (sid, table) = tables.pop().expect("one table");
+                let mut sampler = p.sampler;
+                let next = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
+                self.stats.generated_tokens += 1;
+                let mut generated = p.generated;
+                generated.push(next);
+                let mut token_ids = prompt;
+                token_ids.push(next);
+                let finished = stop_reason(
+                    self.engine.eos_token,
+                    &self.engine.extra_eos_tokens,
+                    self.engine.max_context,
+                    next,
+                    generated.len(),
+                    max_tokens,
+                    token_ids.len(),
+                );
+                self.active.push(Sequence {
+                    id: sid,
+                    request_id,
+                    prompt_len: p.prompt_len,
+                    token_ids,
+                    generated,
+                    max_tokens,
+                    block_table: table,
+                    finished,
+                    sampler,
+                    submitted_at,
+                    admitted_at: p.admitted_at,
+                    first_token_at: p.first_token_at,
+                    drafter: p.drafter,
+                    deferred: false,
+                    preempted: false,
+                });
+                self.record_delta(request_id, sid, vec![next], finished);
+            }
+            None => {
+                for (i, (sid, table)) in tables.into_iter().enumerate() {
+                    let (mut sampler, greedy) = self.sampler_for(&options, num_samples, sid, i);
+                    let first = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
                     self.stats.generated_tokens += 1;
-                    let mut generated = p.generated;
-                    generated.push(next);
-                    let mut token_ids = prompt;
-                    token_ids.push(next);
+
+                    let mut token_ids = prompt.clone();
+                    token_ids.push(first);
                     let finished = stop_reason(
                         self.engine.eos_token,
                         &self.engine.extra_eos_tokens,
                         self.engine.max_context,
-                        next,
-                        generated.len(),
+                        first,
+                        1,
                         max_tokens,
                         token_ids.len(),
                     );
+                    let first_token_at = Some(Instant::now());
+
                     self.active.push(Sequence {
                         id: sid,
                         request_id,
-                        prompt_len: p.prompt_len,
+                        prompt_len: prompt.len(),
                         token_ids,
-                        generated,
+                        generated: vec![first],
                         max_tokens,
                         block_table: table,
                         finished,
                         sampler,
                         submitted_at,
-                        admitted_at: p.admitted_at,
-                        first_token_at: p.first_token_at,
-                        drafter: p.drafter,
+                        admitted_at,
+                        first_token_at,
+                        // Speculation is only sound under greedy; see
+                        // EngineConfig.
+                        drafter: (self.engine.draft_tokens > 0 && greedy)
+                            .then(|| Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>),
                         deferred: false,
                         preempted: false,
                     });
-                    self.record_delta(request_id, sid, vec![next], finished);
-                }
-                None => {
-                    for (i, (sid, table)) in tables.into_iter().enumerate() {
-                        let (mut sampler, greedy) = self.sampler_for(&options, num_samples, sid, i);
-                        let first = sampler.sample(self.batch_scratch.logits_for_mut(0, vocab));
-                        self.stats.generated_tokens += 1;
-
-                        let mut token_ids = prompt.clone();
-                        token_ids.push(first);
-                        let finished = stop_reason(
-                            self.engine.eos_token,
-                            &self.engine.extra_eos_tokens,
-                            self.engine.max_context,
-                            first,
-                            1,
-                            max_tokens,
-                            token_ids.len(),
-                        );
-                        let first_token_at = Some(Instant::now());
-
-                        self.active.push(Sequence {
-                            id: sid,
-                            request_id,
-                            prompt_len: prompt.len(),
-                            token_ids,
-                            generated: vec![first],
-                            max_tokens,
-                            block_table: table,
-                            finished,
-                            sampler,
-                            submitted_at,
-                            admitted_at,
-                            first_token_at,
-                            // Speculation is only sound under greedy; see
-                            // EngineConfig.
-                            drafter: (self.engine.draft_tokens > 0 && greedy).then(|| {
-                                Box::new(PromptLookupDrafter::default()) as Box<dyn Drafter>
-                            }),
-                            deferred: false,
-                            preempted: false,
-                        });
-                        // The token sampled off the prefill logits is a real
-                        // emission — it is the one a streaming client is
-                        // waiting on.
-                        self.record_delta(request_id, sid, vec![first], finished);
-                    }
+                    // The token sampled off the prefill logits is a real
+                    // emission — it is the one a streaming client is
+                    // waiting on.
+                    self.record_delta(request_id, sid, vec![first], finished);
                 }
             }
         }
@@ -1122,7 +1280,8 @@ impl<'a> Engine<'a> {
             if self.active[idx].finished.is_some() || self.active[idx].preempted {
                 continue;
             }
-            if self.secure_held_token(idx) {
+            if self.secure_held_token(idx) || (self.evict_prefill() && self.secure_held_token(idx))
+            {
                 runnable.push(idx);
             } else {
                 deferred.push(idx);
@@ -1477,6 +1636,9 @@ impl<'a> Engine<'a> {
             num_samples: 1,
             options: RequestOptions::default(),
             submitted_at,
+            sequence_ids: vec![id],
+            admitted_at: Some(admitted_at),
+            prefill_high_water: 0,
             resume: Some(Preempted {
                 sequence_id: id,
                 prompt_len,

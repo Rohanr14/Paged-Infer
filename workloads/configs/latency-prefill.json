@@ -1,0 +1,12 @@
+{
+  "name": "latency",
+  "engine": {
+    "total_blocks": 128,
+    "block_size": 8,
+    "max_batch_size": 8,
+    "prefill_chunk_size": 32,
+    "eos_token": 0,
+    "extra_eos_tokens": [],
+    "enable_prefix_cache": false
+  }
+}

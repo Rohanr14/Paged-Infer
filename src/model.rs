@@ -1574,6 +1574,35 @@ impl<'a> LlamaWeights<'a> {
         chunk_size: usize,
         scratch: &mut BatchScratch,
     ) {
+        self.prefill_range(
+            tokens,
+            start_pos,
+            config,
+            block_table,
+            kv_cache,
+            block_size,
+            chunk_size,
+            scratch,
+            true,
+        );
+    }
+
+    /// Consume a resumable prompt range. Every layer's KV is durable on return;
+    /// scratch may be reused for another request before the next range. Only
+    /// the final range needs the vocabulary projection and usable logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_range(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        config: &LlamaConfig,
+        block_table: &BlockTable,
+        kv_cache: &mut [f32],
+        block_size: usize,
+        chunk_size: usize,
+        scratch: &mut BatchScratch,
+        produce_logits: bool,
+    ) {
         assert!(!tokens.is_empty(), "prefill needs at least one token");
         let hidden = config.hidden_size;
         let chunk_size = chunk_size.clamp(1, scratch.capacity());
@@ -1588,6 +1617,10 @@ impl<'a> LlamaWeights<'a> {
                 chunk, &positions, &tables, config, kv_cache, block_size, scratch,
             );
             last_hidden_at = chunk.len() - 1;
+        }
+
+        if !produce_logits {
+            return;
         }
 
         // Only the last position needs logits. The LM head is `vocab_size x
