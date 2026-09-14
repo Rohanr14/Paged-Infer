@@ -101,6 +101,12 @@ Bundled scenarios:
 | `cancellation.json` | Cancellation before admission and during generation |
 | `pressure.json` | Forks and a waiting request under a constrained KV pool |
 | `wallclock.json` | Millisecond arrivals plus a timed cancellation |
+| `tinyllama-long-prefill.json` | TinyLlama-tokenized 11-token stream prompt followed by a 256-token prompt; requires the real TinyLlama checkpoint |
+
+Use the last trace with `workloads/configs/latency-prefill.json`. That configuration
+overrides EOS to ID 0 to keep the test streams running for their output budgets;
+it is a controlled latency experiment, not production stopping behavior. The
+[chunked prefill guide](chunked-prefill.md) records its inputs and measured tradeoffs.
 
 ```bash
 cargo run --release --bin workload_replay -- \
@@ -168,8 +174,8 @@ A delivery is the token batch observable when the driver drains after a step or
 cancellation. Tokens within one delivery share a timestamp, so observed
 inter-token latency has zero gaps within that batch. It does not estimate
 hidden per-token production times. `inter_delivery_ms` contains only gaps
-between nonempty deliveries. This distinction matters for speculative decoding
-and a prefill plus decode in the same step.
+between nonempty deliveries. This distinction matters for speculative decoding,
+which can emit several tokens in one step.
 
 `kv_reserved_bytes` is the preallocated KV buffer. `peak_allocated_blocks` and
 `peak_occupied_kv_bytes` track the allocator's exact high water, including blocks

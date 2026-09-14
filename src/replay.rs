@@ -249,10 +249,19 @@ pub struct EngineCounters {
     pub admitted_requests: usize,
     pub prompt_tokens: usize,
     pub prompt_tokens_prefilled: usize,
+    /// Explicit cache skips; unfinished/cancelled positions are not reuse.
+    #[serde(default)]
+    pub prompt_tokens_reused: usize,
     pub generated_tokens: usize,
     pub prefill_ms: f64,
     pub decode_ms: f64,
     pub preemptions: usize,
+    #[serde(default)]
+    pub prefill_preemptions: usize,
+    #[serde(default)]
+    pub prefill_chunks: usize,
+    #[serde(default)]
+    pub last_prefill_tokens: usize,
     pub recomputed_tokens: usize,
     pub deferred_steps: usize,
     pub prefix_hits: u64,
@@ -261,6 +270,10 @@ pub struct EngineCounters {
     pub cow_copies: u64,
     pub max_observed_active_sequences: usize,
     pub max_observed_queued_requests: usize,
+    #[serde(default)]
+    pub max_observed_prefilling_requests: usize,
+    #[serde(default)]
+    pub max_observed_pending_prefill_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +489,8 @@ pub fn run(
     let mut executed_steps = 0;
     let mut max_active = 0;
     let mut max_queued = 0;
+    let mut max_prefilling = 0;
+    let mut max_pending_prefill_tokens = 0;
     let start = Instant::now();
     while event_index < workload.events.len() || engine.has_work() {
         ensure!(
@@ -553,15 +568,16 @@ pub fn run(
                             req.engine_id
                                 .context("accepted request missing engine id")?,
                         );
-                        // A never-admitted request has no sequence ID or streaming
-                        // completion in Engine. Keep its request-level outcome.
-                        if req.sequences.is_empty() && stopped > 0 {
-                            req.terminal = Some((
+                        drain(engine, &mut requests, &engine_ids, ms(start.elapsed()))?;
+                        // An admitted partial prefill can cancel before producing
+                        // tokens, but still emits empty per-sample completions.
+                        // Only never-admitted requests need a synthetic outcome.
+                        if requests[index].sequences.is_empty() && stopped > 0 {
+                            requests[index].terminal = Some((
                                 RequestStatus::CancelledBeforeAdmission,
                                 ms(start.elapsed()),
                             ));
                         }
-                        drain(engine, &mut requests, &engine_ids, ms(start.elapsed()))?;
                     }
                 }
             }
@@ -569,6 +585,9 @@ pub fn run(
             let (active, queued) = engine.queue_depth();
             max_active = max_active.max(active);
             max_queued = max_queued.max(queued);
+            max_prefilling = max_prefilling.max(engine.prefilling_requests());
+            max_pending_prefill_tokens =
+                max_pending_prefill_tokens.max(engine.pending_prefill_tokens());
             ensure!(
                 start.elapsed() < limits.timeout,
                 "replay timeout while dispatching events"
@@ -587,6 +606,9 @@ pub fn run(
             let (active, queued) = engine.queue_depth();
             max_active = max_active.max(active);
             max_queued = max_queued.max(queued);
+            max_prefilling = max_prefilling.max(engine.prefilling_requests());
+            max_pending_prefill_tokens =
+                max_pending_prefill_tokens.max(engine.pending_prefill_tokens());
         } else if let Some(next) = workload.events.get(event_index) {
             match workload.clock {
                 // Idle gaps need no engine calls; this is a dispatch boundary,
@@ -632,10 +654,14 @@ pub fn run(
             admitted_requests: stats.requests,
             prompt_tokens: stats.prompt_tokens,
             prompt_tokens_prefilled: stats.prompt_tokens_prefilled,
+            prompt_tokens_reused: stats.prompt_tokens_reused(),
             generated_tokens: stats.generated_tokens,
             prefill_ms: ms(stats.prefill_time),
             decode_ms: ms(stats.decode_time),
             preemptions: stats.preemptions,
+            prefill_preemptions: stats.prefill_preemptions,
+            prefill_chunks: stats.prefill_chunks,
+            last_prefill_tokens: stats.last_prefill_tokens,
             recomputed_tokens: stats.recomputed_tokens,
             deferred_steps: stats.deferred_steps,
             prefix_hits: prefix.hits,
@@ -644,6 +670,8 @@ pub fn run(
             cow_copies: engine.cow_copies(),
             max_observed_active_sequences: max_active,
             max_observed_queued_requests: max_queued,
+            max_observed_prefilling_requests: max_prefilling,
+            max_observed_pending_prefill_tokens: max_pending_prefill_tokens,
         },
     })
 }
@@ -790,6 +818,28 @@ pub fn compare_outputs(expected: &ReplayReport, actual: &ReplayReport) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_engine_reports_default_new_prefill_metrics() {
+        let old = serde_json::json!({
+            "steps": 7, "admitted_requests": 2, "prompt_tokens": 40,
+            "prompt_tokens_prefilled": 32, "generated_tokens": 16,
+            "prefill_ms": 4.0, "decode_ms": 2.0, "preemptions": 0,
+            "recomputed_tokens": 0, "deferred_steps": 0,
+            "prefix_hits": 2, "prefix_lookups": 4, "prefix_tokens_saved": 8,
+            "cow_copies": 0, "max_observed_active_sequences": 2,
+            "max_observed_queued_requests": 1
+        });
+        let counters: EngineCounters = serde_json::from_value(old).unwrap();
+        assert_eq!(counters.steps, 7);
+        assert_eq!(counters.prompt_tokens_prefilled, 32);
+        assert_eq!(counters.prompt_tokens_reused, 0);
+        assert_eq!(counters.prefill_chunks, 0);
+        assert_eq!(counters.prefill_preemptions, 0);
+        assert_eq!(counters.last_prefill_tokens, 0);
+        assert_eq!(counters.max_observed_prefilling_requests, 0);
+        assert_eq!(counters.max_observed_pending_prefill_tokens, 0);
+    }
 
     #[test]
     fn nearest_rank_percentiles_preserve_empty_and_single_populations() {

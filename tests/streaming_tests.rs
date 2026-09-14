@@ -349,11 +349,19 @@ fn test_cancellation_emits_exactly_one_terminal_delta() {
     };
     with_engine(cfg, |mut engine| {
         let id = engine.submit_tokens(tokens[..12].to_vec(), 40, 2).unwrap();
-        // One step admits (prefill token) and decodes (one more) both samples.
+        // Admission emits one prefill token per sample. Their first ordinary
+        // decode now runs on the following iteration.
         engine.step().unwrap();
         let first: Vec<_> = engine.take_deltas();
-        assert_eq!(first.len(), 4, "both samples emitted two deltas");
+        assert_eq!(first.len(), 2, "both samples emitted their first token");
         assert!(first.iter().all(|d| d.finish_reason.is_none()));
+
+        engine.step().unwrap();
+        let decoded = engine.take_deltas();
+        assert_eq!(decoded.len(), 2, "both samples decoded before cancellation");
+        assert!(decoded
+            .iter()
+            .all(|d| d.tokens.len() == 1 && d.finish_reason.is_none()));
 
         assert_eq!(engine.cancel_request(id), 2);
         let terminal = engine.take_deltas();

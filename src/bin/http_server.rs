@@ -17,6 +17,9 @@
 //! | `MAX_BODY_BYTES`  | `1048576`                                  |
 //! | `MAX_CONNECTIONS` | `256`                                      |
 //! | `MAX_QUEUED_JOBS` | `1024`                                     |
+//! | `MAX_JOBS_PER_STEP` | `32`, received jobs before scheduling    |
+//! | `PREFILL_TOKENS_PER_STEP` | `32`, prefill positions per step   |
+//! | `PREFILL_CHUNK_SIZE` | `32`, positions per matrix batch       |
 //! | `TIMEOUT_SECS`    | `30`, socket read and write deadlines      |
 //! | `MAX_TOKENS`      | `4096`, cap on a request's `max_tokens`    |
 
@@ -91,6 +94,8 @@ fn main() -> anyhow::Result<()> {
     let engine = EngineConfig {
         total_blocks: env_usize("KV_BLOCKS", 512)?,
         block_size: env_usize("BLOCK_SIZE", 16)?,
+        max_prefill_tokens_per_step: env_usize("PREFILL_TOKENS_PER_STEP", 32)?,
+        prefill_chunk_size: env_usize("PREFILL_CHUNK_SIZE", 32)?,
         // Speculative decoding is off unless asked for: it only pays on
         // copy-heavy workloads, and costs a little on the rest. See
         // `speculative_benchmark` for the trade.
@@ -104,6 +109,7 @@ fn main() -> anyhow::Result<()> {
         max_body_bytes: env_usize("MAX_BODY_BYTES", 1024 * 1024)?,
         max_connections: env_usize("MAX_CONNECTIONS", 256)?,
         max_queued_jobs: env_usize("MAX_QUEUED_JOBS", 1024)?,
+        max_jobs_per_step: env_usize("MAX_JOBS_PER_STEP", 32)?,
         read_timeout: timeout,
         write_timeout: timeout,
         max_tokens_limit: env_usize("MAX_TOKENS", 4096)?,

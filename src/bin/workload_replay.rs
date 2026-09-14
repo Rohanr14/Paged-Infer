@@ -169,6 +169,10 @@ fn validate_engine(engine: &EngineConfig, model: &LlamaConfig, synthetic: bool) 
         "max_batch_size and prefill_chunk_size must be positive"
     );
     ensure!(
+        engine.max_prefill_tokens_per_step > 0,
+        "max_prefill_tokens_per_step must be positive"
+    );
+    ensure!(
         engine.stream_tokens,
         "workload replay requires stream_tokens=true"
     );
@@ -598,6 +602,11 @@ fn main() -> Result<()> {
             "summary/end_to_end_ms/p95",
             "summary/observed_inter_token_ms/p95",
             "summary/dispatch_lag_ms/p95",
+            "engine/prefill_chunks",
+            "engine/prefill_preemptions",
+            "engine/recomputed_tokens",
+            "engine/max_observed_prefilling_requests",
+            "engine/max_observed_pending_prefill_tokens",
         ] {
             let pointer = format!("/{field}");
             metrics.insert(

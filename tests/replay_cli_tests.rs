@@ -147,6 +147,7 @@ fn explicit_missing_model_and_invalid_overrides_fail_without_fallback() {
         json!({"block_size":u64::MAX}),
         json!({"stream_tokens":false}),
         json!({"prefill_chunk_size":0}),
+        json!({"max_prefill_tokens_per_step":0}),
         json!({"top_p":2}),
         json!({"typo":1}),
     ] {

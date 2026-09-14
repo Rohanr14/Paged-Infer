@@ -1,0 +1,309 @@
+{
+  "version": 1,
+  "date": "2026-09-14",
+  "measurement": "Direct engine on a developer workstation; load, hashing, allocation and warmup excluded; no concurrent benchmark or build. Uncontrolled system load; three rotating interleaved rounds, one process per run.",
+  "inputs": {
+    "generation_config_sha256": null,
+    "model_config_sha256": "486bedda3a6988332e60d9638a09ca4b260d34ebcf1b19e22cf3b140b63d8fe9",
+    "quantization": "F32",
+    "synthetic_fixture": false,
+    "weights_sha256": "6e6001da2106d4757498752a021df6c2bdc332c650aae4bae6b0c004dcf14933",
+    "workload_sha256": "09f514fae0cf5754cdfe848cd55f9d552585857bfdd0f1ea26fb817218b6e874"
+  },
+  "tokenizer_sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+  "workload": "workloads/tinyllama-long-prefill.json",
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu": "Apple M2",
+    "logical_cpus": 8,
+    "rayon_threads": 4,
+    "simd": "neon",
+    "uname": "Darwin 25.6.0 arm64"
+  },
+  "ram_bytes": 17179869184,
+  "builds": {
+    "before": {
+      "debug": "false",
+      "git_dirty": "false",
+      "git_head": "1ba8e2d0f969788463fd17d83ca5512c393c613b",
+      "opt_level": "3",
+      "profile": "release",
+      "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11); binary: rustc; commit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf; commit-date: 2026-02-11; host: aarch64-apple-darwin; release: 1.93.1; LLVM version: 21.1.8",
+      "rustflags": [],
+      "source_sha256": "3a9aaef220f14c904e3231a9acbdbd966e511c6ff19bf28dbf027780a57b5f2c",
+      "target": "aarch64-apple-darwin"
+    },
+    "budget32": {
+      "debug": "false",
+      "git_dirty": "true",
+      "git_head": "1ba8e2d0f969788463fd17d83ca5512c393c613b",
+      "opt_level": "3",
+      "profile": "release",
+      "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11); binary: rustc; commit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf; commit-date: 2026-02-11; host: aarch64-apple-darwin; release: 1.93.1; LLVM version: 21.1.8",
+      "rustflags": [],
+      "source_sha256": "171fd33bcdaf8b728ae62ff577cd4a5a98c07c4601658ec1a05178a49343a2d3",
+      "target": "aarch64-apple-darwin"
+    },
+    "budget8": {
+      "debug": "false",
+      "git_dirty": "true",
+      "git_head": "1ba8e2d0f969788463fd17d83ca5512c393c613b",
+      "opt_level": "3",
+      "profile": "release",
+      "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11); binary: rustc; commit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf; commit-date: 2026-02-11; host: aarch64-apple-darwin; release: 1.93.1; LLVM version: 21.1.8",
+      "rustflags": [],
+      "source_sha256": "171fd33bcdaf8b728ae62ff577cd4a5a98c07c4601658ec1a05178a49343a2d3",
+      "target": "aarch64-apple-darwin"
+    }
+  },
+  "build_commands": [
+    "cargo build --release --bin workload_replay (clean baseline checkout at 1ba8e2d)",
+    "cargo build --release --bin workload_replay (candidate source snapshot)"
+  ],
+  "candidate_note": "Source digest identifies the measured uncommitted implementation. Subsequent source edits only clarified API comments and Prometheus HELP text; benchmark behavior is unchanged.",
+  "engine_configs": {
+    "before": {
+      "block_size": 8,
+      "bos_token": 1,
+      "draft_tokens": 0,
+      "enable_prefix_cache": false,
+      "eos_token": 0,
+      "extra_eos_tokens": [],
+      "max_batch_size": 8,
+      "max_context": 2048,
+      "prefill_chunk_size": 32,
+      "seed": 24301,
+      "stream_tokens": true,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "total_blocks": 128
+    },
+    "budget32": {
+      "block_size": 8,
+      "bos_token": 1,
+      "draft_tokens": 0,
+      "enable_prefix_cache": false,
+      "eos_token": 0,
+      "extra_eos_tokens": [],
+      "max_batch_size": 8,
+      "max_context": 2048,
+      "max_prefill_tokens_per_step": 32,
+      "prefill_chunk_size": 32,
+      "seed": 24301,
+      "stream_tokens": true,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "total_blocks": 128
+    },
+    "budget8": {
+      "block_size": 8,
+      "bos_token": 1,
+      "draft_tokens": 0,
+      "enable_prefix_cache": false,
+      "eos_token": 0,
+      "extra_eos_tokens": [],
+      "max_batch_size": 8,
+      "max_context": 2048,
+      "max_prefill_tokens_per_step": 8,
+      "prefill_chunk_size": 32,
+      "seed": 24301,
+      "stream_tokens": true,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "total_blocks": 128
+    }
+  },
+  "statistics": "Per-run p95 uses nearest rank over nonempty delivery gaps of existing-stream; table values are medians of three per-run statistics. Zero intra-delivery gaps are excluded.",
+  "all_outputs_identical": true,
+  "outcomes": [
+    {
+      "id": "existing-stream",
+      "status": "finished",
+      "rejection": null,
+      "sequences": [
+        {
+          "sample_index": 0,
+          "tokens": [
+            13,
+            13,
+            29909,
+            6601,
+            7090,
+            338,
+            263,
+            13201,
+            8635,
+            4038,
+            393,
+            14422,
+            13672,
+            20592,
+            848,
+            29889,
+            1932,
+            263,
+            1824,
+            2130,
+            267,
+            263,
+            848,
+            2944,
+            29892,
+            278,
+            7090,
+            338,
+            1304,
+            304,
+            10563,
+            278,
+            848,
+            515,
+            278,
+            1667,
+            3370,
+            29889,
+            450,
+            7090
+          ],
+          "finish_reason": "length"
+        }
+      ]
+    },
+    {
+      "id": "long-prompt",
+      "status": "finished",
+      "rejection": null,
+      "sequences": [
+        {
+          "sample_index": 0,
+          "tokens": [
+            24270,
+            372,
+            29889,
+            319
+          ],
+          "finish_reason": "length"
+        }
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "variant": "before",
+      "repeat": 1,
+      "order": 0,
+      "elapsed_ms": 9560.820708,
+      "stream_p95_gap_ms": 645.988124999998,
+      "stream_max_gap_ms": 5772.729334000001,
+      "long_ttft_ms": 5772.727667,
+      "useful_tokens_per_second": 4.602115377310975
+    },
+    {
+      "variant": "budget32",
+      "repeat": 1,
+      "order": 1,
+      "elapsed_ms": 8774.160708,
+      "stream_p95_gap_ms": 791.8507500000005,
+      "stream_max_gap_ms": 794.0195000000003,
+      "long_ttft_ms": 6180.757709,
+      "useful_tokens_per_second": 5.014724651656107
+    },
+    {
+      "variant": "budget8",
+      "repeat": 1,
+      "order": 2,
+      "elapsed_ms": 7881.072625,
+      "stream_p95_gap_ms": 224.63637499999982,
+      "stream_max_gap_ms": 355.3447500000001,
+      "long_ttft_ms": 6768.648332999999,
+      "useful_tokens_per_second": 5.582996388134413
+    },
+    {
+      "variant": "budget32",
+      "repeat": 2,
+      "order": 0,
+      "elapsed_ms": 14183.149374999999,
+      "stream_p95_gap_ms": 2500.3200830000005,
+      "stream_max_gap_ms": 2529.272333000001,
+      "long_ttft_ms": 9803.547708,
+      "useful_tokens_per_second": 3.102272904038988
+    },
+    {
+      "variant": "budget8",
+      "repeat": 2,
+      "order": 1,
+      "elapsed_ms": 7400.600958,
+      "stream_p95_gap_ms": 227.36041699999987,
+      "stream_max_gap_ms": 232.93866700000035,
+      "long_ttft_ms": 6632.6738749999995,
+      "useful_tokens_per_second": 5.945463111672883
+    },
+    {
+      "variant": "before",
+      "repeat": 2,
+      "order": 2,
+      "elapsed_ms": 9228.057125,
+      "stream_p95_gap_ms": 93.72895900000003,
+      "stream_max_gap_ms": 5977.7564999999995,
+      "long_ttft_ms": 5977.7549579999995,
+      "useful_tokens_per_second": 4.768067579555648
+    },
+    {
+      "variant": "budget8",
+      "repeat": 3,
+      "order": 0,
+      "elapsed_ms": 7658.64125,
+      "stream_p95_gap_ms": 282.16604200000006,
+      "stream_max_gap_ms": 304.691959,
+      "long_ttft_ms": 6880.3715839999995,
+      "useful_tokens_per_second": 5.745144414487362
+    },
+    {
+      "variant": "before",
+      "repeat": 3,
+      "order": 1,
+      "elapsed_ms": 10298.7535,
+      "stream_p95_gap_ms": 235.96520900000087,
+      "stream_max_gap_ms": 6769.878833,
+      "long_ttft_ms": 6769.877207999999,
+      "useful_tokens_per_second": 4.272361698918224
+    },
+    {
+      "variant": "budget32",
+      "repeat": 3,
+      "order": 2,
+      "elapsed_ms": 9302.707084,
+      "stream_p95_gap_ms": 839.2258749999999,
+      "stream_max_gap_ms": 978.1326250000004,
+      "long_ttft_ms": 6658.367458999999,
+      "useful_tokens_per_second": 4.7298060234183765
+    }
+  ],
+  "medians": {
+    "before": {
+      "elapsed_ms": 9560.820708,
+      "stream_p95_gap_ms": 235.96520900000087,
+      "stream_max_gap_ms": 5977.7564999999995,
+      "long_ttft_ms": 5977.7549579999995,
+      "useful_tokens_per_second": 4.602115377310975
+    },
+    "budget32": {
+      "elapsed_ms": 9302.707084,
+      "stream_p95_gap_ms": 839.2258749999999,
+      "stream_max_gap_ms": 978.1326250000004,
+      "long_ttft_ms": 6658.367458999999,
+      "useful_tokens_per_second": 4.7298060234183765
+    },
+    "budget8": {
+      "elapsed_ms": 7658.64125,
+      "stream_p95_gap_ms": 227.36041699999987,
+      "stream_max_gap_ms": 304.691959,
+      "long_ttft_ms": 6768.648332999999,
+      "useful_tokens_per_second": 5.745144414487362
+    }
+  }
+}

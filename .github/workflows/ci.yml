@@ -46,6 +46,7 @@ jobs:
       - name: Replay fixture workloads and verify full outputs
         run: |
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/mixed.json --config workloads/configs/baseline.json --config workloads/configs/no-prefix.json --repeats 2 --verify --output mixed-replay.jsonl
+          cargo run --release --bin workload_replay -- --threads 2 --workload workloads/mixed.json --config workloads/configs/baseline.json --config workloads/configs/chunked-prefill.json --repeats 2 --verify --output chunked-prefill-replay.jsonl
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/pressure.json --config workloads/configs/tight-pool.json --repeats 2 --verify --output pressure-replay.jsonl
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/cancellation.json --repeats 2 --verify --output cancellation-replay.jsonl
 

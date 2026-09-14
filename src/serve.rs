@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
 use crate::detokenizer::IncrementalDetokenizer;
@@ -74,6 +74,9 @@ pub struct ServeConfig {
     pub max_connections: usize,
     /// Jobs waiting for the engine thread; beyond this, 503.
     pub max_queued_jobs: usize,
+    /// Jobs received before a scheduler step, including refused/cancelled jobs.
+    /// A bounded intake lets decoding proceed under continuous arrivals.
+    pub max_jobs_per_step: usize,
     /// Events buffered per client between the engine and its handler. A client
     /// further behind than this is not reading, and is cancelled.
     pub max_pending_events: usize,
@@ -98,6 +101,7 @@ impl Default for ServeConfig {
             max_body_bytes: 1024 * 1024,
             max_connections: 256,
             max_queued_jobs: 1024,
+            max_jobs_per_step: 32,
             max_pending_events: 1024,
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
@@ -144,6 +148,7 @@ enum Event {
 pub struct Metrics {
     pub prompt_tokens: usize,
     pub prompt_tokens_prefilled: usize,
+    pub prompt_tokens_reused: usize,
     pub generated_tokens: usize,
     pub prefix_hits: u64,
     pub prefix_lookups: u64,
@@ -156,6 +161,11 @@ pub struct Metrics {
     pub kv_blocks_free: usize,
     pub sequences_active: usize,
     pub requests_queued: usize,
+    pub requests_prefilling: usize,
+    pub pending_prefill_tokens: usize,
+    pub last_prefill_tokens: usize,
+    pub prefill_chunks: usize,
+    pub prefill_preemptions: usize,
     pub sequences_deferred: usize,
     pub preemptions: usize,
     pub recomputed_tokens: usize,
@@ -266,6 +276,14 @@ pub fn run(
     profile: ModelProfile,
     weights: LlamaWeights<'static>,
 ) -> Result<Server> {
+    ensure!(
+        config.max_jobs_per_step > 0,
+        "max_jobs_per_step must be positive"
+    );
+    ensure!(
+        config.engine.max_prefill_tokens_per_step > 0,
+        "max_prefill_tokens_per_step must be positive"
+    );
     let listener = TcpListener::bind(&config.addr)?;
     let addr = listener.local_addr()?;
     let (jobs_tx, jobs_rx) = sync_channel::<Job>(config.max_queued_jobs.max(1));
@@ -328,9 +346,22 @@ pub fn run(
 fn engine_loop(engine: &mut Engine<'static>, rx: Receiver<Job>, shared: &Shared) {
     let mut pending: Vec<Pending> = Vec::new();
     loop {
-        // Absorb everything queued right now, so jobs that arrived while the
-        // previous step ran join this batch rather than the next one.
-        loop {
+        let mut received = 0;
+        if !engine.has_work() {
+            publish_metrics(engine, shared);
+            // Count the wake-up job in this iteration's intake allowance too.
+            match rx.recv() {
+                Ok(job) => {
+                    admit(engine, &mut pending, job);
+                    received = 1;
+                }
+                Err(_) => return,
+            }
+        }
+        // Every received job consumes the allowance, even if it is invalid or
+        // its client already cancelled. Producers cannot keep this loop busy
+        // indefinitely while existing streams wait for a scheduler step.
+        for _ in received..shared.config.max_jobs_per_step {
             match rx.try_recv() {
                 Ok(job) => admit(engine, &mut pending, job),
                 Err(TryRecvError::Empty) => break,
@@ -340,11 +371,6 @@ fn engine_loop(engine: &mut Engine<'static>, rx: Receiver<Job>, shared: &Shared)
 
         if !engine.has_work() {
             publish_metrics(engine, shared);
-            // Idle: block rather than spin.
-            match rx.recv() {
-                Ok(job) => admit(engine, &mut pending, job),
-                Err(_) => return,
-            }
             continue;
         }
 
@@ -411,6 +437,9 @@ fn engine_loop(engine: &mut Engine<'static>, rx: Receiver<Job>, shared: &Shared)
 }
 
 fn admit(engine: &mut Engine<'_>, pending: &mut Vec<Pending>, job: Job) {
+    if job.cancel.load(Ordering::Relaxed) {
+        return;
+    }
     match engine.submit_tokens_with(job.tokens, job.max_tokens, job.samples, job.options) {
         Ok(request_id) => pending.push(Pending {
             request_id,
@@ -433,6 +462,7 @@ fn publish_metrics(engine: &Engine<'_>, shared: &Shared) {
     let m = Metrics {
         prompt_tokens: s.prompt_tokens,
         prompt_tokens_prefilled: s.prompt_tokens_prefilled,
+        prompt_tokens_reused: s.prompt_tokens_reused(),
         generated_tokens: s.generated_tokens,
         prefix_hits: prefix.hits,
         prefix_lookups: prefix.hits + prefix.misses,
@@ -445,6 +475,11 @@ fn publish_metrics(engine: &Engine<'_>, shared: &Shared) {
         kv_blocks_free: engine.available_blocks(),
         sequences_active: active,
         requests_queued: queued,
+        requests_prefilling: engine.prefilling_requests(),
+        pending_prefill_tokens: engine.pending_prefill_tokens(),
+        last_prefill_tokens: s.last_prefill_tokens,
+        prefill_chunks: s.prefill_chunks,
+        prefill_preemptions: s.prefill_preemptions,
         sequences_deferred: engine.deferred_sequences(),
         preemptions: s.preemptions,
         recomputed_tokens: s.recomputed_tokens,
@@ -775,6 +810,8 @@ fn health(shared: &Shared) -> (&'static str, Value) {
         "connections": shared.connections.load(Ordering::Relaxed),
         "sequences_active": m.sequences_active,
         "requests_queued": m.requests_queued,
+        "requests_prefilling": m.requests_prefilling,
+        "pending_prefill_tokens": m.pending_prefill_tokens,
         "sequences_deferred": m.sequences_deferred,
         "kv_blocks_free": m.kv_blocks_free,
         "kv_blocks_total": m.kv_blocks_total,
@@ -1455,6 +1492,11 @@ fn metrics_body(m: &Metrics, connections: usize) -> Value {
         "kv_blocks_free": m.kv_blocks_free,
         "sequences_active": m.sequences_active,
         "requests_queued": m.requests_queued,
+        "requests_prefilling": m.requests_prefilling,
+        "pending_prefill_tokens": m.pending_prefill_tokens,
+        "last_prefill_tokens": m.last_prefill_tokens,
+        "prefill_chunks": m.prefill_chunks,
+        "prefill_preemptions": m.prefill_preemptions,
         "sequences_deferred": m.sequences_deferred,
         "preemptions": m.preemptions,
         "recomputed_tokens": m.recomputed_tokens,
@@ -1462,7 +1504,7 @@ fn metrics_body(m: &Metrics, connections: usize) -> Value {
         "prefix_cache_tokens_saved": m.prefix_tokens_saved,
         "prompt_tokens": m.prompt_tokens,
         "prompt_tokens_prefilled": m.prompt_tokens_prefilled,
-        "prompt_tokens_reused": m.prompt_tokens.saturating_sub(m.prompt_tokens_prefilled),
+        "prompt_tokens_reused": m.prompt_tokens_reused,
         "generated_tokens": m.generated_tokens,
         "prefix_cache_hits": m.prefix_hits,
         "prefix_cache_lookups": m.prefix_lookups,
@@ -1512,6 +1554,24 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
         m.prompt_tokens_prefilled as f64,
     );
     metric(
+        "paged_infer_prompt_tokens_reused_total",
+        "counter",
+        "Prompt positions skipped through prefix reuse on initial admission.",
+        m.prompt_tokens_reused as f64,
+    );
+    metric(
+        "paged_infer_prefill_chunks_total",
+        "counter",
+        "Prefill slices processed by the scheduler.",
+        m.prefill_chunks as f64,
+    );
+    metric(
+        "paged_infer_prefill_preemptions_total",
+        "counter",
+        "Unfinished prefills that released their mappings for mandatory decode.",
+        m.prefill_preemptions as f64,
+    );
+    metric(
         "paged_infer_generated_tokens_total",
         "counter",
         "Tokens generated.",
@@ -1532,7 +1592,7 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
     metric(
         "paged_infer_prefix_cache_tokens_saved_total",
         "counter",
-        "Prompt tokens whose KV was reused instead of recomputed.",
+        "Tokens covered by reused blocks across admissions; includes replayed boundary tokens.",
         m.prefix_tokens_saved as f64,
     );
     metric(
@@ -1550,7 +1610,7 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
     metric(
         "paged_infer_recomputed_tokens_total",
         "counter",
-        "Tokens re-prefilled to resume preempted sequences.",
+        "Tokens processed for resumed sequences or repeated after partial-prefill eviction.",
         m.recomputed_tokens as f64,
     );
     metric(
@@ -1574,8 +1634,26 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
     metric(
         "paged_infer_requests_queued",
         "gauge",
-        "Requests waiting for admission.",
+        "Pending requests, including the retained unfinished prefill.",
         m.requests_queued as f64,
+    );
+    metric(
+        "paged_infer_requests_prefilling",
+        "gauge",
+        "Requests holding an unfinished prompt mapping.",
+        m.requests_prefilling as f64,
+    );
+    metric(
+        "paged_infer_pending_prefill_tokens",
+        "gauge",
+        "Positions remaining in the retained unfinished prefill.",
+        m.pending_prefill_tokens as f64,
+    );
+    metric(
+        "paged_infer_last_prefill_tokens",
+        "gauge",
+        "Prompt or resumed-sequence positions processed in the last scheduler step.",
+        m.last_prefill_tokens as f64,
     );
     metric(
         "paged_infer_sequences_deferred",
@@ -1601,6 +1679,178 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_server_parts() -> (ServeConfig, ModelProfile, LlamaWeights<'static>) {
+        use crate::model::{LlamaConfig, ModelLoader};
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tiny_llama.safetensors"
+        ));
+        let mut model = LlamaConfig::beside_checkpoint(path).unwrap();
+        model.eos_token_ids = vec![111];
+        let loader =
+            ModelLoader::new(include_bytes!("../tests/fixtures/tiny_llama.safetensors")).unwrap();
+        let weights = loader.load_weights(&model).unwrap();
+        let profile = ModelProfile::from_parts(model, path, None).unwrap();
+        let config = ServeConfig {
+            max_jobs_per_step: 1,
+            warm_up: false,
+            engine: EngineConfig {
+                total_blocks: 32,
+                block_size: 4,
+                max_prefill_tokens_per_step: 4096,
+                enable_prefix_cache: false,
+                eos_token: u32::MAX,
+                stream_tokens: true,
+                ..profile.engine_config()
+            },
+            ..ServeConfig::default()
+        };
+        (config, profile, weights)
+    }
+
+    fn closed_job_queue(
+        jobs: Vec<(Vec<u32>, usize, bool)>,
+    ) -> (Receiver<Job>, Vec<Receiver<Event>>) {
+        let (sender, receiver) = sync_channel(jobs.len());
+        let mut replies = Vec::new();
+        for (tokens, max_tokens, cancelled) in jobs {
+            let (reply, response) = sync_channel(32);
+            sender
+                .send(Job {
+                    tokens,
+                    max_tokens,
+                    samples: 1,
+                    options: RequestOptions::default(),
+                    reply,
+                    cancel: Arc::new(AtomicBool::new(cancelled)),
+                })
+                .unwrap();
+            replies.push(response);
+        }
+        drop(sender);
+        (receiver, replies)
+    }
+
+    fn fixture_shared(config: ServeConfig, profile: ModelProfile) -> Shared {
+        Shared {
+            config,
+            profile,
+            jobs: Mutex::new(None),
+            metrics: Mutex::new(Metrics::default()),
+            ready: AtomicBool::new(true),
+            engine_alive: AtomicBool::new(true),
+            connections: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn idle_wakeup_job_counts_toward_bounded_intake_before_each_step() {
+        let (config, profile, weights) = fixture_server_parts();
+        let mut engine = Engine::new(weights, profile.config.clone(), config.engine.clone());
+        let shared = fixture_shared(config, profile);
+        let (jobs, replies) = closed_job_queue((0..5).map(|_| (vec![1], 1, false)).collect());
+        engine_loop(&mut engine, jobs, &shared);
+
+        assert_eq!(
+            engine.stats().steps,
+            5,
+            "each wake-up job consumes the entire one-job allowance"
+        );
+        assert_eq!(engine.stats().requests, 5);
+        assert!(!engine.has_work());
+        for reply in replies {
+            let events: Vec<_> = reply.try_iter().collect();
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], Event::Delta { tokens, finish_reason: Some(FinishReason::Length), .. } if tokens.len() == 1)
+            );
+            assert!(
+                matches!(&events[1], Event::Done(done) if done.len() == 1 && done[0].tokens.len() == 1)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_and_cancelled_jobs_consume_intake_while_decode_keeps_advancing() {
+        let (config, profile, weights) = fixture_server_parts();
+        let mut engine = Engine::new(weights, profile.config.clone(), config.engine.clone());
+        let shared = fixture_shared(config, profile);
+        let mut submitted = vec![
+            (vec![1], 8, false),
+            (vec![u32::MAX], 1, false),
+            (vec![1], 1, true),
+            (vec![2], 1, false),
+        ];
+        submitted.extend((0..4).map(|_| (vec![u32::MAX], 1, false)));
+        let (jobs, replies) = closed_job_queue(submitted);
+        engine_loop(&mut engine, jobs, &shared);
+
+        assert_eq!(engine.stats().steps, 8);
+        assert_eq!(engine.stats().requests, 2);
+        assert!(!engine.has_work());
+        for (index, reply) in replies.into_iter().enumerate() {
+            let events: Vec<_> = reply.try_iter().collect();
+            match index {
+                0 => {
+                    assert_eq!(events.len(), 9);
+                    assert!(
+                        matches!(events.last(), Some(Event::Done(done)) if done.len() == 1 && done[0].tokens.len() == 8)
+                    );
+                }
+                2 => assert!(
+                    events.is_empty(),
+                    "already-cancelled job must not be submitted"
+                ),
+                3 => assert!(
+                    matches!(events.last(), Some(Event::Done(done)) if done.len() == 1 && done[0].tokens.len() == 1)
+                ),
+                _ => assert!(matches!(&events[..], [Event::Rejected(_)])),
+            }
+        }
+    }
+
+    #[test]
+    fn zero_scheduler_limits_fail_before_binding_or_starting_threads() {
+        for (jobs, budget, expected) in [
+            (0, 32, "max_jobs_per_step must be positive"),
+            (1, 0, "max_prefill_tokens_per_step must be positive"),
+        ] {
+            let (mut config, profile, weights) = fixture_server_parts();
+            config.addr = "invalid socket address".into();
+            config.max_jobs_per_step = jobs;
+            config.engine.max_prefill_tokens_per_step = budget;
+            let error = run(config, profile, weights)
+                .err()
+                .expect("zero limit must fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn prefill_metrics_preserve_explicit_reuse_when_retries_exceed_prompt_length() {
+        let metrics = Metrics {
+            prompt_tokens: 8,
+            prompt_tokens_prefilled: 12,
+            prompt_tokens_reused: 3,
+            requests_prefilling: 1,
+            pending_prefill_tokens: 5,
+            last_prefill_tokens: 2,
+            prefill_chunks: 6,
+            prefill_preemptions: 1,
+            ..Metrics::default()
+        };
+        let body = metrics_body(&metrics, 0);
+        assert_eq!(body["prompt_tokens_reused"], 3);
+        assert_eq!(body["pending_prefill_tokens"], 5);
+        let text = prometheus(&metrics, 0);
+        assert!(text.contains("paged_infer_prompt_tokens_reused_total 3\n"));
+        assert!(text.contains("# TYPE paged_infer_prefill_chunks_total counter\n"));
+        assert!(text.contains("paged_infer_prefill_chunks_total 6\n"));
+        assert!(text.contains("# TYPE paged_infer_pending_prefill_tokens gauge\n"));
+        assert!(text.contains("paged_infer_pending_prefill_tokens 5\n"));
+    }
 
     #[test]
     fn default_valued_unsupported_options_are_tolerated() {
