@@ -1,0 +1,25 @@
+Preparing computed KV for 8 entries at context 4096
+Decode repeat 1/3, shared=false
+Decode repeat 1/3, shared=true
+Decode repeat 2/3, shared=true
+Decode repeat 2/3, shared=false
+Decode repeat 3/3, shared=false
+Decode repeat 3/3, shared=true
+      172.59 real       512.56 user        35.49 sys
+          3334766592  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1297945  page reclaims
+               46170  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  25  voluntary context switches
+             5972101  involuntary context switches
+       5558260630505  instructions retired
+       1444570882192  cycles elapsed
+          2542899112  peak memory footprint

@@ -95,7 +95,73 @@ EOS is treated as an ordinary token to hold the decode budget fixed. Reported
 step latency is model-batch latency, not client-observed streaming latency.
 The manifest records these limits and the input, model and build fingerprints.
 
-The activation gate remains at least 15% full-model throughput improvement in a
+The merge and activation gate remains at least 15% full-model throughput improvement in a
 declared long-context shared-prefix workload, with no more than 5% regression in
 the no-sharing fallback. Kernel speedups alone do not satisfy it. Keep the option
 off unless measurements justify enabling it for the intended model and traffic.
+
+
+## Apple M2 measurements, 2026-09-15
+
+The declared real-model case is Llama 3.2 1B with int8 projections, 4,096 prompt
+positions, eight sequences, eight measured steps and four Rayon workers. Each
+of three repetitions measures both schedules in rotating order after separate
+full-range warmup. The physically shared portion is 3,680 positions (requested
+90%, rounded to 16-position blocks). All 64 generated tokens and the final logits
+match exactly in every run. Inputs are synthetic token IDs with genuine computed
+KV, and EOS does not shorten the fixed budget.
+
+These are developer-workstation measurements on Apple M2 / 16 GiB, NEON and Rust
+1.93.1 release builds. No other project build or benchmark ran alongside timing;
+other system activity was uncontrolled. The raw reports retain all timed samples,
+per-step latencies, full outputs, model/input hashes and build source hashes in
+[the measurement directory](measurements/shared-prefix-m2/README.md). The measured
+source snapshot matches the implementation commit; later edits only move or
+clarify tests and document the evidence.
+
+An earlier value kernel measured 0.788x median throughput. Keeping value sums in
+registers across each physical block raised the next run to 1.106x. Review then
+found that cloning empty output vectors discarded their reserved capacity; the
+final harness allocates each buffer separately before timing. These earlier
+reports are retained as development history, not pooled with the final build.
+
+The final kernel-only sweep covers all 36 requested cases with 21 timed pairs
+per case and finite bit-identical outputs throughout. At context 4,096 and 90%
+sharing it measured 1.129x / 1.232x / 1.193x for batches 4 / 8 / 16. Those figures
+exclude model projections and cannot establish the full-model gate.
+
+| Final harness, physical sharing | Baseline tokens/s | Candidate tokens/s | Ratio of medians | Baseline / candidate pooled step p95 |
+|---|---:|---:|---:|---:|
+| 90% requested | 22.66 | 27.29 | 1.205x | 507 / 345 ms |
+| 0% control | 18.82 | 19.34 | 1.028x | 1,186 / 471 ms |
+
+The shared run's three paired speedups are 1.216x, 1.114x and 1.097x: the median
+paired improvement is 11.4%, below the target. The no-sharing control ranges from
+0.812x to 2.014x despite both variants executing the same fallback kernel. Its
+large variation makes the apparent 2.8% improvement and tail difference evidence
+of timing noise, not a fallback optimization. No timed samples were discarded.
+These small samples do not establish either a repeatable 15% gain or a reliable
+5% upper bound on fallback regression. The feature stays off and the PR remains
+a draft; the gate is **not yet established**.
+
+The final shared runs retain 8.25 MiB of additional packed scratch. Actual KV
+storage is 446 MiB for 90% sharing and 2,056 MiB for the no-sharing control; these
+are storage-sharing effects present in both attention variants. Process maximum
+RSS was 3.11 GiB / 3.96 GiB respectively, measured by macOS `time -l` across each
+complete process, including checkpoint loading, preparation, warmup and both
+variants. It is not a per-variant RSS comparison. The control's additional packed
+scratch and shared layer-call count are zero. All twelve final real-model runs
+match the same complete token output and final-logit hash across both sharing
+fractions.
+
+## Focused next step
+
+1. Profile the declared eight-sequence, 4,096-position case to separate shared
+   score calculation, value accumulation, packing/scatter and model projections.
+   Use that breakdown to choose one further optimization.
+2. Repeat longer paired runs on a quiet machine, retaining every sample and
+   reporting paired ratios as well as ratios of medians. Establish both the
+   shared-workload gain and the no-sharing bound before merging or enabling.
+3. If the model-level result clears that gate, verify the actual request workload
+   with replay, including prompt preparation, throughput, delivery tails and
+   memory pressure. The current steady-state benchmark excludes those effects.
