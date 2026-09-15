@@ -270,7 +270,10 @@ fn main() -> Result<()> {
         output,
         "{}",
         json!({
-            "type": "manifest", "version": 1, "benchmark": "shared_attention", "environment": environment(),
+            "type": "manifest", "version": 1,
+            "profiling_enabled": paged_infer::profiling::enabled(),
+            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+            "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.", "benchmark": "shared_attention", "environment": environment(),
             "shape": {"layers": 1, "heads": 32, "kv_heads": 4, "head_dim": 64, "block_size": BLOCK_SIZE},
             "batches": batches, "contexts": contexts, "requested_shared_percentages": percentages,
             "repeats": reps, "warmup_pairs": warmup, "timing_unit": "microseconds",

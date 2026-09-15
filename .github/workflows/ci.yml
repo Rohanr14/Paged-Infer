@@ -40,6 +40,9 @@ jobs:
       - name: Tests
         run: cargo test --release --all-targets
 
+      - name: Diagnostic profiling excludes warmup and previous runs
+        run: cargo test --release --features profiling --test profiling_tests
+
       - name: Report the SIMD backend actually selected
         run: cargo test --release --test simd_tests test_reports_a_backend -- --nocapture
 

@@ -21,6 +21,8 @@ use std::time::Instant;
 
 const BLOCK_SIZE: usize = 16;
 const PREFILL_CHUNK: usize = 32;
+const BOOTSTRAP_RESAMPLES: usize = 10_000;
+const BOOTSTRAP_SEED: u64 = 0x7061_6972_6564_4349;
 const HELP: &str = "Full-model shared-prefix steady-state decode; writes JSONL to stdout.
 Environment controls:
   MODEL_PATH                 Safetensors file with adjacent config.json;
@@ -39,6 +41,13 @@ EOS is treated as an ordinary token: every sequence runs the fixed step budget.
 Prompt preparation, warmup, validation and reporting are outside timed loops;
 finite-logit checking is combined with timed greedy selection. Each variant
 warms its entire decode range, then restarts from identical held tokens.
+Increase SHARED_DECODE_STEPS for longer runs and SHARED_DECODE_REPS for more
+measurement pairs; steps within a run are not bootstrap replicates.
+The paired bootstrap interval describes observed pair variation under independent,
+exchangeable-pair assumptions. Few pairs, serial drift and order effects can make
+it misleading; even a narrow interval is not a performance guarantee.
+Builds with the profiling feature are diagnostic and unsuitable for performance
+gating because instrumentation adds timer and counter overhead.
 This is steady-state model decode, not request-lifecycle or HTTP throughput.";
 
 struct Settings {
@@ -414,6 +423,137 @@ fn distribution(mut values: Vec<f64>) -> Value {
         "min": values[0], "max": values[values.len() - 1]})
 }
 
+/// The conventional median; for even samples use the midpoint of both middle
+/// values. This is deliberately separate from the legacy nearest-rank p50
+/// fields, whose meaning remains unchanged in existing reports.
+fn median(values: &mut [f64]) -> f64 {
+    assert!(!values.is_empty());
+    let even = values.len().is_multiple_of(2);
+    let middle = values.len() / 2;
+    let (lower, upper, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+    if even {
+        let lower = lower.iter().copied().max_by(f64::total_cmp).unwrap();
+        lower + (*upper - lower) * 0.5
+    } else {
+        *upper
+    }
+}
+
+/// SplitMix64 with rejection sampling rather than a biased modulo reduction.
+/// All state is local to reporting, so statistics never alter model sampling.
+struct BootstrapRandom(u64);
+
+impl BootstrapRandom {
+    fn index(&mut self, size: usize) -> usize {
+        let bound = size as u64;
+        let rejection = bound.wrapping_neg() % bound;
+        loop {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.0;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            if value >= rejection {
+                return (value % bound) as usize;
+            }
+        }
+    }
+}
+
+/// Percentile bootstrap of the median paired elapsed-time ratio. Resampling a
+/// ratio selects its complete original baseline/candidate pair; sampling the
+/// two schedules independently would destroy pairing. The individual decode
+/// steps are never treated as independent observations.
+///
+/// Each resample contains n pairs sampled with replacement. Endpoints are the
+/// nearest-rank 2.5th/97.5th percentiles of the resampled medians. This is a
+/// descriptive, conditional interval, not a correction for serial dependence,
+/// order effects, tiny samples or unobserved system states. Method reference:
+/// https://www.itl.nist.gov/div898/handbook/eda/section3/eda334.htm
+fn paired_speedup_statistics(baseline: &[f64], candidate: &[f64]) -> Result<Value> {
+    ensure!(
+        !baseline.is_empty(),
+        "paired statistics require at least one repeat"
+    );
+    ensure!(
+        baseline.len() == candidate.len(),
+        "paired timing counts differ"
+    );
+    let mut ratios = Vec::with_capacity(baseline.len());
+    let mut pairs = Vec::with_capacity(baseline.len());
+    for (repeat, (&baseline_ms, &candidate_ms)) in baseline.iter().zip(candidate).enumerate() {
+        ensure!(
+            baseline_ms.is_finite()
+                && baseline_ms > 0.0
+                && candidate_ms.is_finite()
+                && candidate_ms > 0.0,
+            "paired timings must be positive and finite"
+        );
+        let speedup = baseline_ms / candidate_ms;
+        ensure!(
+            speedup.is_finite() && speedup > 0.0,
+            "paired timing ratio must be positive and finite"
+        );
+        ratios.push(speedup);
+        pairs.push(
+            json!({"repeat": repeat + 1, "baseline_elapsed_ms": baseline_ms,
+            "candidate_elapsed_ms": candidate_ms, "speedup": speedup}),
+        );
+    }
+    let minimum = ratios.iter().copied().min_by(f64::total_cmp).unwrap();
+    let maximum = ratios.iter().copied().max_by(f64::total_cmp).unwrap();
+    let estimate = median(&mut ratios.clone());
+    let enough_pairs = ratios.len() > 1;
+    let interval = if enough_pairs {
+        let mut random = BootstrapRandom(BOOTSTRAP_SEED);
+        let mut sample = vec![0.0; ratios.len()];
+        let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+        for _ in 0..BOOTSTRAP_RESAMPLES {
+            for value in &mut sample {
+                *value = ratios[random.index(ratios.len())];
+            }
+            medians.push(median(&mut sample));
+        }
+        medians.sort_by(f64::total_cmp);
+        let lower = medians[BOOTSTRAP_RESAMPLES / 40 - 1];
+        let upper = medians[BOOTSTRAP_RESAMPLES * 39 / 40 - 1];
+        Some(json!({"lower": lower, "upper": upper}))
+    } else {
+        // One observed pair provides no between-pair uncertainty estimate.
+        // Returning [estimate, estimate] would imply unsupported precision.
+        None
+    };
+    Ok(json!({
+        "pair_count": ratios.len(), "pairs": pairs,
+        "estimator": "median of baseline_elapsed_ms / candidate_elapsed_ms within the same repeat",
+        "median_convention": "middle value for odd counts; midpoint of two middle values for even counts",
+        "interpretation": "greater than 1 means the candidate was faster",
+        "median": estimate, "min": minimum, "max": maximum,
+        "bootstrap_95": {
+            "method": "paired percentile bootstrap of the median elapsed-time ratio",
+            "confidence_level": 0.95, "interval": interval,
+            "resamples": if enough_pairs { BOOTSTRAP_RESAMPLES } else { 0 },
+            "seed_hex": format!("0x{BOOTSTRAP_SEED:016x}"),
+            "rng": "SplitMix64 with rejection-sampled pair indices",
+            "resampling_unit": "one complete baseline/candidate repeat pair",
+            "pairs_per_resample": ratios.len(),
+            "endpoint_convention": "nearest-rank 2.5th and 97.5th percentiles, ceil(p * resamples), one-based",
+            "status": if enough_pairs { "descriptive_interval" } else { "insufficient_pairs" },
+            "small_sample_caution": ratios.len() < 10,
+            "small_sample_caution_threshold_pairs": 10,
+            "identical_observed_ratios": minimum == maximum,
+            "assumptions": "repeat pairs are independent and exchangeable observations of the same workload and machine conditions",
+            "limitations": [
+                "Few pairs provide a coarse empirical distribution; 10 pairs is a caution threshold, not a validity guarantee.",
+                "Serial dependence, thermal drift and systematic order effects are not corrected by this resampling method.",
+                "A narrow or zero-width interval does not guarantee future speedup or measure uncertainty in unobserved system conditions.",
+                "A nominal 95% percentile interval can under-cover, especially with small samples; it is not proof of a performance gate.",
+                "Decode steps within one run are dependent and do not increase the bootstrap sample count."
+            ],
+        }
+    }))
+}
+
 fn main() -> Result<()> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments.as_slice() == ["--help"] || arguments.as_slice() == ["-h"] {
@@ -451,6 +591,9 @@ fn main() -> Result<()> {
         json!({
             "type": "manifest", "version": 1, "benchmark": "shared_decode",
             "scope": "full-model steady-state decode, not request-lifecycle or HTTP throughput",
+            "profiling_enabled": paged_infer::profiling::enabled(),
+            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+            "profiling_note": "Instrumented builds are diagnostic; timer/counter overhead makes their timings unsuitable for performance gating. Nested stage timings are not additive; parallel lane timings sum worker time.",
             "environment": environment(), "model_path": settings.model,
             "synthetic_weight_fixture": settings.fixture, "synthetic_kv": false,
             "checkpoint_sha256": checkpoint_sha256, "config_sha256": config_sha256,
@@ -501,7 +644,9 @@ fn main() -> Result<()> {
             // and distinct private token at `context` are never overwritten.
             decode(&weights, &config, &settings, &mut harness, &mut scratch)?;
             scratch.reset_shared_attention_stats();
+            paged_infer::profiling::reset();
             let run = decode(&weights, &config, &settings, &mut harness, &mut scratch)?;
+            let profile = paged_infer::profiling::snapshot();
             match &reference {
                 Some(expected) => ensure!(
                     *expected == run.tokens,
@@ -550,6 +695,7 @@ fn main() -> Result<()> {
                     "shared_layer_calls": stats.layer_calls, "shared_query_tokens": stats.query_tokens,
                     "candidate_extra_scratch_bytes": stats.scratch_bytes,
                     "verified_finite_logits": true, "verified_complete_greedy_output": true,
+                    "profile": profile,
                 })
             )?;
             output.flush()?;
@@ -559,6 +705,7 @@ fn main() -> Result<()> {
     let candidate = distribution(times[1].clone());
     let baseline_ms = baseline["p50"].as_f64().unwrap();
     let candidate_ms = candidate["p50"].as_f64().unwrap();
+    let paired_speedups = paired_speedup_statistics(&times[0], &times[1])?;
     writeln!(
         output,
         "{}",
@@ -569,6 +716,8 @@ fn main() -> Result<()> {
             "baseline_median_tokens_per_second": token_count as f64 * 1000.0 / baseline_ms,
             "candidate_median_tokens_per_second": token_count as f64 * 1000.0 / candidate_ms,
             "median_speedup": baseline_ms / candidate_ms,
+            "median_speedup_estimator": "legacy ratio of separate nearest-rank p50 elapsed times; paired_elapsed_time_speedup reports the paired estimator",
+            "paired_elapsed_time_speedup": paired_speedups,
             "timing_samples_retained": settings.repeats * 2,
         })
     )?;
@@ -579,4 +728,101 @@ fn main() -> Result<()> {
         "runs": settings.repeats * 2, "scope": "all timed greedy tokens, finite logits, fixed step budget"})
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod statistical_tests {
+    use super::*;
+
+    #[test]
+    fn paired_median_preserves_repeat_matching() {
+        // The ratio of the two marginal medians is 50, but the median paired
+        // effect is 1. Strong common run noise must not destroy pairing.
+        let result = paired_speedup_statistics(&[1.0, 50.0, 101.0], &[1.0, 100.0, 1.0]).unwrap();
+        assert_eq!(result["median"], 1.0);
+        assert_eq!(result["min"], 0.5);
+        assert_eq!(result["max"], 101.0);
+        assert_eq!(result["pair_count"], 3);
+        assert_eq!(
+            result["pairs"][1],
+            json!({"repeat": 2,
+            "baseline_elapsed_ms": 50.0, "candidate_elapsed_ms": 100.0, "speedup": 0.5})
+        );
+    }
+
+    #[test]
+    fn median_uses_both_middle_values_for_even_samples() {
+        assert_eq!(median(&mut [9.0, 1.0, 5.0, 3.0]), 4.0);
+        assert_eq!(median(&mut [9.0, 1.0, 5.0]), 5.0);
+        assert_eq!(median(&mut [f64::MAX, f64::MAX]), f64::MAX);
+    }
+
+    #[test]
+    fn constant_paired_effect_does_not_invent_independent_run_noise() {
+        let result = paired_speedup_statistics(&[2.0, 2000.0, 6.0], &[1.0, 1000.0, 3.0]).unwrap();
+        assert_eq!(result["median"], 2.0);
+        assert_eq!(
+            result["bootstrap_95"]["interval"],
+            json!({"lower": 2.0, "upper": 2.0})
+        );
+        assert_eq!(result["bootstrap_95"]["identical_observed_ratios"], true);
+        assert_eq!(result["bootstrap_95"]["small_sample_caution"], true);
+    }
+
+    #[test]
+    fn two_pair_interval_covers_the_exact_resampling_distribution_endpoints() {
+        // Resampling two ratios [1, 3] has medians 1, 2, 2, 3 with equal
+        // probability. Its 2.5th and 97.5th percentiles are therefore 1 and 3.
+        let result = paired_speedup_statistics(&[1.0, 3.0], &[1.0, 1.0]).unwrap();
+        assert_eq!(result["median"], 2.0);
+        assert_eq!(
+            result["bootstrap_95"]["interval"],
+            json!({"lower": 1.0, "upper": 3.0})
+        );
+        assert_eq!(result["bootstrap_95"]["small_sample_caution"], true);
+    }
+
+    #[test]
+    fn bootstrap_is_reproducible_and_invariant_to_time_units() {
+        let baseline = [8.0, 12.0, 10.0, 40.0, 64.0];
+        let candidate = [4.0, 3.0, 20.0, 32.0, 16.0];
+        let result = paired_speedup_statistics(&baseline, &candidate).unwrap();
+        assert_eq!(
+            result,
+            paired_speedup_statistics(&baseline, &candidate).unwrap()
+        );
+        let scaled = paired_speedup_statistics(
+            &baseline.map(|value| value * 1024.0),
+            &candidate.map(|value| value * 1024.0),
+        )
+        .unwrap();
+        assert_eq!(result["median"], scaled["median"]);
+        assert_eq!(result["bootstrap_95"], scaled["bootstrap_95"]);
+        let interval = &result["bootstrap_95"]["interval"];
+        assert!(interval["lower"].as_f64().unwrap() >= result["min"].as_f64().unwrap());
+        assert!(interval["upper"].as_f64().unwrap() <= result["max"].as_f64().unwrap());
+        assert!(interval["lower"].as_f64().unwrap() <= interval["upper"].as_f64().unwrap());
+    }
+
+    #[test]
+    fn one_pair_has_no_claimed_uncertainty_interval() {
+        let result = paired_speedup_statistics(&[9.0], &[3.0]).unwrap();
+        assert_eq!(result["median"], 3.0);
+        assert!(result["bootstrap_95"]["interval"].is_null());
+        assert_eq!(result["bootstrap_95"]["status"], "insufficient_pairs");
+        assert_eq!(result["bootstrap_95"]["resamples"], 0);
+        assert_eq!(result["bootstrap_95"]["small_sample_caution"], true);
+    }
+
+    #[test]
+    fn invalid_pairs_are_refused_instead_of_serializing_invalid_statistics() {
+        assert!(paired_speedup_statistics(&[], &[]).is_err());
+        assert!(paired_speedup_statistics(&[1.0], &[1.0, 2.0]).is_err());
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(paired_speedup_statistics(&[value], &[1.0]).is_err());
+            assert!(paired_speedup_statistics(&[1.0], &[value]).is_err());
+        }
+        assert!(paired_speedup_statistics(&[f64::MAX], &[f64::MIN_POSITIVE]).is_err());
+        assert!(paired_speedup_statistics(&[f64::MIN_POSITIVE], &[f64::MAX]).is_err());
+    }
 }

@@ -430,6 +430,38 @@ pub mod x86 {
         dim: usize,
     ) {
         let mut i = 0;
+        // Two vectors per row keep at most eight output sums live. Reuse
+        // each weight load, zero check and broadcast across both vectors,
+        // leaving room for operands in AVX2's sixteen vector registers.
+        if BT <= 4 {
+            while i + 16 <= dim {
+                let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+                    std::array::from_fn::<_, 2, _>(|j| {
+                        _mm256_loadu_ps(out.as_ptr().add(b * stride + i + j * 8))
+                    })
+                });
+                for (t, _) in weights[0].iter().enumerate() {
+                    let value = std::array::from_fn::<_, 2, _>(|j| {
+                        _mm256_loadu_ps(values.as_ptr().add(t * value_stride + i + j * 8))
+                    });
+                    for (b, row) in sums.iter_mut().enumerate() {
+                        let weight = weights[b][t];
+                        if weight != 0.0 {
+                            let weight = _mm256_set1_ps(weight);
+                            for (sum, value) in row.iter_mut().zip(value) {
+                                *sum = _mm256_fmadd_ps(weight, value, *sum);
+                            }
+                        }
+                    }
+                }
+                for (b, row) in sums.into_iter().enumerate() {
+                    for (j, sum) in row.into_iter().enumerate() {
+                        _mm256_storeu_ps(out.as_mut_ptr().add(b * stride + i + j * 8), sum);
+                    }
+                }
+                i += 16;
+            }
+        }
         while i + 8 <= dim {
             let mut sums = std::array::from_fn::<_, BT, _>(|b| {
                 _mm256_loadu_ps(out.as_ptr().add(b * stride + i))
@@ -724,6 +756,38 @@ pub mod neon {
         dim: usize,
     ) {
         let mut i = 0;
+        // NEON's thirty-two vector registers fit four vectors per row and
+        // their operands. Each coordinate retains its own token-ordered FMA
+        // chain; only weight loads, zero checks and broadcasts are shared.
+        if BT <= 4 {
+            while i + 16 <= dim {
+                let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+                    std::array::from_fn::<_, 4, _>(|j| {
+                        vld1q_f32(out.as_ptr().add(b * stride + i + j * 4))
+                    })
+                });
+                for (t, _) in weights[0].iter().enumerate() {
+                    let value = std::array::from_fn::<_, 4, _>(|j| {
+                        vld1q_f32(values.as_ptr().add(t * value_stride + i + j * 4))
+                    });
+                    for (b, row) in sums.iter_mut().enumerate() {
+                        let weight = weights[b][t];
+                        if weight != 0.0 {
+                            let weight = vdupq_n_f32(weight);
+                            for (sum, value) in row.iter_mut().zip(value) {
+                                *sum = vfmaq_f32(*sum, weight, value);
+                            }
+                        }
+                    }
+                }
+                for (b, row) in sums.into_iter().enumerate() {
+                    for (j, sum) in row.into_iter().enumerate() {
+                        vst1q_f32(out.as_mut_ptr().add(b * stride + i + j * 4), sum);
+                    }
+                }
+                i += 16;
+            }
+        }
         while i + 4 <= dim {
             let mut sums =
                 std::array::from_fn::<_, BT, _>(|b| vld1q_f32(out.as_ptr().add(b * stride + i)));

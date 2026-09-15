@@ -1355,6 +1355,8 @@ impl<'a> LlamaWeights<'a> {
         scratch: &mut BatchScratch,
         allow_shared_prefix: bool,
     ) {
+        use crate::profiling::{Span, Stage};
+        let mut profile = Span::new(Stage::ModelSetup);
         let batch = tokens.len();
         assert_eq!(positions.len(), batch);
         assert_eq!(block_tables.len(), batch);
@@ -1421,6 +1423,7 @@ impl<'a> LlamaWeights<'a> {
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            profile.enter(Stage::Elementwise);
             for b in 0..batch {
                 let span = b * hidden..(b + 1) * hidden;
                 scratch.xb[span.clone()].copy_from_slice(&scratch.x[span]);
@@ -1431,6 +1434,7 @@ impl<'a> LlamaWeights<'a> {
                 );
             }
 
+            profile.enter(Stage::QkvProjection);
             let xb = &scratch.xb[..batch * hidden];
             layer
                 .attention
@@ -1445,6 +1449,7 @@ impl<'a> LlamaWeights<'a> {
                 .wv
                 .apply_batched(&mut scratch.v, xb, batch, &mut scratch.stage);
 
+            profile.enter(Stage::RopeKvWrite);
             // Rotate queries and keys separately: under GQA several query heads
             // share one key head, so driving keys from the query loop would
             // rotate them kv_group times over.
@@ -1489,6 +1494,7 @@ impl<'a> LlamaWeights<'a> {
                 }
             }
 
+            profile.enter(Stage::Attention);
             // Every KV write for this step is done, so the cache is read-only
             // below and the output slices are disjoint.
             if let Some(plan) = &shared_plan {
@@ -1513,6 +1519,7 @@ impl<'a> LlamaWeights<'a> {
                 );
             }
 
+            profile.enter(Stage::OutputProjection);
             let attn_in = &scratch.attn_out[..batch * hidden];
             layer.attention.wo.apply_batched(
                 &mut scratch.proj_out,
@@ -1520,6 +1527,7 @@ impl<'a> LlamaWeights<'a> {
                 batch,
                 &mut scratch.stage,
             );
+            profile.enter(Stage::Elementwise);
             for i in 0..batch * hidden {
                 scratch.x[i] += scratch.proj_out[i];
             }
@@ -1534,6 +1542,7 @@ impl<'a> LlamaWeights<'a> {
                 );
             }
 
+            profile.enter(Stage::FeedForwardProjection);
             let xb = &scratch.xb[..batch * hidden];
             layer.feed_forward.w1.apply_batched(
                 &mut scratch.ff_gate,
@@ -1545,12 +1554,14 @@ impl<'a> LlamaWeights<'a> {
                 .feed_forward
                 .w3
                 .apply_batched(&mut scratch.ff_up, xb, batch, &mut scratch.stage);
+            profile.enter(Stage::Elementwise);
             // SwiGLU is elementwise, so the whole batch goes through in one
             // call — no per-sequence loop, and the two buffers are disjoint
             // fields so both borrows coexist.
             let gate = &mut scratch.ff_gate[..batch * inter];
             let up = &scratch.ff_up[..batch * inter];
             swiglu(gate, up);
+            profile.enter(Stage::FeedForwardProjection);
             let ff = &scratch.ff_gate[..batch * inter];
             layer.feed_forward.w2.apply_batched(
                 &mut scratch.ff_down,
@@ -1558,6 +1569,7 @@ impl<'a> LlamaWeights<'a> {
                 batch,
                 &mut scratch.stage,
             );
+            profile.enter(Stage::Elementwise);
             for i in 0..batch * hidden {
                 scratch.x[i] += scratch.ff_down[i];
             }
@@ -1598,6 +1610,7 @@ impl<'a> LlamaWeights<'a> {
             scratch,
             true,
         );
+        let _profile = crate::profiling::Span::new(crate::profiling::Stage::LmHead);
         let x = &scratch.x[..batch * config.hidden_size];
         self.lm_head
             .apply_batched(&mut scratch.logits, x, batch, &mut scratch.stage);

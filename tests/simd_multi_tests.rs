@@ -111,7 +111,7 @@ fn multi_output_rejects_invalid_layouts_before_writing() {
 }
 
 fn check_weighted_block<const BT: usize>() {
-    for dim in [0, 1, 3, 4, 5, 7, 8, 9, 31, 32, 33, 64] {
+    for dim in [0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
         for tokens in [0, 1, 3, 16, 31] {
             let stride = dim + 3;
             let value_stride = dim + 5;
@@ -171,11 +171,13 @@ fn block_value_sums_match_tokenwise_axpy_with_masks_and_simd_tails() {
     check_weighted_block::<2>();
     check_weighted_block::<3>();
     check_weighted_block::<4>();
+    // Wider row tiles retain the existing single-vector scheduling.
+    check_weighted_block::<5>();
 }
 
 fn check_independent_weight_rows<const BT: usize>(weights: [&[f32]; BT]) {
     let tokens = weights[0].len();
-    for dim in [3, 4, 7, 8, 9, 17] {
+    for dim in [3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
         let stride = dim + 3;
         let value_stride = dim + 5;
         let len = (BT - 1) * stride + dim;
@@ -243,7 +245,7 @@ fn single_token_value_sums_cover_nonzero_and_mixed_zero_paths() {
 fn block_value_sums_apply_zero_masks_independently_to_each_row() {
     // Every token contributes to some rows and is masked in others. In
     // particular, a zero in row 0 must not suppress the other rows' updates.
-    let weights = [
+    let mut weights = [
         [0.0, 0.33333334, -0.0, 0.25, 0.0, -0.33333334],
         [0.25, 0.0, -0.5, 0.0, 0.75, -0.0],
         [-0.5, 1.0000001, 0.0, -0.33333334, -0.0, 0.375],
@@ -251,6 +253,10 @@ fn block_value_sums_apply_zero_masks_independently_to_each_row() {
     ];
     check_independent_weight_rows::<2>(std::array::from_fn(|b| weights[b].as_slice()));
     check_independent_weight_rows::<3>(std::array::from_fn(|b| weights[b].as_slice()));
+    check_independent_weight_rows::<4>(std::array::from_fn(|b| weights[b].as_slice()));
+    // A fully masked row must preserve -0.0 across the unrolled multi-token
+    // loop while the other rows continue to accumulate their own values.
+    weights[2].fill(-0.0);
     check_independent_weight_rows::<4>(std::array::from_fn(|b| weights[b].as_slice()));
 }
 

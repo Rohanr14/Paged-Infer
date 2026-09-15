@@ -7,6 +7,10 @@ edition = "2021"
 default-run = "paged-infer"
 description = "A Bare-Metal Rust Inference Engine with PagedAttention"
 
+[features]
+# Diagnostic stage timers; excluded from normal/performance-gate builds.
+profiling = []
+
 [dependencies]
 # For memory-mapping the model weights directly from disk
 memmap2 = "0.9.0"

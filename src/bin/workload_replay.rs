@@ -524,6 +524,9 @@ fn main() -> Result<()> {
         &mut writer,
         &json!({
             "type": "manifest", "version": 1,
+            "profiling_enabled": paged_infer::profiling::enabled(),
+            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+            "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.",
             "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             "identity": identity, "model_path": model_path, "workload_path": args.workload,
             "workload": workload, "configs": configs, "repeats": args.repeats,

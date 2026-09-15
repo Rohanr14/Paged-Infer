@@ -100,8 +100,47 @@ declared long-context shared-prefix workload, with no more than 5% regression in
 the no-sharing fallback. Kernel speedups alone do not satisfy it. Keep the option
 off unless measurements justify enabling it for the intended model and traffic.
 
+## Profiling and paired statistics
 
-## Apple M2 measurements, 2026-09-15
+Add `--features profiling` to the release Cargo command above to collect
+diagnostic stage timings. Shared-decode, kernel-sweep and replay manifests mark
+these builds with `profiling_enabled: true` and
+`performance_gate_eligible: false`. Timer and counter overhead can change the
+result, so collect performance evidence separately with profiling disabled.
+Ordinary builds report `profiling_enabled: false`; their shared-decode `profile`
+arrays are empty. Older artifacts without these fields must be interpreted using
+their recorded source and build fingerprints.
+
+The shared-decode benchmark resets profiling counters after each full-range
+warmup and captures a `profile` snapshot after the measured decode loop.
+`model_main` spans cover model stages such as projections and attention.
+`attention_main` setup/scatter spans and `attention_workers` lane spans sit
+inside model attention. Worker totals sum overlapping elapsed spans, including
+scheduling delay; they are not CPU time or exclusive wall time. Do not add these
+scopes together. Counters are process-global, so resetting or interpreting them
+also requires that other inference work is absent and workers have joined.
+
+Shared-decode summaries retain the existing ratio of separate elapsed-time
+medians and add `paired_elapsed_time_speedup`: every same-repeat
+baseline/candidate elapsed-time ratio, plus its median, minimum and maximum.
+Ratios above one favor the candidate. The paired median uses the midpoint of
+both middle ratios for even sample counts; the legacy marginal p50 fields keep
+their nearest-rank convention.
+
+The reported 95% interval uses 10,000 deterministic paired bootstrap resamples.
+Each draws the original number of complete repeat pairs with replacement and
+recomputes the median ratio; nearest-rank 2.5th and 97.5th percentiles provide
+the endpoints. The artifact records the fixed seed, generator and estimator.
+One pair produces no interval, and fewer than ten pairs trigger a caution;
+ten is not a validity threshold. This assumes independent, exchangeable repeat
+pairs and does not correct thermal drift, serial dependence or order effects.
+Small samples can under-cover, and narrow or zero-width intervals do not
+guarantee future gains. Increase `SHARED_DECODE_STEPS` for longer timed runs and
+`SHARED_DECODE_REPS` for more pairs; steps within one run are not independent
+bootstrap observations. Retain every sample and compare equivalent workloads
+and build fingerprints.
+
+## Historical Apple M2 measurements, 2026-09-15 (`017c3e8`)
 
 The declared real-model case is Llama 3.2 1B with int8 projections, 4,096 prompt
 positions, eight sequences, eight measured steps and four Rayon workers. Each
@@ -116,8 +155,9 @@ These are developer-workstation measurements on Apple M2 / 16 GiB, NEON and Rust
 other system activity was uncontrolled. The raw reports retain all timed samples,
 per-step latencies, full outputs, model/input hashes and build source hashes in
 [the measurement directory](measurements/shared-prefix-m2/README.md). The measured
-source snapshot matches the implementation commit; later edits only move or
-clarify tests and document the evidence.
+source snapshot matches implementation commit `017c3e8`. Subsequent profiling
+and optimization changes require their own measured builds and source
+fingerprints; the historical figures below do not describe those revisions.
 
 An earlier value kernel measured 0.788x median throughput. Keeping value sums in
 registers across each physical block raised the next run to 1.106x. Review then

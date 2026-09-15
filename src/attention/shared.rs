@@ -83,6 +83,8 @@ impl<'a> SharedPrefixPlan<'a> {
         layer: usize,
         scratch: &mut SharedPrefixScratch,
     ) {
+        use crate::profiling::{Span, Stage};
+        let setup_profile = Span::new(Stage::SharedSetup);
         let batch = self.entries.len();
         let (heads, dim, stride) = (attn.num_heads, attn.head_dim, attn.score_stride);
         assert_eq!(attn.block_size, self.block_size);
@@ -106,10 +108,12 @@ impl<'a> SharedPrefixPlan<'a> {
         }
         let scale = 1.0 / (dim as f32).sqrt();
         let token_stride = attn.layout.num_kv_heads * 2 * dim;
+        drop(setup_profile);
         scratch.work[..work_len]
             .par_chunks_mut(lane_len)
             .enumerate()
             .for_each(|(lane, work)| {
+                let mut profile = Span::new(Stage::SharedPack);
                 let b0 = lane / head_lanes * TILE;
                 let h0 = lane % head_lanes * d;
                 let kv_h = h0 / attn.kv_group;
@@ -124,6 +128,7 @@ impl<'a> SharedPrefixPlan<'a> {
                         queries[(g * TILE + row) * dim..][..dim]
                             .copy_from_slice(&q[offset..][..dim]);
                     }
+                    profile.enter(Stage::PrivateScores);
                     self.private_scores(
                         attn,
                         scores,
@@ -138,12 +143,14 @@ impl<'a> SharedPrefixPlan<'a> {
                         self.start,
                         scale,
                     );
+                    profile.enter(Stage::SharedPack);
                 }
                 let shared = AttnEntry {
                     block_table: self.entries[0].block_table,
                     start: self.start,
                     pos: self.end - 1,
                 };
+                profile.enter(Stage::SharedScores);
                 for_each_block(shared, self.block_size, |si, off, take, pb| {
                     let base = attn.layout.index(
                         layer,
@@ -173,6 +180,7 @@ impl<'a> SharedPrefixPlan<'a> {
                 });
                 for row in 0..count {
                     let entry = self.entries[b0 + row];
+                    profile.enter(Stage::PrivateScores);
                     self.private_scores(
                         attn,
                         scores,
@@ -187,11 +195,13 @@ impl<'a> SharedPrefixPlan<'a> {
                         entry.pos + 1,
                         scale,
                     );
+                    profile.enter(Stage::Softmax);
                     for g in 0..d {
                         softmax_in_place(
                             &mut scores[(g * TILE + row) * stride..][..entry.window_len()],
                         );
                     }
+                    profile.enter(Stage::PrivateValues);
                     self.private_values(
                         attn,
                         values,
@@ -206,6 +216,7 @@ impl<'a> SharedPrefixPlan<'a> {
                         self.start,
                     );
                 }
+                profile.enter(Stage::SharedValues);
                 for_each_block(shared, self.block_size, |si, off, take, pb| {
                     let base = attn.layout.index(
                         layer,
@@ -261,6 +272,7 @@ impl<'a> SharedPrefixPlan<'a> {
                 });
                 for row in 0..count {
                     let entry = self.entries[b0 + row];
+                    profile.enter(Stage::PrivateValues);
                     self.private_values(
                         attn,
                         values,
@@ -277,6 +289,7 @@ impl<'a> SharedPrefixPlan<'a> {
                 }
             });
 
+        let _scatter_profile = Span::new(Stage::SharedScatter);
         // Packed lanes are disjoint during parallel computation. Scatter only
         // afterwards, avoiding aliased mutable slices or raw output pointers.
         for (lane, work) in scratch.work[..work_len].chunks_exact(lane_len).enumerate() {
