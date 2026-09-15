@@ -386,7 +386,7 @@ fn process_usage() -> Option<ProcessUsage> {
 fn update_logit_digest(digest: &mut Sha256, logits: &[f32]) {
     let mut bytes = [0u8; 1024];
     for chunk in logits.chunks(bytes.len() / size_of::<f32>()) {
-        for (value, encoded) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+        for (value, encoded) in chunk.iter().zip(bytes.as_chunks_mut::<4>().0) {
             encoded.copy_from_slice(&value.to_bits().to_le_bytes());
         }
         digest.update(&bytes[..std::mem::size_of_val(chunk)]);
