@@ -291,13 +291,39 @@ fn shared_key_pairs_cover_odd_blocks_windows_and_query_tile_tails() {
         let views: Vec<_> = mappings.iter().map(Vec::as_slice).collect();
         let positions: Vec<_> = (0..batch).map(|row| 16 + row % 3).collect();
         for dim in [17, 64] {
-            let case = Case::new(2, 4, dim, 5, &views);
-            for common_start in [0usize, 2, 4, 12, 13, 14] {
-                let starts: Vec<_> = (0..batch)
-                    .map(|row| common_start.saturating_sub(row % 3))
-                    .collect();
-                case.check(&positions, &starts, Some(15 - common_start), &mut scratch);
+            // Eight KV heads at dim64 exercises the measured paired-key path;
+            // the other shapes retain the ordinary shared-score schedule.
+            for kv_heads in [2, 8] {
+                let case = Case::new(kv_heads, 4, dim, 5, &views);
+                for common_start in [0usize, 2, 4, 12, 13, 14] {
+                    let starts: Vec<_> = (0..batch)
+                        .map(|row| common_start.saturating_sub(row % 3))
+                        .collect();
+                    case.check(&positions, &starts, Some(15 - common_start), &mut scratch);
+                }
             }
+        }
+    }
+}
+
+#[test]
+fn long_shared_prefix_matches_across_score_tile_threshold() {
+    let mut scratch = SharedPrefixScratch::default();
+    // 412 shared five-token blocks give 2,060 positions. These windows straddle
+    // the 2,048-position dispatch threshold and leave odd partial block spans.
+    // The declared model shape has 32 query heads, 8 KV heads, and dimension 64.
+    for batch in [3, 5, 6, 8] {
+        let mappings: Vec<Vec<_>> = (0..batch)
+            .map(|row| (0..412).chain(std::iter::once(412 + row)).collect())
+            .collect();
+        let views: Vec<_> = mappings.iter().map(Vec::as_slice).collect();
+        let positions: Vec<_> = (0..batch).map(|row| 2061 + row % 3).collect();
+        let case = Case::new(8, 4, 64, 5, &views);
+        for common_start in [11usize, 12, 13] {
+            let starts: Vec<_> = (0..batch)
+                .map(|row| common_start.saturating_sub(row % 3))
+                .collect();
+            case.check(&positions, &starts, Some(2060 - common_start), &mut scratch);
         }
     }
 }

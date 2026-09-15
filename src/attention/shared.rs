@@ -108,6 +108,14 @@ impl<'a> SharedPrefixPlan<'a> {
         }
         let scale = 1.0 / (dim as f32).sqrt();
         let token_stride = attn.layout.num_kv_heads * 2 * dim;
+        // Query reuse helps long common prefixes in the measured Llama shape,
+        // but regresses shorter contexts and TinyLlama's wider GQA groups.
+        // Retain the established score schedule outside that measured range.
+        #[cfg(target_arch = "aarch64")]
+        let pair_shared_keys = heads == 32
+            && attn.layout.num_kv_heads == 8
+            && dim == 64
+            && self.prefix_tokens() >= 2048;
         drop(setup_profile);
         scratch.work[..work_len]
             .par_chunks_mut(lane_len)
@@ -159,7 +167,53 @@ impl<'a> SharedPrefixPlan<'a> {
                         kv_h,
                         false,
                     );
-                    for i in 0..take {
+                    #[cfg(target_arch = "aarch64")]
+                    let first_single_key = {
+                        let mut i = 0;
+                        if pair_shared_keys && count > 1 {
+                            // Pair keys only inside this physical block. Each
+                            // 2-query tile reuses its query loads across both
+                            // keys while retaining independent dot reductions.
+                            while i + 1 < take {
+                                let keys =
+                                    &kv_cache[base + i * token_stride..][..token_stride + dim];
+                                for g in 0..d {
+                                    for row0 in (0..count).step_by(2) {
+                                        let query_pair =
+                                            &queries[(g * TILE + row0) * dim..][..2 * dim];
+                                        let dots = crate::simd::neon::dot_queries2_keys2(
+                                            query_pair,
+                                            dim,
+                                            keys,
+                                            token_stride,
+                                            dim,
+                                        );
+                                        for (key_offset, key_dots) in dots.iter().enumerate() {
+                                            for (query_offset, dot) in key_dots
+                                                .iter()
+                                                .take((count - row0).min(2))
+                                                .enumerate()
+                                            {
+                                                let row = row0 + query_offset;
+                                                let offset = self.start
+                                                    - self.entries[b0 + row].start
+                                                    + si
+                                                    + i
+                                                    + key_offset;
+                                                scores[(g * TILE + row) * stride + offset] =
+                                                    dot * scale;
+                                            }
+                                        }
+                                    }
+                                }
+                                i += 2;
+                            }
+                        }
+                        i
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let first_single_key = 0;
+                    for i in first_single_key..take {
                         let k = &kv_cache[base + i * token_stride..][..dim];
                         for g in 0..d {
                             let query_group = &queries[g * TILE * dim..][..TILE * dim];
