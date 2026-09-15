@@ -1,10 +1,10 @@
 //! Paged attention over a ragged batch.
 //!
-//! Attention is the one part of a decode step that cannot amortize across the
-//! batch. Every other operand — every projection, every FFN matrix — is shared,
-//! so batching reads it once and reuses each row. The KV cache is not shared:
-//! each sequence has its own history, its own position, its own scattered block
-//! table. Batching cannot make attention cheaper *per sequence*.
+//! Unrelated histories require independent KV reads. Shared physical prefixes
+//! offer an additional opportunity: the optional [`SharedPrefixPlan`] reuses
+//! vector loads across decode queries while preserving full-window softmax.
+//! The default kernel below groups GQA heads within each sequence and handles
+//! every ragged batch, including the fallback for unrelated prefixes.
 //!
 //! What it can do is stop making it more expensive than it has to be. Two costs
 //! in the obvious implementation are pure overhead:
@@ -37,6 +37,9 @@ use rayon::prelude::*;
 use crate::math::{axpy, dot, softmax_in_place};
 use crate::memory::block_table::BlockTable;
 use crate::memory::layout::KvLayout;
+
+mod shared;
+pub use shared::{SharedPrefixPlan, SharedPrefixScratch};
 
 /// Tasks per thread the lane scheduler aims for.
 ///

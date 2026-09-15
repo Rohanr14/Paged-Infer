@@ -1,0 +1,23 @@
+replay lifecycle-baseline repeat 1/2
+replay lifecycle-shared repeat 1/2
+replay lifecycle-shared repeat 2/2
+replay lifecycle-baseline repeat 2/2
+report: target/shared-attention-validation/score-tile/lifecycle/replay.jsonl
+      267.48 real       894.03 user        17.32 sys
+          4796399616  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1048133  page reclaims
+              238640  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 185  voluntary context switches
+             1402694  involuntary context switches
+       8882132667291  instructions retired
+       2442827807513  cycles elapsed
+          2368933704  peak memory footprint

@@ -140,22 +140,41 @@ Each line is one JSON object:
 1. `manifest`: schema version, trace, effective configurations, SHA-256 of
    checkpoint/config/generation-config/workload bytes and configuration values,
    quantization, repeats/limits and environment information.
-2. `run`: configuration name, repeat, order, weight storage bytes, and the full
-   replay report. Requests include every generated token and terminal reason,
-   submission/cancellation timing, per-sequence timing and delivery batches.
+2. `run`: configuration name, repeat, order, weight storage bytes, a diagnostic
+   `profile` array, and the full replay report. Requests include every generated
+   token and terminal reason, submission/cancellation timing, per-sequence timing
+   and delivery batches.
 3. `config_summary`: nearest-rank p50/p95/p99/max across all run values, plus
    pooled latency distributions using all observations across all repeats.
 4. `verification`: a completion marker and exact output verification result.
    `passed` is null when verification was not requested.
 
 The environment records OS/architecture, CPU when available, actual Rayon
-threads, selected SIMD backend, and debug-assertion/build mode. The nested
+threads, the requested `PAGED_INFER_MATMUL_TILE` value, selected SIMD backend,
+and debug-assertion/build mode. The nested
 `build` object embeds the build's actual `RUSTC -Vv`, target, profile,
 optimization/debug settings, Rust flags, Git revision/dirty state, and a SHA-256
 of `src`, Cargo files, `build.rs`, and `.cargo` configuration. Runtime
 `rustc_on_path`, `git_head_at_run`, and `rustflags_env_at_run` remain separate:
 they can differ when a previously built executable runs in another checkout.
 Keep the build command and checkout with published benchmark results.
+
+Build with `--features profiling` to populate each run's `profile` with stage,
+scope, call count, and elapsed-time totals. Counters reset after engine warmup
+and reset, immediately before replay, and are sampled immediately after replay,
+before comparisons or reporting. Ordinary builds emit an empty array. Older
+version-1 reports without the field remain valid for output comparison.
+Instrumented manifests set `profiling_enabled: true` and
+`performance_gate_eligible: false`: timer/counter overhead makes these runs
+diagnostic, not performance-gate evidence.
+
+Profiles cover the instrumented batched CPU model stages, including the final
+prefill LM head. Scheduler work, prefix-cache management, sampling, delivery,
+and prefill wrapper work outside those spans are not separate profile stages.
+`model_main`, nested `attention_main`, and summed `attention_workers` timings
+overlap. Worker totals include scheduling delay and are not CPU time. Do not
+add scopes or equate their sum or residual with complete request latency; these
+profiles do not claim coverage of every production execution path.
 
 Every sequence's first observable token yields one TTFT sample. Engine queue
 time is the engine's own admission wait; for wall-clock traces, driver dispatch

@@ -1,0 +1,37 @@
+   Compiling paged-infer v0.1.0 (/Users/rohan/VSCode/Paged-Infer)
+    Finished `release` profile [optimized] target(s) in 10.99s
+     Running unittests src/bin/shared_decode_benchmark.rs (target/release/deps/shared_decode_benchmark-05527b12694e14df)
+
+running 10 tests
+test statistical_tests::full_logit_digest_preserves_bits_across_steps_and_chunk_boundaries ... ok
+test statistical_tests::diagnostics_keep_aggregate_and_order_effects_separate ... ok
+test statistical_tests::invalid_pairs_are_refused_instead_of_serializing_invalid_statistics ... ok
+test statistical_tests::median_uses_both_middle_values_for_even_samples ... ok
+test statistical_tests::one_pair_has_no_claimed_uncertainty_interval ... ok
+test statistical_tests::process_deltas_subtract_counters_and_refuse_decreasing_snapshots ... ok
+test statistical_tests::constant_paired_effect_does_not_invent_independent_run_noise ... ok
+test statistical_tests::two_pair_interval_covers_the_exact_resampling_distribution_endpoints ... ok
+test statistical_tests::paired_median_preserves_repeat_matching ... ok
+test statistical_tests::bootstrap_is_reproducible_and_invariant_to_time_units ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/shared_attention_engine_tests.rs (target/release/deps/shared_attention_engine_tests-93d4503b921edde3)
+
+running 5 tests
+test prefill_stays_on_default_and_cancellation_reset_releases_mappings ... ok
+test millisecond_arrivals_preserve_outputs_and_deadline_accounting ... ok
+test seeded_samples_match_after_copy_on_write_and_preemption ... ok
+test replay_parity_covers_prefix_forks_cancellation_and_pressure ... ok
+test speculative_verification_and_rollback_keep_greedy_outputs ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/shared_decode_cli_tests.rs (target/release/deps/shared_decode_cli_tests-897760c927c37316)
+
+running 2 tests
+test nonaligned_context_is_refused_before_preparing_weights ... ok
+test genuine_kv_and_outputs_are_invariant_to_physical_sharing ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+

@@ -328,6 +328,7 @@ fn hardware() -> Value {
         "logical_cpus": std::thread::available_parallelism().ok().map(|n| n.get()),
         "rayon_threads": rayon::current_num_threads(),
         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
+        "matmul_tile_env": std::env::var("PAGED_INFER_MATMUL_TILE").ok(),
         "simd": paged_infer::simd::backend(),
         "build": {
             "rustc": env!("PAGED_BUILD_RUSTC"),
@@ -524,6 +525,9 @@ fn main() -> Result<()> {
         &mut writer,
         &json!({
             "type": "manifest", "version": 1,
+            "profiling_enabled": paged_infer::profiling::enabled(),
+            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+            "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.",
             "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             "identity": identity, "model_path": model_path, "workload_path": args.workload,
             "workload": workload, "configs": configs, "repeats": args.repeats,
@@ -553,8 +557,11 @@ fn main() -> Result<()> {
             let mut engine = Engine::new(weights, model.clone(), config.engine.clone());
             engine.warm_up();
             engine.reset();
-            let report = run(&mut engine, &workload, &args.limits)
-                .with_context(|| format!("{} repeat {}", config.name, repeat + 1))?;
+            paged_infer::profiling::reset();
+            let replay_result = run(&mut engine, &workload, &args.limits);
+            let profile = paged_infer::profiling::snapshot();
+            let report =
+                replay_result.with_context(|| format!("{} repeat {}", config.name, repeat + 1))?;
             if args.verify {
                 if let Some(expected) = &first_report {
                     if let Err(error) = compare_outputs(expected, &report) {
@@ -581,7 +588,7 @@ fn main() -> Result<()> {
             }
             write_record(
                 &mut writer,
-                &json!({"type": "run", "config": config.name, "repeat": repeat + 1, "order_in_repeat": slot + 1, "weight_bytes": weight_bytes, "report": report}),
+                &json!({"type": "run", "config": config.name, "repeat": repeat + 1, "order_in_repeat": slot + 1, "weight_bytes": weight_bytes, "profile": profile, "report": report}),
             )?;
             reports[index].push(report);
         }

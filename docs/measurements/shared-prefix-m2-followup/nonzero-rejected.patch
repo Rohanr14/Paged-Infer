@@ -1,0 +1,135 @@
+diff --git a/src/simd.rs b/src/simd.rs
+index bf84345..9fd5b16 100644
+--- a/src/simd.rs
++++ b/src/simd.rs
+@@ -428,6 +428,30 @@ pub mod x86 {
+         values: &[f32],
+         value_stride: usize,
+         dim: usize,
++    ) {
++        // Scan once per block instead of checking each weight again for
++        // every dimension tile. NaN weights remain active, as in axpy.
++        let all_nonzero = BT <= 4
++            && weights.first().is_some_and(|row| row.len() > 1)
++            && weights.iter().all(|row| row.iter().all(|&w| w != 0.0));
++        if all_nonzero {
++            weighted_sum_multi_impl::<BT, false>(out, stride, weights, values, value_stride, dim);
++        } else {
++            weighted_sum_multi_impl::<BT, true>(out, stride, weights, values, value_stride, dim);
++        }
++    }
++
++    // CHECK_ZERO=false additionally requires every weight to compare unequal
++    // to zero. The public backend entry above establishes that condition.
++    #[inline]
++    #[target_feature(enable = "avx2,fma")]
++    unsafe fn weighted_sum_multi_impl<const BT: usize, const CHECK_ZERO: bool>(
++        out: &mut [f32],
++        stride: usize,
++        weights: [&[f32]; BT],
++        values: &[f32],
++        value_stride: usize,
++        dim: usize,
+     ) {
+         let mut i = 0;
+         // Two vectors per row keep at most eight output sums live. Reuse
+@@ -446,7 +470,7 @@ pub mod x86 {
+                     });
+                     for (b, row) in sums.iter_mut().enumerate() {
+                         let weight = weights[b][t];
+-                        if weight != 0.0 {
++                        if !CHECK_ZERO || weight != 0.0 {
+                             let weight = _mm256_set1_ps(weight);
+                             for (sum, value) in row.iter_mut().zip(value) {
+                                 *sum = _mm256_fmadd_ps(weight, value, *sum);
+@@ -470,7 +494,7 @@ pub mod x86 {
+                 let value = _mm256_loadu_ps(values.as_ptr().add(t * value_stride + i));
+                 for b in 0..BT {
+                     let weight = weights[b][t];
+-                    if weight != 0.0 {
++                    if !CHECK_ZERO || weight != 0.0 {
+                         sums[b] = _mm256_fmadd_ps(_mm256_set1_ps(weight), value, sums[b]);
+                     }
+                 }
+@@ -754,6 +778,29 @@ pub mod neon {
+         values: &[f32],
+         value_stride: usize,
+         dim: usize,
++    ) {
++        // Both signs of zero select the masked path. Nonfinite weights keep
++        // the same arithmetic as the original per-row check.
++        let all_nonzero = BT <= 4
++            && weights.first().is_some_and(|row| row.len() > 1)
++            && weights.iter().all(|row| row.iter().all(|&w| w != 0.0));
++        if all_nonzero {
++            weighted_sum_multi_impl::<BT, false>(out, stride, weights, values, value_stride, dim);
++        } else {
++            weighted_sum_multi_impl::<BT, true>(out, stride, weights, values, value_stride, dim);
++        }
++    }
++
++    // CHECK_ZERO=false additionally requires every weight to compare unequal
++    // to zero. The public backend entry above establishes that condition.
++    #[inline]
++    unsafe fn weighted_sum_multi_impl<const BT: usize, const CHECK_ZERO: bool>(
++        out: &mut [f32],
++        stride: usize,
++        weights: [&[f32]; BT],
++        values: &[f32],
++        value_stride: usize,
++        dim: usize,
+     ) {
+         let mut i = 0;
+         // NEON's thirty-two vector registers fit four vectors per row and
+@@ -772,7 +819,7 @@ pub mod neon {
+                     });
+                     for (b, row) in sums.iter_mut().enumerate() {
+                         let weight = weights[b][t];
+-                        if weight != 0.0 {
++                        if !CHECK_ZERO || weight != 0.0 {
+                             let weight = vdupq_n_f32(weight);
+                             for (sum, value) in row.iter_mut().zip(value) {
+                                 *sum = vfmaq_f32(*sum, weight, value);
+@@ -795,7 +842,7 @@ pub mod neon {
+                 let value = vld1q_f32(values.as_ptr().add(t * value_stride + i));
+                 for b in 0..BT {
+                     let weight = weights[b][t];
+-                    if weight != 0.0 {
++                    if !CHECK_ZERO || weight != 0.0 {
+                         sums[b] = vfmaq_f32(sums[b], vdupq_n_f32(weight), value);
+                     }
+                 }
+diff --git a/tests/simd_multi_tests.rs b/tests/simd_multi_tests.rs
+index c8e9eb7..37d6a8f 100644
+--- a/tests/simd_multi_tests.rs
++++ b/tests/simd_multi_tests.rs
+@@ -241,6 +241,29 @@ fn single_token_value_sums_cover_nonzero_and_mixed_zero_paths() {
+     }
+ }
+ 
++#[test]
++fn multi_token_value_sums_cover_all_nonzero_specialization() {
++    for tokens in [2, 3, 16, 17, 31] {
++        let weights: [Vec<f32>; 4] = std::array::from_fn(|b| {
++            (0..tokens)
++                .map(|t| {
++                    let magnitude = (b * 13 + t + 1) as f32 * 0.021 + 0.001;
++                    if (b + t).is_multiple_of(2) {
++                        magnitude
++                    } else {
++                        -magnitude
++                    }
++                })
++                .collect()
++        });
++        assert!(weights.iter().all(|row| row.iter().all(|&w| w != 0.0)));
++        check_independent_weight_rows::<1>(std::array::from_fn(|b| weights[b].as_slice()));
++        check_independent_weight_rows::<2>(std::array::from_fn(|b| weights[b].as_slice()));
++        check_independent_weight_rows::<3>(std::array::from_fn(|b| weights[b].as_slice()));
++        check_independent_weight_rows::<4>(std::array::from_fn(|b| weights[b].as_slice()));
++    }
++}
++
+ #[test]
+ fn block_value_sums_apply_zero_masks_independently_to_each_row() {
+     // Every token contributes to some rows and is masked in others. In

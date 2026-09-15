@@ -1,0 +1,150 @@
+{
+  "diagnostic_source_sha256": "9683cfbedf0bb2afec62ed8f1af0a95349cfb4d3867d5907367c18ea8e39fe45",
+  "ordinary_source_sha256": "70f9795a937084955d1cc8f1977b743cc85d53bfa7b44b789ea42ca8a57e1b77",
+  "diagnostic_elapsed_ms": 48388.482500000006,
+  "diagnostic_model_main_ms": 48386.679917,
+  "diagnostic_profile": [
+    {
+      "calls": 65,
+      "elapsed_ms": 264.955081,
+      "scope": "model_main",
+      "stage": "model_setup",
+      "percent_of_model_main": 0.5475785514825364
+    },
+    {
+      "calls": 4160,
+      "elapsed_ms": 802.17333,
+      "scope": "model_main",
+      "stage": "elementwise",
+      "percent_of_model_main": 1.6578391643650825
+    },
+    {
+      "calls": 1040,
+      "elapsed_ms": 5143.459395,
+      "scope": "model_main",
+      "stage": "qkv_projection",
+      "percent_of_model_main": 10.629907660171813
+    },
+    {
+      "calls": 1040,
+      "elapsed_ms": 37.411893,
+      "scope": "model_main",
+      "stage": "rope_kv_write",
+      "percent_of_model_main": 0.07731857830331491
+    },
+    {
+      "calls": 1040,
+      "elapsed_ms": 4771.264847,
+      "scope": "model_main",
+      "stage": "attention",
+      "percent_of_model_main": 9.860698967534827
+    },
+    {
+      "calls": 1040,
+      "elapsed_ms": 3002.625692,
+      "scope": "model_main",
+      "stage": "output_projection",
+      "percent_of_model_main": 6.205479890644591
+    },
+    {
+      "calls": 2080,
+      "elapsed_ms": 34217.621012,
+      "scope": "model_main",
+      "stage": "feed_forward_projection",
+      "percent_of_model_main": 70.71702598875379
+    },
+    {
+      "calls": 1,
+      "elapsed_ms": 147.168667,
+      "scope": "model_main",
+      "stage": "lm_head",
+      "percent_of_model_main": 0.3041511987440459
+    }
+  ],
+  "pairs": [
+    {
+      "pair": 1,
+      "order": [
+        4,
+        6
+      ],
+      "tile4": {
+        "elapsed_ms": 48164.056458,
+        "prefill_ms": 48163.558245,
+        "ttft_ms": 48164.049917000004,
+        "prompt_tokens_per_second": 42.54209779416666
+      },
+      "tile6": {
+        "elapsed_ms": 48818.13325,
+        "prefill_ms": 48817.667086,
+        "ttft_ms": 48818.125167000006,
+        "prompt_tokens_per_second": 41.97210879627398
+      },
+      "elapsed_ratio_4_over_6": 0.9866017656052016,
+      "latency_reduction_percent": -1.3580184895148228
+    },
+    {
+      "pair": 2,
+      "order": [
+        6,
+        4
+      ],
+      "tile4": {
+        "elapsed_ms": 50740.790167,
+        "prefill_ms": 50740.304661,
+        "ttft_ms": 50740.782625,
+        "prompt_tokens_per_second": 40.38171248922719
+      },
+      "tile6": {
+        "elapsed_ms": 49266.768458,
+        "prefill_ms": 49266.291168,
+        "ttft_ms": 49266.76225000001,
+        "prompt_tokens_per_second": 41.58990053806301
+      },
+      "elapsed_ratio_4_over_6": 1.0299191880274552,
+      "latency_reduction_percent": 2.9050034580633155
+    },
+    {
+      "pair": 3,
+      "order": [
+        4,
+        6
+      ],
+      "tile4": {
+        "elapsed_ms": 51054.688583999996,
+        "prefill_ms": 51053.412961,
+        "ttft_ms": 51054.679833,
+        "prompt_tokens_per_second": 40.133434496007
+      },
+      "tile6": {
+        "elapsed_ms": 53564.580292,
+        "prefill_ms": 53562.996337000004,
+        "ttft_ms": 53564.569709,
+        "prompt_tokens_per_second": 38.25289004095909
+      },
+      "elapsed_ratio_4_over_6": 0.9531426981352664,
+      "latency_reduction_percent": -4.916084648857444
+    }
+  ],
+  "paired_median_elapsed_ratio_4_over_6": 0.9866017656052016,
+  "observed_ratio_range": [
+    0.9531426981352664,
+    1.0299191880274552
+  ],
+  "exact_output_signature": [
+    [
+      "cold-prefill",
+      [
+        [
+          [
+            13
+          ],
+          "length"
+        ]
+      ]
+    ]
+  ],
+  "all_three_pairs_improve": false,
+  "conclusion": "Reject and revert candidate",
+  "limitations": "Three serial pairs on an uncontrolled desktop; no reliable tail or confidence-bound estimate; cold prefill only; defaults remain unchanged; not shared-attention gate evidence."
+}

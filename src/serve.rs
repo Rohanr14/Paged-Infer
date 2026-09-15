@@ -169,6 +169,9 @@ pub struct Metrics {
     pub sequences_deferred: usize,
     pub preemptions: usize,
     pub recomputed_tokens: usize,
+    pub shared_attention_layer_calls: usize,
+    pub shared_attention_query_tokens: usize,
+    pub shared_attention_scratch_bytes: usize,
 }
 
 /// A request in flight, held until every sibling sample of it has finished.
@@ -459,6 +462,7 @@ fn publish_metrics(engine: &Engine<'_>, shared: &Shared) {
     let s = engine.stats();
     let prefix = engine.prefix_stats();
     let (active, queued) = engine.queue_depth();
+    let shared_attention = engine.shared_attention_stats();
     let m = Metrics {
         prompt_tokens: s.prompt_tokens,
         prompt_tokens_prefilled: s.prompt_tokens_prefilled,
@@ -483,6 +487,9 @@ fn publish_metrics(engine: &Engine<'_>, shared: &Shared) {
         sequences_deferred: engine.deferred_sequences(),
         preemptions: s.preemptions,
         recomputed_tokens: s.recomputed_tokens,
+        shared_attention_layer_calls: shared_attention.layer_calls,
+        shared_attention_query_tokens: shared_attention.query_tokens,
+        shared_attention_scratch_bytes: shared_attention.scratch_bytes,
     };
     *shared.metrics.lock().unwrap_or_else(|e| e.into_inner()) = m;
 }
@@ -1500,6 +1507,9 @@ fn metrics_body(m: &Metrics, connections: usize) -> Value {
         "sequences_deferred": m.sequences_deferred,
         "preemptions": m.preemptions,
         "recomputed_tokens": m.recomputed_tokens,
+        "shared_attention_layer_calls": m.shared_attention_layer_calls,
+        "shared_attention_query_tokens": m.shared_attention_query_tokens,
+        "shared_attention_scratch_bytes": m.shared_attention_scratch_bytes,
         "connections": connections,
         "prefix_cache_tokens_saved": m.prefix_tokens_saved,
         "prompt_tokens": m.prompt_tokens,
@@ -1612,6 +1622,24 @@ pub fn prometheus(m: &Metrics, connections: usize) -> String {
         "counter",
         "Tokens processed for resumed sequences or repeated after partial-prefill eviction.",
         m.recomputed_tokens as f64,
+    );
+    metric(
+        "paged_infer_shared_attention_layer_calls_total",
+        "counter",
+        "Decode layer calls that used shared-prefix attention.",
+        m.shared_attention_layer_calls as f64,
+    );
+    metric(
+        "paged_infer_shared_attention_query_tokens_total",
+        "counter",
+        "Common attended positions times query entries, summed across shared attention layers.",
+        m.shared_attention_query_tokens as f64,
+    );
+    metric(
+        "paged_infer_shared_attention_scratch_bytes",
+        "gauge",
+        "Retained additional packed-attention scratch capacity, not total scratch or RSS.",
+        m.shared_attention_scratch_bytes as f64,
     );
     metric(
         "paged_infer_kv_blocks",

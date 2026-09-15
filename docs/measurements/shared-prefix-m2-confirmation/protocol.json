@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "purpose": "PR16 merge-readiness confirmation; fixed before measurement; no numerical or kernel change.",
+  "base_revision": "cd1a45d3e1ab6b88c6c95b498a4d17bf6a1b4cd2",
+  "source_freeze": "Record compiled source and executable hashes after harness-only evidence additions and tests, before timing. All sessions use the same ordinary binary.",
+  "checkpoint": "models/llama3-reference/checkpoint/model.safetensors",
+  "checkpoint_sha256": "68a2e4be76fa709455a60272fba8e512c02d81c46e6c671cc9449e374fd6809a",
+  "settings": {
+    "context": 4096,
+    "batch": 8,
+    "steps": 16,
+    "pairs_per_case": 12,
+    "threads": 4,
+    "quantization": "int8",
+    "matmul_tile": 4,
+    "attention_lanes_per_thread": 2,
+    "features": []
+  },
+  "sessions": [
+    {
+      "name": "A",
+      "sharing_percentages": [
+        90,
+        0
+      ]
+    },
+    {
+      "name": "B",
+      "sharing_percentages": [
+        0,
+        90
+      ]
+    }
+  ],
+  "pair_order": "Alternating baseline/shared for odd repeats, shared/baseline for even repeats, as the existing benchmark.",
+  "scope": "Steady-state full-model decode including vocabulary projection, finite-logit scan, greedy selection and token recording. Loading, prepared KV, full-range warmup, validation and reporting excluded. EOS is an ordinary token in this fixed-step benchmark.",
+  "evidence_additions": "Untimed warmup hashes every complete logit row at every step; each measured run retains UNIX start time, warmup duration and optional outside-the-loop process CPU/fault/context-switch deltas. Timed arithmetic and outputs are unchanged.",
+  "performance_acceptance": {
+    "primary": "Keep the existing median of paired baseline/candidate elapsed ratios and its deterministic 10000-resample paired-bootstrap descriptive interval.",
+    "shared_each_session": {
+      "minimum_paired_median": 1.15,
+      "minimum_descriptive_interval_lower": 1.15
+    },
+    "control_each_session": {
+      "minimum_paired_median": 0.95,
+      "minimum_descriptive_interval_lower": 0.95
+    },
+    "additional_merge_safeguards": {
+      "minimum_shared_aggregate_throughput_ratio": 1.15,
+      "minimum_control_aggregate_throughput_ratio": 0.95,
+      "maximum_candidate_over_baseline_pooled_p95_ratio": 1.05,
+      "minimum_shared_order_stratum_median": 1.0,
+      "minimum_control_order_stratum_median": 0.95
+    },
+    "interpretation": "Both sessions must support the declared throughput/regression limits. The additional aggregate, tail and order checks prevent a favorable median from hiding operational regression; they do not relax the original targets. Bootstrap assumptions and desktop interference remain limitations, not permission to drop observations."
+  },
+  "correctness_acceptance": "Complete timed token arrays, finite logits and final hashes match; untimed all-step logits match; expected attention path/count and configuration verified in every run. Profiling must be disabled.",
+  "lifecycle_acceptance": {
+    "mixed": "Two ordinary interleaved repeats for baseline/shared, fixed millisecond arrivals, exact complete outputs, four successful requests, eight length completions,336 output tokens, no OOM/rejection/preemption, positive shared calls only when enabled and deadline-derived latency accounting.",
+    "pressure": "One repeat across roomy192 baseline, tight132 baseline and tight132 shared; exact128 output tokens and two length completions against roomy oracle; both tight runs must preempt/recompute/COW and reach132 allocated blocks; shared kernel must execute when enabled.",
+    "eos": "Real-engine traces override EOS to valid token0 and clear extra EOS IDs. Any early EOS or missed pressure invariant makes the observation invalid and reported; do not select replacement prompts after seeing timings."
+  },
+  "host_controls": "No concurrent project builds, tests, benchmarks or sampling loop during timing. Preserve a lightweight load/thermal snapshot before and after each process. Desktop applications remain running; the host is not claimed isolated or noise-free.",
+  "retention": "Keep every completed and partial run, all inputs and raw reports. Stop after the declared sessions; do not rerun until passing or pool sources. Investigate failures without claiming merge readiness.",
+  "analysis": "Report each session separately, including paired ratios and intervals, aggregate throughput, pooled p95/p99/max, per-run tails and order strata. Resource counters are diagnostic, not causal attribution."
+}

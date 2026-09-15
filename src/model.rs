@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use safetensors::SafeTensors;
 
-use crate::attention::{AttnEntry, PagedAttention};
+use crate::attention::{AttnEntry, PagedAttention, SharedPrefixPlan, SharedPrefixScratch};
 use crate::gpu::{GpuContext, GpuLinear};
 use crate::math::{
     matvec_f32_weight_transposed_parallel, rms_norm, rope_inv_freq, rope_rotate, rope_table_from,
@@ -849,11 +849,21 @@ impl ForwardScratch {
     }
 }
 
+/// Execution evidence for the optional shared-prefix decode kernel.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SharedAttentionStats {
+    /// Transformer layer calls that actually used shared-prefix attention.
+    pub layer_calls: usize,
+    /// Common attended positions times query entries, summed across layers.
+    pub query_tokens: usize,
+    /// Retained capacity of the additional packed scratch, not total model RSS.
+    pub scratch_bytes: usize,
+}
+
 /// Working memory for decoding several sequences in one pass.
 ///
-/// Every per-sequence buffer is `[batch][feature]`-major, so sequence `b`'s
-/// slice is contiguous and the per-sequence steps (RMSNorm, RoPE, SwiGLU) index
-/// it directly.
+/// Per-sequence buffers use `[batch][feature]` order. Shared-prefix lanes pack
+/// their own reusable tile storage, without retaining any block identities.
 pub struct BatchScratch {
     capacity: usize,
     x: Vec<f32>,
@@ -874,6 +884,9 @@ pub struct BatchScratch {
     rope_sin: Vec<f32>,
     rope_inv_freq: Vec<f32>,
     scores: Vec<f32>,
+    shared_prefix_attention: bool,
+    shared_scratch: SharedPrefixScratch,
+    shared_stats: SharedAttentionStats,
     pub logits: Vec<f32>,
 }
 
@@ -906,12 +919,31 @@ impl BatchScratch {
             rope_sin: vec![0.0; capacity * half],
             rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta, config.rope_scaling),
             scores: Vec::new(),
+            shared_prefix_attention: false,
+            shared_scratch: SharedPrefixScratch::default(),
+            shared_stats: SharedAttentionStats::default(),
             logits: vec![0.0; capacity * config.vocab_size],
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Opt into the experimental decode kernel. Prefill always uses the default.
+    pub fn set_shared_prefix_attention(&mut self, enabled: bool) {
+        self.shared_prefix_attention = enabled;
+    }
+
+    pub fn shared_attention_stats(&self) -> SharedAttentionStats {
+        SharedAttentionStats {
+            scratch_bytes: self.shared_scratch.allocated_bytes(),
+            ..self.shared_stats
+        }
+    }
+
+    pub fn reset_shared_attention_stats(&mut self) {
+        self.shared_stats = SharedAttentionStats::default();
     }
 
     /// Logits for sequence `b` of a batch of `batch`.
@@ -1296,10 +1328,9 @@ impl<'a> LlamaWeights<'a> {
     /// memory-bound, so `batch` sequences cost `batch` times the DRAM traffic
     /// for identical arithmetic. Batching streams each matrix once.
     ///
-    /// Attention does *not* batch: each sequence has its own block table, its
-    /// own position, and its own KV history, so there is no shared operand.
-    /// It is instead parallelized across every (sequence, head) pair at once,
-    /// which gives Rayon more independent work than one sequence's heads would.
+    /// Default attention groups GQA heads within each independent history.
+    /// The optional decode kernel also shares KV loads across entries with a
+    /// common physical prefix; unrelated batches use the existing schedule.
     ///
     /// Run every transformer layer for a batch of (token, position, table)
     /// triples, leaving each entry's final normalized hidden state in
@@ -1322,7 +1353,10 @@ impl<'a> LlamaWeights<'a> {
         kv_cache: &mut [f32],
         block_size: usize,
         scratch: &mut BatchScratch,
+        allow_shared_prefix: bool,
     ) {
+        use crate::profiling::{Span, Stage};
+        let mut profile = Span::new(Stage::ModelSetup);
         let batch = tokens.len();
         assert_eq!(positions.len(), batch);
         assert_eq!(block_tables.len(), batch);
@@ -1367,7 +1401,14 @@ impl<'a> LlamaWeights<'a> {
         // batch so every lane has the same stride.
         let lanes = batch * num_heads;
         let widest_window = widest_window.max(1);
-        if scratch.scores.len() < lanes * widest_window {
+        // Ownership and mapping decisions have already finished. This borrowed
+        // plan lives for this forward pass only, never across scheduler steps.
+        let shared_plan = if allow_shared_prefix && scratch.shared_prefix_attention {
+            SharedPrefixPlan::new(&entries, block_size)
+        } else {
+            None
+        };
+        if shared_plan.is_none() && scratch.scores.len() < lanes * widest_window {
             scratch.scores.resize(lanes * widest_window, 0.0);
         }
 
@@ -1382,6 +1423,7 @@ impl<'a> LlamaWeights<'a> {
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            profile.enter(Stage::Elementwise);
             for b in 0..batch {
                 let span = b * hidden..(b + 1) * hidden;
                 scratch.xb[span.clone()].copy_from_slice(&scratch.x[span]);
@@ -1392,6 +1434,7 @@ impl<'a> LlamaWeights<'a> {
                 );
             }
 
+            profile.enter(Stage::QkvProjection);
             let xb = &scratch.xb[..batch * hidden];
             layer
                 .attention
@@ -1406,6 +1449,7 @@ impl<'a> LlamaWeights<'a> {
                 .wv
                 .apply_batched(&mut scratch.v, xb, batch, &mut scratch.stage);
 
+            profile.enter(Stage::RopeKvWrite);
             // Rotate queries and keys separately: under GQA several query heads
             // share one key head, so driving keys from the query loop would
             // rotate them kv_group times over.
@@ -1450,17 +1494,32 @@ impl<'a> LlamaWeights<'a> {
                 }
             }
 
+            profile.enter(Stage::Attention);
             // Every KV write for this step is done, so the cache is read-only
             // below and the output slices are disjoint.
-            attn.run(
-                &mut scratch.attn_out[..batch * hidden],
-                &mut scratch.scores[..lanes * widest_window],
-                &scratch.q[..batch * hidden],
-                kv_cache,
-                &entries,
-                layer_idx,
-            );
+            if let Some(plan) = &shared_plan {
+                plan.run(
+                    &attn,
+                    &mut scratch.attn_out[..batch * hidden],
+                    &scratch.q[..batch * hidden],
+                    kv_cache,
+                    layer_idx,
+                    &mut scratch.shared_scratch,
+                );
+                scratch.shared_stats.layer_calls += 1;
+                scratch.shared_stats.query_tokens += plan.prefix_tokens() * batch;
+            } else {
+                attn.run(
+                    &mut scratch.attn_out[..batch * hidden],
+                    &mut scratch.scores[..lanes * widest_window],
+                    &scratch.q[..batch * hidden],
+                    kv_cache,
+                    &entries,
+                    layer_idx,
+                );
+            }
 
+            profile.enter(Stage::OutputProjection);
             let attn_in = &scratch.attn_out[..batch * hidden];
             layer.attention.wo.apply_batched(
                 &mut scratch.proj_out,
@@ -1468,6 +1527,7 @@ impl<'a> LlamaWeights<'a> {
                 batch,
                 &mut scratch.stage,
             );
+            profile.enter(Stage::Elementwise);
             for i in 0..batch * hidden {
                 scratch.x[i] += scratch.proj_out[i];
             }
@@ -1482,6 +1542,7 @@ impl<'a> LlamaWeights<'a> {
                 );
             }
 
+            profile.enter(Stage::FeedForwardProjection);
             let xb = &scratch.xb[..batch * hidden];
             layer.feed_forward.w1.apply_batched(
                 &mut scratch.ff_gate,
@@ -1493,12 +1554,14 @@ impl<'a> LlamaWeights<'a> {
                 .feed_forward
                 .w3
                 .apply_batched(&mut scratch.ff_up, xb, batch, &mut scratch.stage);
+            profile.enter(Stage::Elementwise);
             // SwiGLU is elementwise, so the whole batch goes through in one
             // call — no per-sequence loop, and the two buffers are disjoint
             // fields so both borrows coexist.
             let gate = &mut scratch.ff_gate[..batch * inter];
             let up = &scratch.ff_up[..batch * inter];
             swiglu(gate, up);
+            profile.enter(Stage::FeedForwardProjection);
             let ff = &scratch.ff_gate[..batch * inter];
             layer.feed_forward.w2.apply_batched(
                 &mut scratch.ff_down,
@@ -1506,6 +1569,7 @@ impl<'a> LlamaWeights<'a> {
                 batch,
                 &mut scratch.stage,
             );
+            profile.enter(Stage::Elementwise);
             for i in 0..batch * hidden {
                 scratch.x[i] += scratch.ff_down[i];
             }
@@ -1544,7 +1608,9 @@ impl<'a> LlamaWeights<'a> {
             kv_cache,
             block_size,
             scratch,
+            true,
         );
+        let _profile = crate::profiling::Span::new(crate::profiling::Stage::LmHead);
         let x = &scratch.x[..batch * config.hidden_size];
         self.lm_head
             .apply_batched(&mut scratch.logits, x, batch, &mut scratch.stage);
@@ -1614,7 +1680,7 @@ impl<'a> LlamaWeights<'a> {
             // Every position of one sequence shares that sequence's mapping.
             let tables = vec![block_table; chunk.len()];
             self.run_layers_batch(
-                chunk, &positions, &tables, config, kv_cache, block_size, scratch,
+                chunk, &positions, &tables, config, kv_cache, block_size, scratch, false,
             );
             last_hidden_at = chunk.len() - 1;
         }
@@ -1626,6 +1692,7 @@ impl<'a> LlamaWeights<'a> {
         // Only the last position needs logits. The LM head is `vocab_size x
         // hidden_size` — the largest matrix in the model — so projecting every
         // prompt position through it would cost more than the layers did.
+        let _profile = crate::profiling::Span::new(crate::profiling::Stage::LmHead);
         let x = &scratch.x[last_hidden_at * hidden..(last_hidden_at + 1) * hidden];
         let logits = &mut scratch.logits[..config.vocab_size];
         self.lm_head.apply_parallel(logits, x);

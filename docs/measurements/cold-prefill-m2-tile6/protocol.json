@@ -1,0 +1,39 @@
+{
+  "purpose": "Bounded cold-prefill NEON int8 tile-six experiment, selected after diagnostic projection share of 87.56%.",
+  "baseline_git": "a0849f4b69acdc14c33621a85c94382e42351c41",
+  "workload": "One 2049-token prompt copied from first cold lifecycle request; max_tokens 1; no decode forward; synthetic token IDs, real Llama 3.2 1B int8 weights.",
+  "configuration": "Four Rayon workers; prefill chunks 32 and per-step budget 32; prefix cache and shared-prefix attention off; 192 blocks of 16; maximum batch 8.",
+  "diagnostic": {
+    "tile": 4,
+    "repeats": 1,
+    "features": [
+      "profiling"
+    ],
+    "performance_gate_eligible": false
+  },
+  "ordinary_comparison": {
+    "pairs": 3,
+    "order": [
+      [
+        4,
+        6
+      ],
+      [
+        6,
+        4
+      ],
+      [
+        4,
+        6
+      ]
+    ],
+    "same_binary": true,
+    "features": [],
+    "max_steps": 128,
+    "timeout_secs": 180,
+    "primary": "Whole replay elapsed_ms, with engine prefill_ms corroboration; one request TTFT and prompt tokens per second; retain every run.",
+    "verification": "Compare full generated tokens and terminal outcomes against first tile 4 run; kernel bitwise parity separately covers arithmetic.",
+    "decision": "Exploratory only: retain opt-in 6 if all 3 pairs improve cold latency without correctness failure; otherwise preserve patch/results and revert candidate. Defaults remain 4 in either case. No shared-attention gate inference from these timings.",
+    "host_controls": "No other tests, builds, or benchmarks alongside timing. Desktop applications remain running; host load and thermal drift uncontrolled."
+  }
+}

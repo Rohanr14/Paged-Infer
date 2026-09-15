@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "verified": true,
+  "checked_at_utc": "2026-09-15T22:02:09.490462+00:00",
+  "expected_compiled_source_sha256": "a1fc6917c6009b763766e3cfbc67387ddcd6bd43d2623b0306d9ff3e2bdf39af",
+  "frozen_commit": {
+    "commit": "fdd76e3b799056292539f8edaa3129e65c5cd0b5",
+    "source_sha256": "a1fc6917c6009b763766e3cfbc67387ddcd6bd43d2623b0306d9ff3e2bdf39af",
+    "hashed_files": 41,
+    "source_bytes": 734994
+  },
+  "later_commit": {
+    "commit": "160426fbd4561bf09295b927da97fba2ea762ce7",
+    "source_sha256": "7831b9ceed2c70541b16b5adec40b6a85b5c1c9162c47eebe207966214a28c13",
+    "hashed_files": 41,
+    "source_bytes": 734997
+  },
+  "method": "Replayed build.rs hash_source over Git blobs: ordered roots src, Cargo.toml, Cargo.lock, build.rs, .cargo; recursively sorted immediate child paths; .DS_Store skipped; UTF-8 path byte length, path bytes, content byte length and content bytes hashed, lengths encoded as little-endian u64.",
+  "changed_files": [
+    "src/bin/shared_decode_benchmark.rs"
+  ],
+  "delta_sha256": "ff8229408f0a4f71a53325aec25a77dd013cee6269c32a0531ad3554a8741b96",
+  "delta": {
+    "function": "update_logit_digest",
+    "old": "bytes.chunks_exact_mut(4)",
+    "new": "bytes.as_chunks_mut::<4>().0",
+    "classification": "Untimed logit-hash helper iteration only",
+    "equivalence": "The 1024-byte buffer divides exactly into 256 four-byte chunks. Both forms yield the same chunks in the same order; f32 little-endian encoding and hashed byte range are unchanged."
+  },
+  "timed_decode_source_unchanged": true,
+  "scope": "Source identity and exact source delta only. No binaries or checkpoint hashed; no builds, tests, benchmarks, execution equivalence or fresh performance claim."
+}

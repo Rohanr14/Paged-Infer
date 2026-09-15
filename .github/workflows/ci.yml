@@ -40,6 +40,9 @@ jobs:
       - name: Tests
         run: cargo test --release --all-targets
 
+      - name: Diagnostic profiling excludes warmup and previous runs
+        run: cargo test --release --features profiling --test profiling_tests
+
       - name: Report the SIMD backend actually selected
         run: cargo test --release --test simd_tests test_reports_a_backend -- --nocapture
 
@@ -47,6 +50,7 @@ jobs:
         run: |
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/mixed.json --config workloads/configs/baseline.json --config workloads/configs/no-prefix.json --repeats 2 --verify --output mixed-replay.jsonl
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/mixed.json --config workloads/configs/baseline.json --config workloads/configs/chunked-prefill.json --repeats 2 --verify --output chunked-prefill-replay.jsonl
+          cargo run --release --bin workload_replay -- --threads 2 --workload workloads/shared-prefix.json --config workloads/configs/baseline.json --config workloads/configs/shared-attention.json --repeats 2 --verify --output shared-attention-replay.jsonl
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/pressure.json --config workloads/configs/tight-pool.json --repeats 2 --verify --output pressure-replay.jsonl
           cargo run --release --bin workload_replay -- --threads 2 --workload workloads/cancellation.json --repeats 2 --verify --output cancellation-replay.jsonl
 
@@ -134,3 +138,8 @@ jobs:
       # regression, not the wall-clock figures, which are noise on a shared runner.
       - name: Batched decode benchmark
         run: BENCH_LAYERS=2 BENCH_VOCAB=2048 BENCH_STEPS=2 BENCH_BATCHES="1 4" cargo run --release --bin batch_benchmark
+
+      - name: Shared-prefix attention parity and benchmark smoke checks
+        run: |
+          RAYON_NUM_THREADS=2 SHARED_ATTN_BATCHES="1 3 4" SHARED_ATTN_CONTEXTS=64 SHARED_ATTN_REPS=2 cargo run --release --bin shared_attention_benchmark
+          RAYON_NUM_THREADS=2 SHARED_DECODE_STEPS=3 SHARED_DECODE_REPS=2 cargo run --release --bin shared_decode_benchmark

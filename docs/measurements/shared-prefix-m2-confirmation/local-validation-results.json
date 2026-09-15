@@ -1,0 +1,31 @@
+{
+  "source_revision": "160426fbd4561bf09295b927da97fba2ea762ce7",
+  "developer_dir": "/Library/Developer/CommandLineTools",
+  "scope": "Local checks after the fixed measurement pipeline completed; no performance reruns and no source edits.",
+  "all_passed": true,
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "exit_code": 0,
+      "log": "local-validation-fmt.log"
+    },
+    {
+      "command": "cargo clippy --all-targets --all-features -- -D warnings",
+      "exit_code": 0,
+      "log": "local-validation-clippy.log"
+    },
+    {
+      "command": "cargo test --release --bin shared_decode_benchmark --test shared_decode_cli_tests --test shared_attention_engine_tests",
+      "exit_code": 0,
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "suites": {
+        "shared_decode_benchmark": 10,
+        "shared_attention_engine_tests": 5,
+        "shared_decode_cli_tests": 2
+      },
+      "log": "local-validation-tests.log"
+    }
+  ]
+}

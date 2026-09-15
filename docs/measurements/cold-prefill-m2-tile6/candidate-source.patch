@@ -1,0 +1,394 @@
+diff --git a/src/bin/workload_replay.rs b/src/bin/workload_replay.rs
+index 3dcdc81..f1fa322 100644
+--- a/src/bin/workload_replay.rs
++++ b/src/bin/workload_replay.rs
+@@ -328,6 +328,7 @@ fn hardware() -> Value {
+         "logical_cpus": std::thread::available_parallelism().ok().map(|n| n.get()),
+         "rayon_threads": rayon::current_num_threads(),
+         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
++        "matmul_tile_env": std::env::var("PAGED_INFER_MATMUL_TILE").ok(),
+         "simd": paged_infer::simd::backend(),
+         "build": {
+             "rustc": env!("PAGED_BUILD_RUSTC"),
+@@ -556,8 +557,11 @@ fn main() -> Result<()> {
+             let mut engine = Engine::new(weights, model.clone(), config.engine.clone());
+             engine.warm_up();
+             engine.reset();
+-            let report = run(&mut engine, &workload, &args.limits)
+-                .with_context(|| format!("{} repeat {}", config.name, repeat + 1))?;
++            paged_infer::profiling::reset();
++            let replay_result = run(&mut engine, &workload, &args.limits);
++            let profile = paged_infer::profiling::snapshot();
++            let report =
++                replay_result.with_context(|| format!("{} repeat {}", config.name, repeat + 1))?;
+             if args.verify {
+                 if let Some(expected) = &first_report {
+                     if let Err(error) = compare_outputs(expected, &report) {
+@@ -584,7 +588,7 @@ fn main() -> Result<()> {
+             }
+             write_record(
+                 &mut writer,
+-                &json!({"type": "run", "config": config.name, "repeat": repeat + 1, "order_in_repeat": slot + 1, "weight_bytes": weight_bytes, "report": report}),
++                &json!({"type": "run", "config": config.name, "repeat": repeat + 1, "order_in_repeat": slot + 1, "weight_bytes": weight_bytes, "profile": profile, "report": report}),
+             )?;
+             reports[index].push(report);
+         }
+diff --git a/src/math.rs b/src/math.rs
+index ef5d2ca..2f7c644 100644
+--- a/src/math.rs
++++ b/src/math.rs
+@@ -251,6 +251,20 @@ pub fn matmat_i8_weight_parallel(
+             let w_row = &weight[r * cols..(r + 1) * cols];
+             let scale = scales[r];
+             let mut b = 0;
++            // Opt-in experiment: six activation vectors reuse each int8
++            // widening with 24 accumulators, within NEON's register budget.
++            // The default remains four; AVX2 and f32 keep their current tiles.
++            #[cfg(target_arch = "aarch64")]
++            if tile >= 6 {
++                while b + 6 <= batch {
++                    let block = &x_br[b * cols..(b + 6) * cols];
++                    let got = crate::simd::dot_i8_multi::<6>(w_row, block, cols);
++                    for (slot, v) in out_row[b..b + 6].iter_mut().zip(got) {
++                        *slot = v * scale;
++                    }
++                    b += 6;
++                }
++            }
+             if tile >= 4 {
+                 while b + 4 <= batch {
+                     let block = &x_br[b * cols..(b + 4) * cols];
+diff --git a/src/model.rs b/src/model.rs
+index 4ee626c..ecfe48f 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -1692,6 +1692,7 @@ impl<'a> LlamaWeights<'a> {
+         // Only the last position needs logits. The LM head is `vocab_size x
+         // hidden_size` — the largest matrix in the model — so projecting every
+         // prompt position through it would cost more than the layers did.
++        let _profile = crate::profiling::Span::new(crate::profiling::Stage::LmHead);
+         let x = &scratch.x[last_hidden_at * hidden..(last_hidden_at + 1) * hidden];
+         let logits = &mut scratch.logits[..config.vocab_size];
+         self.lm_head.apply_parallel(logits, x);
+diff --git a/tests/profiling_tests.rs b/tests/profiling_tests.rs
+index ab04f89..adf3d67 100644
+--- a/tests/profiling_tests.rs
++++ b/tests/profiling_tests.rs
+@@ -1,6 +1,8 @@
+ //! Timed-run profiles must exclude preparation, warmup and previous variants.
+-use serde_json::Value;
+-use std::process::Command;
++use serde_json::{json, Value};
++use std::fs;
++use std::path::PathBuf;
++use std::process::{Command, Output};
+ 
+ #[test]
+ fn benchmark_profiles_only_the_measured_decode_and_selected_path() {
+@@ -55,3 +57,180 @@ fn benchmark_profiles_only_the_measured_decode_and_selected_path() {
+     }
+     assert_eq!(records.last().unwrap()["passed"], true);
+ }
++
++struct ReplayTemp(PathBuf);
++
++impl ReplayTemp {
++    fn new() -> Self {
++        let path =
++            std::env::temp_dir().join(format!("paged-replay-profiling-{}", std::process::id()));
++        fs::create_dir_all(&path).unwrap();
++        Self(path)
++    }
++
++    fn path(&self, name: &str) -> PathBuf {
++        self.0.join(name)
++    }
++}
++
++impl Drop for ReplayTemp {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir_all(&self.0);
++    }
++}
++
++fn replay_records(output: Output) -> Vec<Value> {
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    String::from_utf8(output.stdout)
++        .unwrap()
++        .lines()
++        .map(|line| serde_json::from_str(line).unwrap())
++        .collect()
++}
++
++#[test]
++fn replay_profiles_exclude_warmup_and_reset_between_configs_and_repeats() {
++    let temp = ReplayTemp::new();
++    let workload = temp.path("workload.json");
++    fs::write(
++        &workload,
++        json!({"version": 1, "clock": "steps", "events": [
++            {"type": "submit", "at": 0, "id": "prefill-only", "tokens": [1, 3, 4, 5, 6], "max_tokens": 1, "seed": 99}
++        ]})
++        .to_string(),
++    )
++    .unwrap();
++    let config_paths = [temp.path("chunk2.json"), temp.path("chunk3.json")];
++    for (path, chunk) in config_paths.iter().zip([2, 3]) {
++        fs::write(
++            path,
++            json!({"name": format!("chunk{chunk}"), "engine": {
++                "total_blocks": 8, "block_size": 16, "max_batch_size": 2,
++                "prefill_chunk_size": chunk,
++                "max_prefill_tokens_per_step": if chunk == 2 { 2 } else { 6 },
++                "enable_prefix_cache": false, "draft_tokens": 0,
++                "shared_prefix_attention": chunk == 3
++            }})
++            .to_string(),
++        )
++        .unwrap();
++    }
++    let invoke = || {
++        let mut command = Command::new(env!("CARGO_BIN_EXE_workload_replay"));
++        command
++            .current_dir(env!("CARGO_MANIFEST_DIR"))
++            .args(["--threads", "1", "--workload"])
++            .arg(&workload)
++            .arg("--config")
++            .arg(&config_paths[0])
++            .arg("--config")
++            .arg(&config_paths[1]);
++        command
++    };
++    let mut records = replay_records(
++        invoke()
++            .args(["--repeats", "2", "--verify"])
++            .output()
++            .unwrap(),
++    );
++    let enabled = cfg!(feature = "profiling");
++    assert_eq!(records[0]["version"], 1);
++    assert_eq!(records[0]["profiling_enabled"], enabled);
++    assert_eq!(records[0]["performance_gate_eligible"], !enabled);
++    let fixture: Value = serde_json::from_str(include_str!("fixtures/config.json")).unwrap();
++    let layers = fixture["num_hidden_layers"].as_u64().unwrap();
++    let runs: Vec<_> = records.iter().filter(|row| row["type"] == "run").collect();
++    let order: Vec<_> = runs
++        .iter()
++        .map(|row| {
++            (
++                row["config"].as_str().unwrap(),
++                row["repeat"].as_u64().unwrap(),
++            )
++        })
++        .collect();
++    assert_eq!(
++        order,
++        [("chunk2", 1), ("chunk3", 1), ("chunk3", 2), ("chunk2", 2)]
++    );
++    for run in runs {
++        // The first generated token comes from prefill's final LM head; a
++        // one-token budget finishes without a subsequent decode forward.
++        let (model_batches, scheduler_ranges) = if run["config"] == "chunk2" {
++            (3, 3)
++        } else {
++            (2, 1)
++        };
++        assert_eq!(run["report"]["engine"]["prefill_chunks"], scheduler_ranges);
++        assert_eq!(run["report"]["engine"]["prompt_tokens_prefilled"], 5);
++        assert_eq!(run["report"]["engine"]["generated_tokens"], 1);
++        assert_eq!(run["report"]["summary"]["successful_requests"], 1);
++        assert_eq!(
++            run["report"]["requests"][0]["sequences"][0]["finish_reason"],
++            "length"
++        );
++        let profile = run["profile"].as_array().unwrap();
++        if !enabled {
++            assert!(profile.is_empty());
++            continue;
++        }
++        let calls = |stage: &str| {
++            profile
++                .iter()
++                .find(|entry| entry["stage"] == stage)
++                .unwrap()["calls"]
++                .as_u64()
++                .unwrap()
++        };
++        // Each configuration warms one extra batch before replay. Exact
++        // per-run counts catch both warmup leakage and accumulated prior runs.
++        // Chunk3's single scheduler range contains two model batches (3+2),
++        // so engine prefill_chunks is not the model-stage call count.
++        assert_eq!(calls("model_setup"), model_batches);
++        for stage in [
++            "qkv_projection",
++            "rope_kv_write",
++            "attention",
++            "output_projection",
++        ] {
++            assert_eq!(calls(stage), layers * model_batches, "{stage}");
++        }
++        assert_eq!(calls("feed_forward_projection"), 2 * layers * model_batches);
++        assert_eq!(calls("lm_head"), 1);
++        for entry in profile {
++            if entry["scope"] != "model_main" {
++                assert_eq!(entry["calls"], 0, "prefill must not use the shared path");
++            }
++            let elapsed = entry["elapsed_ms"].as_f64().unwrap();
++            assert!(elapsed.is_finite() && elapsed >= 0.0);
++        }
++    }
++    assert_eq!(records.last().unwrap()["passed"], true);
++
++    // Older version-1 reports have no run-level profile. Comparing their
++    // outputs must continue to work independently of diagnostic fields.
++    for run in records.iter_mut().filter(|row| row["type"] == "run") {
++        run.as_object_mut().unwrap().remove("profile");
++    }
++    let prior = temp.path("prior-without-profiles.jsonl");
++    fs::write(
++        &prior,
++        records
++            .iter()
++            .map(|row| format!("{row}\n"))
++            .collect::<String>(),
++    )
++    .unwrap();
++    let compared = replay_records(
++        invoke()
++            .args(["--repeats", "1", "--compare-to"])
++            .arg(prior)
++            .output()
++            .unwrap(),
++    );
++    assert_eq!(compared.last().unwrap()["passed"], true);
++}
+diff --git a/tests/simd_tests.rs b/tests/simd_tests.rs
+index 9e83942..cd6ba99 100644
+--- a/tests/simd_tests.rs
++++ b/tests/simd_tests.rs
+@@ -270,3 +270,29 @@ fn test_dot_i8_multi_is_dot_i8_at_every_length_and_tile_width() {
+         }
+     }
+ }
++
++#[cfg(target_arch = "aarch64")]
++#[test]
++fn test_six_wide_int8_tile_preserves_exact_dot_arithmetic() {
++    for n in [
++        0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 2048, 8192,
++    ] {
++        let weights: Vec<i8> = (0..n)
++            .map(|i| match i % 5 {
++                0 => i8::MIN,
++                1 => i8::MAX,
++                2 => -1,
++                3 => 0,
++                _ => ((i * 31) % 127) as i8,
++            })
++            .collect();
++        let activations: Vec<f32> = (0..6 * n)
++            .map(|i| ((i * 17 % 211) as f32) * 0.011 - 1.2)
++            .collect();
++        let actual = simd::dot_i8_multi::<6>(&weights, &activations, n);
++        for (b, actual) in actual.into_iter().enumerate() {
++            let expected = simd::dot_i8(&weights, &activations[b * n..(b + 1) * n]);
++            assert_eq!(actual.to_bits(), expected.to_bits(), "n={n}, row={b}");
++        }
++    }
++}
+--- /dev/null
++++ b/tests/neon_i8_tile_tests.rs
+@@ -0,0 +1,89 @@
++#![cfg(target_arch = "aarch64")]
++
++use paged_infer::math::{matmat_i8_weight_parallel, transpose_rb_to_br};
++use paged_infer::simd;
++use std::process::Command;
++
++#[test]
++fn neon_six_wide_matrix_matches_scaled_single_dots() {
++    const CHILD: &str = "PAGED_INFER_TILE6_PARITY_CHILD";
++    if std::env::var_os(CHILD).is_none() {
++        // The tile knob is cached in a OnceLock. Select it before a fresh
++        // process starts, without racing other tests' environment or kernels.
++        let output = Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "neon_six_wide_matrix_matches_scaled_single_dots",
++                "--nocapture",
++            ])
++            .env(CHILD, "1")
++            .env("PAGED_INFER_MATMUL_TILE", "6")
++            .env("RAYON_NUM_THREADS", "4")
++            .output()
++            .expect("launch isolated six-wide matrix test");
++        assert!(
++            output.status.success(),
++            "six-wide matrix child failed:\n{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        return;
++    }
++    assert_eq!(std::env::var("PAGED_INFER_MATMUL_TILE").unwrap(), "6");
++
++    let scales = [0.00390625, 0.03125, 0.17, 1.0, 0.0001];
++    let rows = scales.len();
++    for cols in [
++        0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 2048, 8192,
++    ] {
++        let weights: Vec<i8> = (0..rows * cols)
++            .map(|i| match i % 5 {
++                0 => i8::MIN,
++                1 => i8::MAX,
++                2 => -1,
++                3 => 0,
++                _ => ((i * 31) % 127) as i8,
++            })
++            .collect();
++        // Include full six-wide tiles, every 4/2/1 remainder, and batch32's
++        // five six-wide tiles followed by a two-wide tile.
++        for batch in [6, 7, 10, 31, 32, 33] {
++            let activations: Vec<f32> = (0..batch * cols)
++                .map(|i| ((i * 37 % 251) as f32) * 0.013 - 1.6)
++                .collect();
++            let sentinel = 123.25_f32;
++            let mut actual_rb = vec![sentinel; rows * batch + 2];
++            matmat_i8_weight_parallel(
++                &mut actual_rb[1..1 + rows * batch],
++                &activations,
++                &weights,
++                &scales,
++                batch,
++                rows,
++                cols,
++            );
++            assert_eq!(actual_rb[0].to_bits(), sentinel.to_bits());
++            assert_eq!(actual_rb[1 + rows * batch].to_bits(), sentinel.to_bits());
++            let mut actual_br = vec![f32::NAN; batch * rows];
++            transpose_rb_to_br(&actual_rb[1..1 + rows * batch], &mut actual_br, rows, batch);
++            for (r, &scale) in scales.iter().enumerate() {
++                for b in 0..batch {
++                    let expected = simd::dot_i8(
++                        &weights[r * cols..(r + 1) * cols],
++                        &activations[b * cols..(b + 1) * cols],
++                    ) * scale;
++                    assert_eq!(
++                        actual_rb[1 + r * batch + b].to_bits(),
++                        expected.to_bits(),
++                        "row-major: cols={cols}, batch={batch}, row={r}, token={b}"
++                    );
++                    assert_eq!(
++                        actual_br[b * rows + r].to_bits(),
++                        expected.to_bits(),
++                        "batch-major: cols={cols}, batch={batch}, row={r}, token={b}"
++                    );
++                }
++            }
++        }
++    }
++}

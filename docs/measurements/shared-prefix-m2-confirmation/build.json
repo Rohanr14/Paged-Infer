@@ -1,0 +1,21 @@
+{
+  "compiled_source_sha256": "a1fc6917c6009b763766e3cfbc67387ddcd6bd43d2623b0306d9ff3e2bdf39af",
+  "checkpoint_sha256": "68a2e4be76fa709455a60272fba8e512c02d81c46e6c671cc9449e374fd6809a",
+  "config_sha256": "8f028e2cd88148fad38c7dece460947681adf6178e46e11ece9742aa49b378dd",
+  "benchmark_binary_sha256": "9bce9cbfdd3f79b9af918c6ed219717d91b2b9d2f8cef7a1063888872a5c2b29",
+  "replay_binary_sha256": "936c7cace3a20efacda38453a0e0e54fd6b2a5697fac70d43a0435392232e128",
+  "protocol_sha256": "bc4f5fad3bd237e9d521e0fb19a75ee2f29ce9150883c753434ef7ae12c8333d",
+  "input_files_sha256": {
+    "compiled-build.json": "ea78203e976806e22dc0fcf3b051103a8c1e26deca6e20b4d7c183cf71ec97d1",
+    "pressure-roomy.json": "1ef26731412fcefb30eaab1012da8ff4ee539640fdd85a45ec5af6e7ff80ab45",
+    "pressure-shared.json": "a898f2b84a80cc53de7a267e05f1bc9768a3b2eee3a1cfac240ca9d9a9652c8e",
+    "mixed-workload.json": "9a8a02defe138c48ea5b228f598fded559ad228ffdc05c9017cd39cee2f27924",
+    "pressure-baseline.json": "7867b017e5727904ae148458b64d7bd07535694a22139c1558bbfc8005c45f4f",
+    "mixed-baseline.json": "7ce701f50fe16350ca5b2d63745b9ed81e6e598f151ac5dc94fbc314638c8d06",
+    "pressure-workload.json": "a436f7b1ddfd9c07a347ac3874a90e57028fc2fe9dae72972edf27926886fb02",
+    "protocol.json": "bc4f5fad3bd237e9d521e0fb19a75ee2f29ce9150883c753434ef7ae12c8333d",
+    "mixed-shared.json": "8399ec1585aa5beba3e1bcde1eceef0e3d8455439b5685cde1d1b2ba6d3498fb"
+  },
+  "benchmark_binary": "/Users/rohan/VSCode/Paged-Infer/target/pr16-readiness/shared_decode_benchmark",
+  "replay_binary": "/Users/rohan/VSCode/Paged-Infer/target/pr16-readiness/workload_replay"
+}

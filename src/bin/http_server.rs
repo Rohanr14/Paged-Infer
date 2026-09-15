@@ -20,6 +20,7 @@
 //! | `MAX_JOBS_PER_STEP` | `32`, received jobs before scheduling    |
 //! | `PREFILL_TOKENS_PER_STEP` | `32`, prefill positions per step   |
 //! | `PREFILL_CHUNK_SIZE` | `32`, positions per matrix batch       |
+//! | `SHARED_PREFIX_ATTENTION` | `0`; `1` enables experimental decode kernel |
 //! | `TIMEOUT_SECS`    | `30`, socket read and write deadlines      |
 //! | `MAX_TOKENS`      | `4096`, cap on a request's `max_tokens`    |
 
@@ -96,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         block_size: env_usize("BLOCK_SIZE", 16)?,
         max_prefill_tokens_per_step: env_usize("PREFILL_TOKENS_PER_STEP", 32)?,
         prefill_chunk_size: env_usize("PREFILL_CHUNK_SIZE", 32)?,
+        shared_prefix_attention: env_usize("SHARED_PREFIX_ATTENTION", 0)? != 0,
         // Speculative decoding is off unless asked for: it only pays on
         // copy-heavy workloads, and costs a little on the rest. See
         // `speculative_benchmark` for the trade.

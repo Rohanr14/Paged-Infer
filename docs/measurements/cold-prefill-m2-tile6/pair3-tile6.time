@@ -1,0 +1,20 @@
+replay cold-prefill repeat 1/1
+report: /Users/rohan/VSCode/Paged-Infer/target/cold-prefill-validation/pair3-tile6.jsonl
+      130.27 real       195.99 user         4.19 sys
+          3221602304  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              401947  page reclaims
+               55216  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  45  voluntary context switches
+              306873  involuntary context switches
+       1774553661687  instructions retired
+        569293112124  cycles elapsed
+          2251951872  peak memory footprint
