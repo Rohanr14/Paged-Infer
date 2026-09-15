@@ -457,7 +457,7 @@ fn zero_probability_case(masked_value: f32, underflow: bool) {
     let mut case = Case::new(1, 2, 8, 4, &[&[0, 1], &[0, 2]]);
     case.kv.fill(0.0);
     case.q.fill(0.0);
-    for query in case.q.chunks_exact_mut(8) {
+    for query in case.q.as_chunks_mut::<8>().0 {
         query[0] = 1.0;
     }
     for layer in 0..case.layout.num_layers {
