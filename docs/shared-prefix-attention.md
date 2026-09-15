@@ -155,7 +155,28 @@ guarantee future gains. Increase `SHARED_DECODE_STEPS` for longer timed runs and
 bootstrap observations. Retain every sample and compare equivalent workloads
 and build fingerprints.
 
-## Latest Apple M2 measurements, 2026-09-15 (`1ad58be`)
+## Cold-prefill follow-up, 2026-09-15
+
+Per-run replay profiling now covers the instrumented batched CPU stages,
+including the final prefill vocabulary projection. Counters exclude warmup
+and reset between configurations and repeats; ordinary builds emit empty
+profiles. Older version-1 reports still compare normally. These diagnostic
+timers are excluded from performance-gate builds.
+
+A cold 2,049-token Llama 3.2 1B int8 request spent 70.72% of recorded model
+elapsed time in feed-forward projections, and 87.56% in all transformer
+projections. That selected a bounded NEON experiment: reuse converted weights
+across six activation vectors instead of four, preserving exact arithmetic.
+Three fixed ordinary comparison pairs produced four/six elapsed ratios of
+0.987x, 1.030x and 0.953x. The candidate slowed two pairs and failed the
+predeclared consistency check, so it was reverted. The default remains four.
+
+The [complete cold-prefill evidence](measurements/cold-prefill-m2-tile6/README.md)
+preserves every run, source patches, exact output checks, the fixed protocol
+and a reproducible analysis. These single-request cold measurements neither
+replace the shared-decode evidence below nor establish its merge gate.
+
+## Latest Apple M2 decode measurements, 2026-09-15 (`1ad58be`)
 
 The score-tile follow-up adds query reuse for the narrow NEON shape and prefix
 range described above. The retained value-loop build was profiled again: shared
@@ -310,10 +331,14 @@ fractions.
    using the same declared workload, twelve paired repeats and sixteen steps.
    Retain every sample. Do not change the workload or select a favorable run to
    satisfy the gate; the no-sharing control must also provide a stable baseline.
-2. Profile cold prefill before choosing another implementation change. The
-   completed lifecycle trace spends most of its time there, so another decode
-   optimization alone cannot produce a comparable total-request improvement.
-   Keep cold-start, warm-cache and steady-state results separate.
+2. The cold-prefill profile now identifies feed-forward projections as 70.72%
+   of recorded model time (87.56% for all transformer projections). Before a
+   further kernel change, separate gate/up/down projection compute from output
+   transposes and inspect the rejected six-wide tile for register spills. A
+   possible next experiment reuses activations across two weight rows while
+   retaining each output's arithmetic; the current profile does not establish
+   that activation traffic is the bottleneck. Keep cold-start, warm-cache and
+   steady-state results separate.
 3. Extend lifecycle evidence to timed mixed arrivals and a pool that actually
    forces eviction/recompute. Preserve complete outputs, cancellation behavior
    and competing-stream latency. The completed 192-block trace has spare capacity

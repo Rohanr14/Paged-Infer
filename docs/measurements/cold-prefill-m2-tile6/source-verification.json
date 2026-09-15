@@ -1,0 +1,12 @@
+[
+  {
+    "patch": "diagnostic-source.patch",
+    "source_sha256": "9683cfbedf0bb2afec62ed8f1af0a95349cfb4d3867d5907367c18ea8e39fe45",
+    "matches_recorded_build": true
+  },
+  {
+    "patch": "candidate-source.patch",
+    "source_sha256": "70f9795a937084955d1cc8f1977b743cc85d53bfa7b44b789ea42ca8a57e1b77",
+    "matches_recorded_build": true
+  }
+]

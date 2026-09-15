@@ -1692,6 +1692,7 @@ impl<'a> LlamaWeights<'a> {
         // Only the last position needs logits. The LM head is `vocab_size x
         // hidden_size` — the largest matrix in the model — so projecting every
         // prompt position through it would cost more than the layers did.
+        let _profile = crate::profiling::Span::new(crate::profiling::Stage::LmHead);
         let x = &scratch.x[last_hidden_at * hidden..(last_hidden_at + 1) * hidden];
         let logits = &mut scratch.logits[..config.vocab_size];
         self.lm_head.apply_parallel(logits, x);
