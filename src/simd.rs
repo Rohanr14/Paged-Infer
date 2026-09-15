@@ -695,8 +695,10 @@ pub fn axpy(out: &mut [f32], weight: f32, v: &[f32]) {
 /// `out[j] = dot(w, &x_block[j * stride..][..stride])`, for `j` in `0..BT`.
 ///
 /// `x_block` holds `BT` consecutive activation vectors of length `stride`.
+/// Panics if the layout overflows or the activation block is too short.
 pub fn dot_multi<const BT: usize>(w: &[f32], x_block: &[f32], stride: usize) -> [f32; BT] {
-    debug_assert!(x_block.len() >= BT * stride);
+    let required = BT.checked_mul(stride).expect("activation layout overflow");
+    assert!(x_block.len() >= required, "activation block is too short");
     #[cfg(target_arch = "x86_64")]
     if x86::available() {
         return unsafe { x86::dot_multi::<BT>(w, x_block, stride) };
@@ -715,8 +717,10 @@ pub fn dot_multi_scalar<const BT: usize>(w: &[f32], x_block: &[f32], stride: usi
 }
 
 /// `out[j] = dot_i8(w, &x_block[j * stride..][..stride])`, for `j` in `0..BT`.
+/// Panics if the layout overflows or the activation block is too short.
 pub fn dot_i8_multi<const BT: usize>(w: &[i8], x_block: &[f32], stride: usize) -> [f32; BT] {
-    debug_assert!(x_block.len() >= BT * stride);
+    let required = BT.checked_mul(stride).expect("activation layout overflow");
+    assert!(x_block.len() >= required, "activation block is too short");
     #[cfg(target_arch = "x86_64")]
     if x86::available() {
         return unsafe { x86::dot_i8_multi::<BT>(w, x_block, stride) };
