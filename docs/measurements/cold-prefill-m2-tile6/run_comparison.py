@@ -10,7 +10,18 @@ folder = pathlib.Path(__file__).resolve().parent
 binary = pathlib.Path(sys.argv[1]).resolve()
 model = pathlib.Path(sys.argv[2]).resolve()
 protocol = json.loads((folder / 'protocol.json').read_text())
-(folder / 'ordinary-binary.sha256').write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + '\n')
+digest_path = folder / 'ordinary-binary.sha256'
+outputs = [digest_path]
+for pair, order in enumerate(protocol['ordinary_comparison']['order'], 1):
+    for tile in order:
+        outputs.extend(folder / f'pair{pair}-tile{tile}.{suffix}'
+                       for suffix in ('jsonl', 'stdout', 'time'))
+for output in outputs:
+    if output.exists():
+        raise SystemExit(f'Refusing to replace {output}')
+digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+with digest_path.open('x') as file:
+    file.write(digest + '\n')
 prior = folder / 'pair1-tile4.jsonl'
 for pair, order in enumerate(protocol['ordinary_comparison']['order'], 1):
     for tile in order:
