@@ -1,0 +1,15 @@
+{
+  "compiled_source_sha256": "a1fc6917c6009b763766e3cfbc67387ddcd6bd43d2623b0306d9ff3e2bdf39af",
+  "build": {
+    "debug": "false",
+    "git_dirty": "true",
+    "git_head": "fdd76e3b799056292539f8edaa3129e65c5cd0b5",
+    "opt_level": "3",
+    "profile": "release",
+    "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11); binary: rustc; commit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf; commit-date: 2026-02-11; host: aarch64-apple-darwin; release: 1.93.1; LLVM version: 21.1.8",
+    "rustflags": "",
+    "source_sha256": "a1fc6917c6009b763766e3cfbc67387ddcd6bd43d2623b0306d9ff3e2bdf39af",
+    "target": "aarch64-apple-darwin"
+  },
+  "profiling_enabled": false
+}

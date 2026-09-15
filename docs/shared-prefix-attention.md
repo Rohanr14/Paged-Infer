@@ -172,195 +172,107 @@ guarantee future gains. Increase `SHARED_DECODE_STEPS` for longer timed runs and
 bootstrap observations. Retain every sample and compare equivalent workloads
 and build fingerprints.
 
-## Cold-prefill follow-up, 2026-09-15
+## Current confirmation, 2026-09-15
 
-Per-run replay profiling now covers the instrumented batched CPU stages,
-including the final prefill vocabulary projection. Counters exclude warmup
-and reset between configurations and repeats; ordinary builds emit empty
-profiles. Older version-1 reports still compare normally. These diagnostic
-timers are excluded from performance-gate builds.
+The fixed two-session confirmation does **not establish the merge gate**:
+session B's no-sharing control has a descriptive interval lower bound of
+**0.908615**, below the required 0.95. Every other prescribed check passes,
+but both sessions must satisfy every predeclared check. The feature remains
+disabled by default.
 
-A cold 2,049-token Llama 3.2 1B int8 request spent 70.72% of recorded model
-elapsed time in feed-forward projections, and 87.56% in all transformer
-projections. That selected a bounded NEON experiment: reuse converted weights
-across six activation vectors instead of four, preserving exact arithmetic.
-Three fixed ordinary comparison pairs produced four/six elapsed ratios of
-0.987x, 1.030x and 0.953x. The candidate slowed two pairs and failed the
-predeclared consistency check, so it was reverted. The default remains four.
+The confirmation uses one frozen ordinary build: Llama 3.2 1B int8, context
+4,096, batch eight, sixteen decode steps, twelve pairs per sharing fraction,
+four Rayon workers, matmul tile four and two attention lanes per thread. Session
+A runs 90% requested sharing (3,680 common positions) then 0%; session B
+reverses that order. The control copies the same token history into independent
+physical blocks. Within each case, the existing alternating baseline/candidate
+order is unchanged. There are no
+numerical or kernel changes in this confirmation. All observations are retained;
+results are neither pooled across sessions nor replaced by additional runs.
 
-The [complete cold-prefill evidence](measurements/cold-prefill-m2-tile6/README.md)
-preserves every run, source patches, exact output checks, the fixed protocol
-and a reproducible analysis. These single-request cold measurements neither
-replace the shared-decode evidence below nor establish its merge gate.
-
-## Latest Apple M2 decode measurements, 2026-09-15 (`1ad58be`)
-
-The score-tile follow-up adds query reuse for the narrow NEON shape and prefix
-range described above. The retained value-loop build was profiled again: shared
-scores occupied about 54% of summed attention-worker elapsed time and shared
-values about 19%. These overlapping diagnostic spans motivated the experiment;
-they do not predict its model-level gain.
-
-Three alternating source comparisons were run for each of two attention shapes,
-first with unrestricted score tiling, then with shape-only dispatch, then with
-the final shape-and-prefix restriction. Every sweep includes all 36 kernel cases
-and 21 timing pairs per case. Short contexts and four-KV-head cases exposed
-regressions, which motivated retaining the previous score loop there. In the
-final primary eight-KV-head/context-4,096/batch-eight/90% case, candidate shared
-attention was faster than the retained build in two comparisons and roughly
-tied in the third. Fallback timing also varied. All samples and intermediate
-patches remain in [the score-tile evidence directory](measurements/shared-prefix-m2-score-tile/README.md).
-
-The final ordinary build then used the unchanged real-model protocol: Llama 3.2
-1B int8, context 4,096, batch eight, four workers, sixteen decode steps and twelve
-paired repeats for each physical-sharing fraction.
-
-| Physical sharing | Median paired speedup | Descriptive bootstrap 95% interval | Baseline / candidate pooled batch-step p95 |
-|---|---:|---:|---:|
-| 90% requested | 1.182x | [1.040, 1.230] | 293 / 401 ms |
-| 0% control | 0.996x | [0.939, 1.032] | 431 / 434 ms |
-
-All 48 timed runs have the same complete 128-token output and final-logit hash.
-The shared point estimate exceeds the 15% target, but the interval includes much
-smaller gains and the candidate's p95 worsens. The control's median slowdown is
-about 0.4%; its interval still includes regressions beyond 5%. Other desktop CPU
-activity was present, with no concurrent project build or benchmark. No samples
-were discarded. These measurements do not yet establish a repeatable gain and
-regression bound sufficient to merge or enable the feature.
-
-The separate real-model request replay completes four runs of two eight-request
-bursts, with a 2,048-token common prefix, private suffixes and one cancellation.
-Every run has identical tokens and finish reasons, 15 successful requests and
-one cancellation after eight emitted tokens. Each reaches eight active sequences
-and reuses 30,720 prompt tokens. The shared variant executes 608 shared-attention
-layer calls; the baseline executes none.
-
-Across its two repeat pairs, overall useful throughput changes by about -0.9%
-and +0.3%. Cold prefill dominates the run. The warm burst's useful throughput
-improves by about 4.9% and 16.6%, and overall observed inter-token p95 improves from
-207 / 217 ms to 191 / 192 ms. These are descriptive results from two pairs, not
-a reliable speed bound. Warm-burst throughput includes queueing and private
-prefill: successful warm output tokens divided by the interval from the first
-warm submission to the last warm completion. No prefill time is subtracted.
-
-All runs peak at 142 of 192 KV blocks and retain 128 cached prefix blocks after
-completion. The shared variant retains about 4.25 MiB of additional scratch.
-There are no OOMs, rejections, preemptions or COW copies. This validates the
-bounded-memory lifecycle and cancellation path; the pool does not force memory
-pressure. Arrivals follow scheduler steps, not wall-clock deadlines, and model
-loading and initial warmup remain outside the request timer. This 2,048-token
-request case is distinct from the 4,096-position steady-state model benchmark.
-
-## Earlier Apple M2 measurements, 2026-09-15 (`cf7bbe1`)
-
-Profiling the declared Llama 3.2 1B int8 case put attention at 41.4% of
-candidate model wall time. Shared scores and shared value accumulation accounted
-for 46.3% and 28.5% of summed attention-worker elapsed spans. These overlapping
-diagnostic scopes motivated a value-loop change: retain sixteen coordinates per
-output row in SIMD registers and reuse each weight load, mask check and broadcast
-across them. Token-order FMA arithmetic remains unchanged.
-
-The ordinary build then measured twelve paired repeats of sixteen decode steps
-at context 4,096, batch eight and four workers. Both sharing fractions use the
-same model and input histories; the shared case has 3,680 common positions.
-
-| Physical sharing | Median paired speedup | Descriptive bootstrap 95% interval | Baseline / candidate pooled batch-step p95 |
-|---|---:|---:|---:|
-| 90% requested | 1.135x | [1.107, 1.158] | 332 / 377 ms |
-| 0% control | 0.990x | [0.950, 1.027] | 410 / 478 ms |
-
-All 48 timed runs pass complete output and final-logit checks. All 36 kernel
-cases also retain finite bit-identical outputs; kernel speedups at context 4,096
-and 90% sharing are 1.580x / 1.582x / 1.538x for batches 4 / 8 / 16.
-
-The shared workload's paired median gain of 13.5% is below the 15% target.
-The control's median slowdown is about 1%, but its interval and the worsened
-tails do not establish a reliable regression bound. Other desktop processes
-were consuming CPU during these measurements. No concurrent project builds or
-benchmarks ran, and no samples were discarded. The PR remains a draft and the
-feature remains off; full request-lifecycle validation is still pending.
-
-A second experiment scanned each weight block once and skipped repeated zero
-checks only when every weight was nonzero. It preserved all numerical checks,
-but its kernel sweep showed no consistent improvement. That specialization was
-reverted before full-model testing. Its patch and all measurements remain in
-[the follow-up evidence directory](measurements/shared-prefix-m2-followup/README.md),
-alongside exact source fingerprints, process memory reports and reproduction
-instructions for both retained and rejected implementations.
-
-## Historical Apple M2 measurements, 2026-09-15 (`017c3e8`)
-
-The declared real-model case is Llama 3.2 1B with int8 projections, 4,096 prompt
-positions, eight sequences, eight measured steps and four Rayon workers. Each
-of three repetitions measures both schedules in rotating order after separate
-full-range warmup. The physically shared portion is 3,680 positions (requested
-90%, rounded to 16-position blocks). All 64 generated tokens and the final logits
-match exactly in every run. Inputs are synthetic token IDs with genuine computed
-KV, and EOS does not shorten the fixed budget.
-
-These are developer-workstation measurements on Apple M2 / 16 GiB, NEON and Rust
-1.93.1 release builds. No other project build or benchmark ran alongside timing;
-other system activity was uncontrolled. The raw reports retain all timed samples,
-per-step latencies, full outputs, model/input hashes and build source hashes in
-[the measurement directory](measurements/shared-prefix-m2/README.md). The measured
-source snapshot matches implementation commit `017c3e8`. Subsequent profiling
-and optimization changes require their own measured builds and source
-fingerprints; the historical figures below do not describe those revisions.
-
-An earlier value kernel measured 0.788x median throughput. Keeping value sums in
-registers across each physical block raised the next run to 1.106x. Review then
-found that cloning empty output vectors discarded their reserved capacity; the
-final harness allocates each buffer separately before timing. These earlier
-reports are retained as development history, not pooled with the final build.
-
-The final kernel-only sweep covers all 36 requested cases with 21 timed pairs
-per case and finite bit-identical outputs throughout. At context 4,096 and 90%
-sharing it measured 1.129x / 1.232x / 1.193x for batches 4 / 8 / 16. Those figures
-exclude model projections and cannot establish the full-model gate.
-
-| Final harness, physical sharing | Baseline tokens/s | Candidate tokens/s | Ratio of medians | Baseline / candidate pooled step p95 |
+| Session / physical sharing | Median paired speedup | Descriptive bootstrap 95% interval | Aggregate throughput ratio | Baseline / candidate pooled step p95 |
 |---|---:|---:|---:|---:|
-| 90% requested | 22.66 | 27.29 | 1.205x | 507 / 345 ms |
-| 0% control | 18.82 | 19.34 | 1.028x | 1,186 / 471 ms |
+| A / 90% | 1.196x | [1.186, 1.203] | 1.197x | 280.8 / 240.8 ms |
+| A / 0% | 1.006x | [0.980, 1.036] | 1.003x | 366.6 / 372.2 ms |
+| B / 0% | 0.985x | [0.909, 1.072] | 0.969x | 2269.0 / 2289.9 ms |
+| B / 90% | 1.574x | [1.489, 1.662] | 1.583x | 1639.3 / 1088.9 ms |
 
-The shared run's three paired speedups are 1.216x, 1.114x and 1.097x: the median
-paired improvement is 11.4%, below the target. The no-sharing control ranges from
-0.812x to 2.014x despite both variants executing the same fallback kernel. Its
-large variation makes the apparent 2.8% improvement and tail difference evidence
-of timing noise, not a fallback optimization. No timed samples were discarded.
-These small samples do not establish either a repeatable 15% gain or a reliable
-5% upper bound on fallback regression. The feature stays off and the PR remains
-a draft; the gate is **not yet established**.
+Both sessions require paired-median and descriptive-interval lower bounds of
+at least 1.15 for sharing and 0.95 for the control. Additional safeguards require
+the same aggregate-throughput bounds, candidate pooled p95 no more than 1.05
+times baseline, and order-stratum medians of at least 1.0 for sharing and 0.95
+for the control. These checks preserve the original improvement and regression
+targets; the descriptive intervals retain the statistical limitations above.
 
-The final shared runs retain 8.25 MiB of additional packed scratch. Actual KV
-storage is 446 MiB for 90% sharing and 2,056 MiB for the no-sharing control; these
-are storage-sharing effects present in both attention variants. Process maximum
-RSS was 3.11 GiB / 3.96 GiB respectively, measured by macOS `time -l` across each
-complete process, including checkpoint loading, preparation, warmup and both
-variants. It is not a per-variant RSS comparison. The control's additional packed
-scratch and shared layer-call count are zero. All twelve final real-model runs
-match the same complete token output and final-logit hash across both sharing
-fractions.
+The [complete confirmation archive](measurements/shared-prefix-m2-confirmation/README.md)
+retains every report, frozen input, host snapshot and executable/source digest.
+Its independent analyzer validates all 96 timed runs, complete tokens, final
+logits, every-step warmup logits, path counts and both lifecycle traces. Eleven
+negative checks verify that invalid evidence is rejected. The only failed
+criterion is the second control's interval lower bound.
+
+The measured source is `fdd76e3`; source reconstruction verifies its compiled
+fingerprint. The later `160426f` change only replaces equivalent four-byte
+chunk iteration inside the untimed hash helper. It leaves timed decode source
+unchanged; the archive distinguishes these revisions and does not claim
+identical executable bytes.
+
+No-sharing whole-process time rises from 395 to 1,614 seconds between sessions,
+with roughly the same retired instruction count; B's recorded one-minute load
+average rises from 4.63 to 24.36. Full per-run p95/p99/max, order-stratum medians
+and process counters are retained. These observations do not establish a cause.
+No project builds, tests or other benchmarks overlap the measurements. Desktop
+applications remain running; host/resource observations cannot establish the
+cause of a slow sample or justify excluding it.
+
+The separate lifecycle cases test deadline-based arrivals and actual memory
+pressure. Their acceptance rules cover correctness and latency accounting
+within the fixed traces; they contain no lifecycle throughput or latency
+regression bound.
+
+| Lifecycle case | Fixed scope | Final evidence |
+|---|---|---|
+| Mixed arrivals | Two alternating baseline/shared repeats; millisecond arrivals; four requests, eight sequences and 336 output tokens; no OOM, rejection or preemption | All four runs pass output and latency-accounting checks; peak 162/192 blocks, no preemption; 784 shared layer calls in each enabled run |
+| Memory pressure | One repeat of roomy-192 baseline, tight-132 baseline and tight-132 shared; two sequences and 128 output tokens; both tight runs must reach capacity and exercise preemption, recomputation and COW | Both tight runs match the oracle, peak at 132 blocks, and record one preemption, 33 recomputed tokens and one COW copy; enabled run executes 496 shared layer calls |
+
+These traces explicitly use token 0 as EOS and clear additional EOS IDs. An
+early EOS or missed pressure invariant fails the declared observation; prompts
+are not replaced after inspecting the results. Cancellation evidence remains
+in the earlier replay archive below.
+
+## Measurement history
+
+These records explain the implementation's development. They retain every
+sample, source fingerprint and rejected experiment. Historical timings belong
+to their recorded builds and are not pooled with the current confirmation.
+
+| Source / experiment | Main result | Evidence |
+|---|---|---|
+| `017c3e8`: initial real-model benchmark, final harness | Shared paired median 1.114x from three pairs, below 1.15; no-sharing pairs ranged 0.812–2.014x. All complete tokens and final logits matched. | [Initial M2 measurements](measurements/shared-prefix-m2/README.md) |
+| Earlier value kernels and harness correction | Development measurements moved from 0.788x to 1.106x after retaining value sums in registers. Review then corrected discarded output-buffer capacity. These reports were superseded by the final harness. | [Initial experiment history](measurements/shared-prefix-m2/README.md) |
+| `cf7bbe1`: retained value-loop optimization | Twelve-pair shared median 1.135x, interval [1.107, 1.158]; control 0.990x, interval [0.950, 1.027]. Shared and control tails worsened; the gate was not established. | [Value-loop follow-up](measurements/shared-prefix-m2-followup/README.md) |
+| Rejected nonzero-weight specialization | Exact numerical checks passed, but kernel sweeps showed no consistent benefit; the specialization was reverted before model timing. | [Retained and rejected follow-up experiments](measurements/shared-prefix-m2-followup/README.md) |
+| `1ad58be`: guarded long-prefix score tile | Twelve-pair shared median 1.182x, interval [1.040, 1.230], with pooled p95 worsening 293→401 ms. Control 0.996x, interval [0.939, 1.032]. All 48 timed runs matched outputs; the gate was not established. | [Score-tile evidence](measurements/shared-prefix-m2-score-tile/README.md) |
+| Rejected unrestricted and shape-only score tiles | Three alternating source comparisons per shape exposed regressions for four KV heads and shorter prefixes. The retained tile is restricted to the measured Llama shape and at least 2,048 attended shared tokens. | [Score-tile development and source patches](measurements/shared-prefix-m2-score-tile/README.md) |
+| `1ad58be`: earlier request lifecycle | Two replay pairs matched outputs, cancellation and prefix reuse. Overall throughput was nearly flat; warm-burst gains were 4.9% and 16.6%. Peak allocation was 142/192 blocks, so the trace did not force pressure. | [Replay results and limitations](measurements/shared-prefix-m2-score-tile/README.md#bounded-memory-request-lifecycle) |
+| Cold-prefill six-wide projection tile, reverted | A cold 2,049-token profile attributed 70.72% of recorded model time to feed-forward projections. Fixed four/six elapsed ratios of 0.987x, 1.030x and 0.953x failed the consistency check; the default remained four. This separate cold-start experiment did not establish the shared-decode gate. | [Cold-prefill experiment](measurements/cold-prefill-m2-tile6/README.md) |
 
 ## Focused next step
 
-1. Establish the current build's throughput and tail behavior on a quiet host,
-   using the same declared workload, twelve paired repeats and sixteen steps.
-   Retain every sample. Do not change the workload or select a favorable run to
-   satisfy the gate; the no-sharing control must also provide a stable baseline.
-2. The cold-prefill profile now identifies feed-forward projections as 70.72%
-   of recorded model time (87.56% for all transformer projections). Before a
-   further kernel change, separate gate/up/down projection compute from output
-   transposes and inspect the rejected six-wide tile for register spills. A
-   possible next experiment reuses activations across two weight rows while
-   retaining each output's arithmetic; the current profile does not establish
-   that activation traffic is the bottleneck. Keep cold-start, warm-cache and
-   steady-state results separate.
-3. Extend lifecycle evidence to timed mixed arrivals and a pool that actually
-   forces eviction/recompute. Preserve complete outputs, cancellation behavior
-   and competing-stream latency. The completed 192-block trace has spare capacity
-   and cannot establish behavior under pressure.
-4. Keep the feature off and the PR in draft until repeatable model improvement,
-   the no-sharing bound and request-latency evidence justify merging. The source
-   and measurement record are ready for review; the performance decision remains
-   unresolved.
+Keep the feature disabled by default and the PR in draft. The source and
+correctness evidence are ready for review; the performance gate is unresolved.
+Both shared cases clear their bounds, so another speculative kernel rewrite is
+not the next step supported by this record.
+
+Establish a stable evaluation environment before a new confirmation: use a
+quiet, dedicated M2 host with sufficient memory for the declared no-sharing
+case, record CPU/memory conditions, and fix the workload, run count and failure
+rules before timing. Preserve this failed observation and every new sample.
+Do not repeat the existing session until a favorable result appears or pool
+across changed sources or host conditions. If the control remains variable,
+investigate that variation before making a model-level performance claim.
+
+The completed mixed-arrival and forced-pressure traces establish bounded
+correctness and latency accounting. They do not establish a serving throughput
+or tail-latency guarantee; measure representative traffic separately before
+enabling the option for a deployment.

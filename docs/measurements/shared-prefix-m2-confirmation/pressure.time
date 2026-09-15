@@ -1,0 +1,22 @@
+replay pressure-roomy-baseline repeat 1/1
+replay pressure-baseline repeat 1/1
+replay pressure-shared repeat 1/1
+report: /Users/rohan/VSCode/Paged-Infer/target/pr16-readiness/pressure.jsonl
+     1402.64 real      1096.72 user        20.71 sys
+          4810031104  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              946855  page reclaims
+              236125  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               43296  voluntary context switches
+             2167192  involuntary context switches
+       6265447954155  instructions retired
+       2551644837586  cycles elapsed
+          2365443888  peak memory footprint

@@ -1,0 +1,241 @@
+{
+  "baseline": {
+    "A-shared0": {
+      "case_passed": true,
+      "evidence_valid": true,
+      "failure_reasons": []
+    },
+    "A-shared90": {
+      "case_passed": true,
+      "evidence_valid": true,
+      "failure_reasons": []
+    },
+    "B-shared0": {
+      "case_passed": false,
+      "evidence_valid": true,
+      "failure_reasons": [
+        "performance gate descriptive_interval_lower: 0.908615169 does not satisfy >= 0.95"
+      ]
+    },
+    "B-shared90": {
+      "case_passed": true,
+      "evidence_valid": true,
+      "failure_reasons": []
+    },
+    "mixed": {
+      "case_passed": true,
+      "evidence_valid": true,
+      "failure_reasons": []
+    },
+    "pressure": {
+      "case_passed": true,
+      "evidence_valid": true,
+      "failure_reasons": []
+    }
+  },
+  "negative_cases": [
+    {
+      "case": "A-shared90",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "FileNotFoundError": true
+      },
+      "failure_reasons": [
+        "decode evidence: FileNotFoundError: [Errno 2] No such file or directory: '/var/folders/w6/vhlgwh3j0xd14st5ksz581840000gn/T/pr16-analyzer-negative-rdf__gxj/A-shared90.jsonl'"
+      ],
+      "name": "missing_decode",
+      "passed": true
+    },
+    {
+      "case": "A-shared90",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "last record type": true
+      },
+      "failure_reasons": [
+        "last record type: expected 'verification', got 'summary'",
+        "decode evidence: KeyError: 'passed'"
+      ],
+      "name": "truncated_decode",
+      "passed": true
+    },
+    {
+      "case": "A-shared90",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "warmup logits differ": true
+      },
+      "failure_reasons": [
+        "complete tokens/final logits/warmup logits differ between runs",
+        "verification digest: expected '0000000000000000000000000000000000000000000000000000000000000000', got '8bee00f0fef28f66957f0a1532f71a3266eccd0d0481f67fcc5134d0e3d4ebfe'"
+      ],
+      "name": "warmup_digest_mismatch",
+      "passed": true
+    },
+    {
+      "case": "A-shared90",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "shared layer count": true
+      },
+      "failure_reasons": [
+        "shared layer count: expected 256, got 0"
+      ],
+      "name": "wrong_shared_path_count",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "sequence finish reason": true
+      },
+      "failure_reasons": [
+        "sequence finish reason: expected 'length', got 'eos'",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "sequence finish reason: expected 'length', got 'eos'",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "sequence finish reason: expected 'length', got 'eos'",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "sequence finish reason: expected 'length', got 'eos'",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335"
+      ],
+      "name": "equal_early_eos_outputs",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "incomplete or invalid lifecycle output tokens": true
+      },
+      "failure_reasons": [
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335",
+        "incomplete or invalid lifecycle output tokens",
+        "lifecycle summary output_tokens: expected 336, got 335",
+        "lifecycle summary useful_output_tokens: expected 336, got 335",
+        "delivery-derived observed token gap count: expected 328, got 327",
+        "observed_inter_token_ms summary count: expected 327, got 328",
+        "inter_delivery_ms summary count: expected 327, got 328",
+        "engine generated tokens: expected 336, got 335"
+      ],
+      "name": "equal_short_length_outputs",
+      "passed": true
+    },
+    {
+      "case": "pressure",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "pressure did not exercise cow_copies": true,
+        "pressure did not exercise preemptions": true,
+        "pressure did not exercise recomputed_tokens": true
+      },
+      "failure_reasons": [
+        "pressure did not exercise preemptions",
+        "pressure did not exercise recomputed_tokens",
+        "pressure did not exercise cow_copies",
+        "pressure did not exercise preemptions",
+        "pressure did not exercise recomputed_tokens",
+        "pressure did not exercise cow_copies"
+      ],
+      "name": "equal_outputs_without_pressure",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "deadline-derived TTFT": true
+      },
+      "failure_reasons": [
+        "deadline-derived TTFT: expected 167335.777708, got 167336.777708"
+      ],
+      "name": "incorrect_deadline_ttft",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "dispatch_lag_ms summary p95": true
+      },
+      "failure_reasons": [
+        "dispatch_lag_ms summary p95: expected 2289.9911660000002, got 2290.9911660000002"
+      ],
+      "name": "incorrect_dispatch_summary",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "observed_inter_token_ms summary p95": true
+      },
+      "failure_reasons": [
+        "observed_inter_token_ms summary p95: expected 2736.7650830000057, got 2737.7650830000057"
+      ],
+      "name": "incorrect_inter_token_summary",
+      "passed": true
+    },
+    {
+      "case": "mixed",
+      "evidence_valid": false,
+      "expected_reasons_found": {
+        "inter_delivery_ms summary p95": true
+      },
+      "failure_reasons": [
+        "inter_delivery_ms summary p95: expected 2736.7650830000057, got 2737.7650830000057"
+      ],
+      "name": "incorrect_inter_delivery_summary",
+      "passed": true
+    }
+  ],
+  "original_files_checked": 28,
+  "original_files_unchanged": true,
+  "scope": "Per-case evidence rejection; no inference or CI checks",
+  "validation_passed": true
+}

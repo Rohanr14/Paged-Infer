@@ -1,0 +1,23 @@
+replay mixed-baseline repeat 1/2
+replay mixed-shared repeat 1/2
+replay mixed-shared repeat 2/2
+replay mixed-baseline repeat 2/2
+report: /Users/rohan/VSCode/Paged-Infer/target/pr16-readiness/mixed.jsonl
+      904.22 real      2878.44 user        40.97 sys
+          4771201024  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1237099  page reclaims
+              265289  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  98  voluntary context switches
+             5563524  involuntary context switches
+       9879207759623  instructions retired
+       5880447265984  cycles elapsed
+          2370375472  peak memory footprint

@@ -1,0 +1,16 @@
+{
+  "name": "mixed-baseline",
+  "engine": {
+    "total_blocks": 192,
+    "block_size": 16,
+    "max_batch_size": 8,
+    "prefill_chunk_size": 32,
+    "max_prefill_tokens_per_step": 32,
+    "enable_prefix_cache": true,
+    "draft_tokens": 0,
+    "stream_tokens": true,
+    "shared_prefix_attention": false,
+    "eos_token": 0,
+    "extra_eos_tokens": []
+  }
+}

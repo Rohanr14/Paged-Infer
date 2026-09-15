@@ -863,7 +863,9 @@ blocks.
 - **Shared-prefix attention is experimental and off by default.** The prototype
   supports one physical prefix common to a decode batch, with private suffixes
   and per-query windows. It retains the existing fallback and full-window score
-  storage. See [the measurement and activation gate](docs/shared-prefix-attention.md).
+  storage. The current confirmation passes correctness and lifecycle checks,
+  but does not establish the no-sharing regression bound. See
+  [the measurement and activation gate](docs/shared-prefix-attention.md).
 - **The batched matmul is tiled across the batch but not across output rows.**
   Tiling rows as well would cut activation loads the way tiling the batch cut
   weight loads, but `4 * TILE` accumulators per output already crowd the AVX2

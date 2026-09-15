@@ -1,0 +1,25 @@
+{
+  "before": {
+    "utc": "2026-09-15T21:48:08.566644+00:00",
+    "load_average_1_5_15_minutes": [
+      3.20068359375,
+      3.22265625,
+      2.64306640625
+    ],
+    "thermal_report_exit_code": 0,
+    "thermal_report": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "thermal_report_error": ""
+  },
+  "after": {
+    "utc": "2026-09-15T21:53:31.363527+00:00",
+    "load_average_1_5_15_minutes": [
+      5.62646484375,
+      4.9072265625,
+      3.6318359375
+    ],
+    "thermal_report_exit_code": 0,
+    "thermal_report": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "thermal_report_error": ""
+  },
+  "exit_code": 0
+}
