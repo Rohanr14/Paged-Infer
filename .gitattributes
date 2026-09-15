@@ -5,3 +5,5 @@ docs/measurements/**/*.jsonl linguist-generated=true
 docs/measurements/**/*.time linguist-generated=true
 docs/measurements/**/*.stdout linguist-generated=true
 docs/measurements/**/*.log linguist-generated=true whitespace=-blank-at-eof
+docs/measurements/**/analysis.json linguist-generated=true
+docs/measurements/**/analyzer-validation.json linguist-generated=true
