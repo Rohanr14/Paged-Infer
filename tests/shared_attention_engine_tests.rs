@@ -1,7 +1,7 @@
 //! The optional attention schedule must survive real scheduler ownership changes.
-use paged_infer::engine::{Engine, EngineConfig, RequestOptions};
+use paged_infer::engine::{Engine, EngineConfig, FinishReason, RequestOptions};
 use paged_infer::model::{LlamaConfig, ModelLoader};
-use paged_infer::replay::{self, ReplayLimits, Workload};
+use paged_infer::replay::{self, ReplayClock, ReplayEvent, ReplayLimits, Workload};
 
 fn engine(enabled: bool, blocks: usize, draft_tokens: usize) -> Engine<'static> {
     let config = LlamaConfig::from_hf_config(concat!(
@@ -94,8 +94,8 @@ fn prefill_stays_on_default_and_cancellation_reset_releases_mappings() {
 
 #[test]
 fn seeded_samples_match_after_copy_on_write_and_preemption() {
-    let run = |enabled| {
-        let mut e = engine(enabled, 8, 0);
+    let run = |enabled, blocks| {
+        let mut e = engine(enabled, blocks, 0);
         e.submit_tokens_with(
             (1..8).collect(),
             22,
@@ -109,25 +109,116 @@ fn seeded_samples_match_after_copy_on_write_and_preemption() {
         .unwrap();
         let mut done = e.run().unwrap();
         done.sort_by_key(|c| c.sequence_id);
+        assert_eq!(done.len(), 2);
+        for completion in &done {
+            assert_eq!(completion.tokens.len(), 22);
+            assert_eq!(completion.finish_reason, FinishReason::Length);
+        }
+        assert!(!e.has_work());
+        assert_eq!(e.queue_depth(), (0, 0));
+        if blocks == 8 {
+            assert_eq!(e.peak_allocated_blocks(), blocks);
+        }
         let outputs: Vec<_> = done
             .into_iter()
             .map(|c| (c.sequence_id, c.tokens, c.finish_reason))
             .collect();
-        (
+        let result = (
             outputs,
-            e.stats().preemptions,
+            e.stats().clone(),
             e.cow_copies(),
             e.shared_attention_stats(),
-        )
+        );
+        e.reset();
+        assert_eq!(e.available_blocks(), e.total_blocks());
+        result
+    };
+    let roomy = run(false, 64);
+    let baseline = run(false, 8);
+    let candidate = run(true, 8);
+    assert_eq!(roomy.0, baseline.0);
+    assert_eq!(roomy.0, candidate.0);
+    assert_eq!(roomy.1.preemptions, 0);
+    assert_eq!(roomy.1.recomputed_tokens, 0);
+    for tight in [&baseline, &candidate] {
+        assert!(
+            tight.1.preemptions > 0 && tight.1.recomputed_tokens > 0 && tight.2 > 0,
+            "must exercise preemption, recompute and COW"
+        );
+    }
+    assert_eq!(baseline.3.layer_calls, 0);
+    assert!(candidate.3.layer_calls > 0);
+}
+
+#[test]
+fn millisecond_arrivals_preserve_outputs_and_deadline_accounting() {
+    let submit = |id: &str, at, tokens, max_tokens, samples| ReplayEvent::Submit {
+        id: id.into(),
+        at,
+        tokens,
+        max_tokens,
+        samples,
+        seed: 42,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+    };
+    let mut shared_prompt: Vec<u32> = (1..17).collect();
+    shared_prompt.push(31);
+    let workload = Workload {
+        version: 1,
+        clock: ReplayClock::Milliseconds,
+        events: vec![
+            submit("fork", 0, (1..18).collect(), 24, 2),
+            submit("short", 1, vec![21, 22, 23], 6, 1),
+            submit("shared", 2, shared_prompt, 10, 1),
+        ],
+    };
+    let run = |enabled| {
+        let mut e = engine(enabled, 64, 0);
+        let report = replay::run(&mut e, &workload, &ReplayLimits::default()).unwrap();
+        assert!(!e.has_work());
+        assert_eq!(e.queue_depth(), (0, 0));
+        assert_eq!(report.summary.successful_requests, 3);
+        assert_eq!(report.summary.completed_sequences, 4);
+        assert_eq!(report.summary.useful_output_tokens, 64);
+        assert_eq!(report.summary.dispatch_lag_ms.count, 3);
+        assert_eq!(report.summary.ttft_ms.count, 4);
+        for request in &report.requests {
+            let scheduled_ms = request.scheduled_at as f64;
+            assert!(request.submitted_at_ms >= scheduled_ms);
+            assert!(
+                (request.dispatch_lag_ms.unwrap() - (request.submitted_at_ms - scheduled_ms)).abs()
+                    < 1e-8
+            );
+            for sequence in &request.sequences {
+                assert_eq!(sequence.finish_reason, FinishReason::Length);
+                assert!(
+                    (sequence.ttft_ms.unwrap() - (sequence.deliveries[0].at_ms - scheduled_ms))
+                        .abs()
+                        < 1e-8
+                );
+                assert!(
+                    (sequence.end_to_end_ms - (sequence.finished_at_ms - scheduled_ms)).abs()
+                        < 1e-8
+                );
+                assert_eq!(
+                    sequence.tokens.len(),
+                    sequence.deliveries.iter().map(|d| d.tokens).sum::<usize>()
+                );
+            }
+        }
+        e.reset();
+        assert_eq!(e.available_blocks(), e.total_blocks());
+        report
     };
     let baseline = run(false);
     let candidate = run(true);
-    assert_eq!(baseline.0, candidate.0);
-    assert!(
-        candidate.1 > 0 && candidate.2 > 0,
-        "must exercise recompute and COW"
-    );
-    assert!(candidate.3.layer_calls > 0);
+    replay::compare_outputs(&baseline, &candidate).unwrap();
+    assert_eq!(baseline.engine.shared_attention_layer_calls, 0);
+    assert_eq!(baseline.memory.shared_attention_scratch_bytes, 0);
+    assert!(candidate.engine.shared_attention_layer_calls > 0);
+    assert!(candidate.memory.shared_attention_scratch_bytes > 0);
 }
 
 #[test]

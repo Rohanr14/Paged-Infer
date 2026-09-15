@@ -933,6 +933,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "libc",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

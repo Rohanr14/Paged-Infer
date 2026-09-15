@@ -135,12 +135,29 @@ scheduling delay; they are not CPU time or exclusive wall time. Do not add these
 scopes together. Counters are process-global, so resetting or interpreting them
 also requires that other inference work is absent and workers have joined.
 
+Every warmup now hashes the complete logits at every decode position and checks
+that digest across variants and repeats. The timed specialization performs no
+logit hashing. Each measured run retains its warmup duration, loop-start UNIX
+timestamp, complete tokens, final-logit digest and individual step times. On
+Unix, process CPU time, page-fault and context-switch deltas are sampled just
+outside the timed loop; unavailable or decreasing counters produce `null`.
+These process-wide deltas include all threads and a small amount of boundary
+work. They cannot identify a particular worker or prove that outside activity
+caused a stall.
+
 Shared-decode summaries retain the existing ratio of separate elapsed-time
 medians and add `paired_elapsed_time_speedup`: every same-repeat
 baseline/candidate elapsed-time ratio, plus its median, minimum and maximum.
 Ratios above one favor the candidate. The paired median uses the midpoint of
 both middle ratios for even sample counts; the legacy marginal p50 fields keep
 their nearest-rank convention.
+
+The `performance_diagnostics` summary additionally reports aggregate throughput
+(equal total token budgets divided by total elapsed time) and paired medians
+split by which variant ran first. These views preserve the primary estimator
+while exposing costly tails and order sensitivity; the strata are not separate
+independent experiments. Compare pooled p95/p99/max with the per-run step
+distributions rather than treating each decode step as an independent repeat.
 
 The reported 95% interval uses 10,000 deterministic paired bootstrap resamples.
 Each draws the original number of complete repeat pairs with replacement and

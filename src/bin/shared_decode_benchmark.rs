@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const BLOCK_SIZE: usize = 16;
 const PREFILL_CHUNK: usize = 32;
@@ -41,6 +41,8 @@ EOS is treated as an ordinary token: every sequence runs the fixed step budget.
 Prompt preparation, warmup, validation and reporting are outside timed loops;
 finite-logit checking is combined with timed greedy selection. Each variant
 warms its entire decode range, then restarts from identical held tokens.
+Warmup hashes complete logits at every step; timed decode never hashes logits.
+Process resource snapshots and the loop-start timestamp are outside timed work.
 Increase SHARED_DECODE_STEPS for longer runs and SHARED_DECODE_REPS for more
 measurement pairs; steps within a run are not bootstrap replicates.
 The paired bootstrap interval describes observed pair variation under independent,
@@ -319,9 +321,81 @@ struct DecodeRun {
     elapsed_ms: f64,
     steps_ms: Vec<f64>,
     tokens: Vec<Vec<u32>>,
+    all_step_logits_sha256: Option<String>,
+    timed_loop_start_unix_ms: Option<u128>,
+    process_resource_usage: Option<Value>,
 }
 
-fn decode(
+/// Cumulative process counters. Snapshot outside the timed loop; these include
+/// all process threads and cannot identify which worker or outside process
+/// caused a stall. A missing or non-monotonic snapshot produces no delta.
+struct ProcessUsage {
+    user_cpu_us: u64,
+    system_cpu_us: u64,
+    minor_page_faults: u64,
+    major_page_faults: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+}
+
+impl ProcessUsage {
+    fn since(&self, before: &Self) -> Option<Value> {
+        Some(json!({
+            "user_cpu_ms": self.user_cpu_us.checked_sub(before.user_cpu_us)? as f64 / 1000.0,
+            "system_cpu_ms": self.system_cpu_us.checked_sub(before.system_cpu_us)? as f64 / 1000.0,
+            "minor_page_faults": self.minor_page_faults.checked_sub(before.minor_page_faults)?,
+            "major_page_faults": self.major_page_faults.checked_sub(before.major_page_faults)?,
+            "voluntary_context_switches": self.voluntary_context_switches.checked_sub(before.voluntary_context_switches)?,
+            "involuntary_context_switches": self.involuntary_context_switches.checked_sub(before.involuntary_context_switches)?,
+        }))
+    }
+}
+
+#[cfg(unix)]
+fn process_usage() -> Option<ProcessUsage> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage receives writable storage for exactly one rusage. Only
+    // a successful call initializes the value that we read below.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful getrusage call initialized this structure.
+    let usage = unsafe { usage.assume_init() };
+    let micros = |time: libc::timeval| {
+        u64::try_from(time.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000)?
+            .checked_add(u64::try_from(time.tv_usec).ok()?)
+    };
+    Some(ProcessUsage {
+        user_cpu_us: micros(usage.ru_utime)?,
+        system_cpu_us: micros(usage.ru_stime)?,
+        minor_page_faults: u64::try_from(usage.ru_minflt).ok()?,
+        major_page_faults: u64::try_from(usage.ru_majflt).ok()?,
+        voluntary_context_switches: u64::try_from(usage.ru_nvcsw).ok()?,
+        involuntary_context_switches: u64::try_from(usage.ru_nivcsw).ok()?,
+    })
+}
+
+#[cfg(not(unix))]
+fn process_usage() -> Option<ProcessUsage> {
+    None
+}
+
+/// Canonical f32-bit encoding without allocating a second vocabulary buffer.
+fn update_logit_digest(digest: &mut Sha256, logits: &[f32]) {
+    let mut bytes = [0u8; 1024];
+    for chunk in logits.chunks(bytes.len() / size_of::<f32>()) {
+        for (value, encoded) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+            encoded.copy_from_slice(&value.to_bits().to_le_bytes());
+        }
+        digest.update(&bytes[..std::mem::size_of_val(chunk)]);
+    }
+}
+
+// The const parameter gives timed decode its own specialization with no
+// per-step logit hashing or process-resource sampling in the model loop.
+fn decode<const VERIFY_LOGITS: bool>(
     weights: &LlamaWeights<'_>,
     config: &LlamaConfig,
     settings: &Settings,
@@ -335,6 +409,16 @@ fn decode(
         .map(|_| Vec::with_capacity(settings.steps))
         .collect();
     let mut steps_ms = Vec::with_capacity(settings.steps);
+    let mut logits_digest = VERIFY_LOGITS.then(Sha256::new);
+    let resource_start = if VERIFY_LOGITS { None } else { process_usage() };
+    let timed_loop_start_unix_ms = if VERIFY_LOGITS {
+        None
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis())
+    };
     let start = Instant::now();
     for _ in 0..settings.steps {
         let step_start = Instant::now();
@@ -347,6 +431,12 @@ fn decode(
             BLOCK_SIZE,
             scratch,
         );
+        if VERIFY_LOGITS {
+            update_logit_digest(
+                logits_digest.as_mut().unwrap(),
+                &scratch.logits[..settings.batch * config.vocab_size],
+            );
+        }
         for sequence in 0..settings.batch {
             held[sequence] = greedy(scratch.logits_for(sequence, config.vocab_size))?;
             tokens[sequence].push(held[sequence]);
@@ -355,10 +445,18 @@ fn decode(
         steps_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
     }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let resource_end = if VERIFY_LOGITS { None } else { process_usage() };
+    let process_resource_usage = resource_start
+        .as_ref()
+        .zip(resource_end.as_ref())
+        .and_then(|(before, after)| after.since(before));
     Ok(DecodeRun {
         elapsed_ms,
         steps_ms,
         tokens,
+        all_step_logits_sha256: logits_digest.map(|digest| format!("{:x}", digest.finalize())),
+        timed_loop_start_unix_ms,
+        process_resource_usage,
     })
 }
 
@@ -405,6 +503,7 @@ fn environment() -> Value {
         "rayon_threads": rayon::current_num_threads(),
         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
         "attention_lanes_per_thread_env": std::env::var("PAGED_INFER_ATTN_LANES_PER_THREAD").ok(),
+        "matmul_tile_env": std::env::var("PAGED_INFER_MATMUL_TILE").ok(),
         "logical_cpus": std::thread::available_parallelism().ok().map(|n| n.get()),
         "build": {
             "rustc": env!("PAGED_BUILD_RUSTC"), "target": env!("PAGED_BUILD_TARGET"),
@@ -554,6 +653,48 @@ fn paired_speedup_statistics(baseline: &[f64], candidate: &[f64]) -> Result<Valu
     }))
 }
 
+/// Extra views of the same retained observations, never replacements for the
+/// predeclared median of paired ratios. Order follows the unchanged AB/BA loop.
+fn performance_diagnostics(baseline: &[f64], candidate: &[f64], tokens_per_run: usize) -> Value {
+    assert!(!baseline.is_empty() && baseline.len() == candidate.len());
+    let baseline_total: f64 = baseline.iter().sum();
+    let candidate_total: f64 = candidate.iter().sum();
+    let tokens_per_variant = tokens_per_run as f64 * baseline.len() as f64;
+    let strata: Vec<_> = ["baseline", "shared_prefix"]
+        .into_iter()
+        .enumerate()
+        .map(|(parity, first_variant)| {
+            let repeat_numbers: Vec<_> = (parity..baseline.len())
+                .step_by(2)
+                .map(|index| index + 1)
+                .collect();
+            let mut ratios: Vec<_> = repeat_numbers
+                .iter()
+                .map(|&repeat| baseline[repeat - 1] / candidate[repeat - 1])
+                .collect();
+            let estimate = (!ratios.is_empty()).then(|| median(&mut ratios));
+            json!({
+                "first_variant": first_variant, "pair_count": repeat_numbers.len(),
+                "repeat_numbers": repeat_numbers, "median": estimate,
+            })
+        })
+        .collect();
+    json!({
+        "diagnostic_only": true,
+        "interpretation": "Alternative views of the same complete samples; the primary estimator remains paired_elapsed_time_speedup. Order strata are descriptive, not independent experiments.",
+        "aggregate_throughput": {
+            "estimator": "sum of baseline elapsed times divided by sum of candidate elapsed times, with equal total generated-token budgets",
+            "baseline_elapsed_ms": baseline_total,
+            "candidate_elapsed_ms": candidate_total,
+            "tokens_per_variant": tokens_per_variant,
+            "baseline_tokens_per_second": tokens_per_variant * 1000.0 / baseline_total,
+            "candidate_tokens_per_second": tokens_per_variant * 1000.0 / candidate_total,
+            "speedup": baseline_total / candidate_total,
+        },
+        "order_stratified_paired_speedup": strata,
+    })
+}
+
 fn main() -> Result<()> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments.as_slice() == ["--help"] || arguments.as_slice() == ["-h"] {
@@ -610,8 +751,21 @@ fn main() -> Result<()> {
         "physical_kv_bytes": harness.kv.len() * size_of::<f32>(),
         "preparation_ms": preparation_ms,
             "timed_work": "all layers, LM head, finite-logit scan, argmax and token recording",
-            "excluded_work": "model loading, fingerprinting, prompt preparation, full-range warmup, output comparison, reporting",
-            "warmup": "fresh scratch per variant/run; one full untimed decode followed by restart from identical held tokens",
+            "excluded_work": "model loading, fingerprinting, prompt preparation, full-range warmup and logit hashing, process-resource snapshots, loop-start wall-clock timestamp, output comparison, reporting",
+            "warmup": "fresh scratch per variant/run; one full untimed decode hashes every step's complete logits, then restarts from identical held tokens; warmup_elapsed_ms includes hashing",
+            "warmup_logit_hash": {
+                "algorithm": "SHA-256",
+                "encoding": "complete raw f32 bits, little-endian, in step/batch-entry/vocabulary-ID order",
+                "steps_per_run": settings.steps,
+                "entries_per_step": settings.batch,
+                "logits_per_entry": config.vocab_size,
+                "timed_loop_hashing": false,
+            },
+            "process_resource_usage": {
+                "provider": if cfg!(unix) { "getrusage(RUSAGE_SELF)" } else { "unavailable" },
+                "scope": "process-wide deltas bracketing the timed loop, including all worker threads and small boundary bookkeeping; no per-step sampling",
+                "unavailable": "run field is null if unsupported, either snapshot fails, or counters decrease",
+            },
             "termination": "fixed step budget; EOS tokens do not terminate this benchmark",
             "physical_no_sharing_control": "percentage 0 copies genuine common-content KV into distinct physical blocks",
         })
@@ -620,6 +774,7 @@ fn main() -> Result<()> {
     let token_count = settings.batch * settings.steps;
     let mut reference: Option<Vec<Vec<u32>>> = None;
     let mut reference_logits: Option<String> = None;
+    let mut reference_warmup_logits: Option<String> = None;
     let mut times = [
         Vec::with_capacity(settings.repeats),
         Vec::with_capacity(settings.repeats),
@@ -642,11 +797,26 @@ fn main() -> Result<()> {
             // Populate scratch to the widest measured window before starting the
             // timer. Replaying overwrites future KV causally; the prepared prompt
             // and distinct private token at `context` are never overwritten.
-            decode(&weights, &config, &settings, &mut harness, &mut scratch)?;
+            let warmup = decode::<true>(&weights, &config, &settings, &mut harness, &mut scratch)?;
+            let warmup_logits_sha256 = warmup.all_step_logits_sha256.as_ref().unwrap();
+            if let Some(expected) = &reference_warmup_logits {
+                ensure!(
+                    expected == warmup_logits_sha256,
+                    "complete warmup logits differ at repeat {} shared={enabled}",
+                    repetition + 1
+                );
+            } else {
+                reference_warmup_logits = Some(warmup_logits_sha256.clone());
+            }
             scratch.reset_shared_attention_stats();
             paged_infer::profiling::reset();
-            let run = decode(&weights, &config, &settings, &mut harness, &mut scratch)?;
+            let run = decode::<false>(&weights, &config, &settings, &mut harness, &mut scratch)?;
             let profile = paged_infer::profiling::snapshot();
+            ensure!(
+                warmup.tokens == run.tokens,
+                "warmup and timed greedy outputs differ at repeat {} shared={enabled}",
+                repetition + 1
+            );
             match &reference {
                 Some(expected) => ensure!(
                     *expected == run.tokens,
@@ -689,6 +859,13 @@ fn main() -> Result<()> {
                     "variant": if enabled { "shared_prefix" } else { "baseline" },
                     "selected_path": if stats.layer_calls > 0 { "shared_prefix" } else { "fallback" },
                     "elapsed_ms": run.elapsed_ms, "tokens_per_second": token_count as f64 * 1000.0 / run.elapsed_ms,
+                    "warmup_elapsed_ms": warmup.elapsed_ms,
+                    "warmup_logits_sha256": warmup_logits_sha256,
+                    "warmup_logit_steps_hashed": settings.steps,
+                    "verified_complete_warmup_logits": true,
+                    "verified_warmup_timed_greedy_output": true,
+                    "timed_loop_start_unix_ms": run.timed_loop_start_unix_ms,
+                    "process_resource_usage": run.process_resource_usage,
                     "step_ms": run.steps_ms, "step_distribution_ms": distribution(run.steps_ms.clone()),
                     "generated_tokens": run.tokens, "finish_reason": "fixed_step_budget",
                     "final_logits_sha256": final_logits_sha256,
@@ -718,6 +895,7 @@ fn main() -> Result<()> {
             "median_speedup": baseline_ms / candidate_ms,
             "median_speedup_estimator": "legacy ratio of separate nearest-rank p50 elapsed times; paired_elapsed_time_speedup reports the paired estimator",
             "paired_elapsed_time_speedup": paired_speedups,
+            "performance_diagnostics": performance_diagnostics(&times[0], &times[1], token_count),
             "timing_samples_retained": settings.repeats * 2,
         })
     )?;
@@ -725,7 +903,10 @@ fn main() -> Result<()> {
         output,
         "{}",
         json!({"type": "verification", "passed": true, "complete": true,
-        "runs": settings.repeats * 2, "scope": "all timed greedy tokens, finite logits, fixed step budget"})
+        "runs": settings.repeats * 2,
+        "warmup_logits_sha256": reference_warmup_logits,
+        "warmup_logit_steps_per_run": settings.steps,
+        "scope": "all timed greedy tokens, finite logits, final timed logits, every warmup step's complete logits, warmup/timed greedy parity, fixed step budget"})
     )?;
     Ok(())
 }
@@ -733,6 +914,78 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod statistical_tests {
     use super::*;
+
+    #[test]
+    fn full_logit_digest_preserves_bits_across_steps_and_chunk_boundaries() {
+        let mut first_step = vec![1.0f32; 300];
+        first_step[0] = -0.0;
+        first_step[299] = f32::from_bits(0x7fc0_0123);
+        let final_step = [2.0f32, 3.0];
+        let digest_steps = |first: &[f32]| {
+            let mut digest = Sha256::new();
+            update_logit_digest(&mut digest, first);
+            update_logit_digest(&mut digest, &final_step);
+            format!("{:x}", digest.finalize())
+        };
+        let bytes: Vec<_> = first_step
+            .iter()
+            .chain(&final_step)
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect();
+        let expected = hash(&bytes);
+        assert_eq!(digest_steps(&first_step), expected);
+        // A changed earlier step must be visible even when the final step is
+        // identical, and signed zero must not be normalized during hashing.
+        first_step[0] = 0.0;
+        assert_ne!(digest_steps(&first_step), expected);
+    }
+
+    #[test]
+    fn diagnostics_keep_aggregate_and_order_effects_separate() {
+        let result = performance_diagnostics(&[2.0, 12.0, 8.0, 1.0], &[1.0, 3.0, 2.0, 2.0], 9);
+        assert_eq!(result["aggregate_throughput"]["speedup"], 2.875);
+        assert_eq!(result["aggregate_throughput"]["tokens_per_variant"], 36.0);
+        let strata = &result["order_stratified_paired_speedup"];
+        assert_eq!(strata[0]["first_variant"], "baseline");
+        assert_eq!(strata[0]["repeat_numbers"], json!([1, 3]));
+        assert_eq!(strata[0]["median"], 3.0);
+        assert_eq!(strata[1]["first_variant"], "shared_prefix");
+        assert_eq!(strata[1]["repeat_numbers"], json!([2, 4]));
+        assert_eq!(strata[1]["median"], 2.25);
+        let single = performance_diagnostics(&[2.0], &[1.0], 9);
+        assert_eq!(
+            single["order_stratified_paired_speedup"][1]["pair_count"],
+            0
+        );
+        assert!(single["order_stratified_paired_speedup"][1]["median"].is_null());
+    }
+
+    #[test]
+    fn process_deltas_subtract_counters_and_refuse_decreasing_snapshots() {
+        let before = ProcessUsage {
+            user_cpu_us: 1000,
+            system_cpu_us: 2000,
+            minor_page_faults: 3,
+            major_page_faults: 4,
+            voluntary_context_switches: 5,
+            involuntary_context_switches: 6,
+        };
+        let after = ProcessUsage {
+            user_cpu_us: 3500,
+            system_cpu_us: 6000,
+            minor_page_faults: 5,
+            major_page_faults: 7,
+            voluntary_context_switches: 9,
+            involuntary_context_switches: 11,
+        };
+        assert_eq!(
+            after.since(&before).unwrap(),
+            json!({"user_cpu_ms": 2.5, "system_cpu_ms": 4.0,
+                "minor_page_faults": 2, "major_page_faults": 3,
+                "voluntary_context_switches": 4, "involuntary_context_switches": 5})
+        );
+        assert!(before.since(&after).is_none());
+    }
 
     #[test]
     fn paired_median_preserves_repeat_matching() {

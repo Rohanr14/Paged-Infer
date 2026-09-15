@@ -42,6 +42,10 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # Fingerprint replay inputs and assert reference checkpoint identity.
 sha2 = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+# Untimed process-resource snapshots for benchmark diagnostics.
+libc = "0.2"
+
 [build-dependencies]
 # Capture a deterministic source fingerprint alongside the build toolchain.
 sha2 = "0.10"

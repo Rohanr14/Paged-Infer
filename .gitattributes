@@ -1,0 +1,6 @@
+# Keep raw benchmark evidence available while collapsing generated reports in
+# GitHub's review view. Protocols, analysis scripts, source patches and guides
+# remain ordinary reviewable files.
+docs/measurements/**/*.jsonl linguist-generated=true
+docs/measurements/**/*.time linguist-generated=true
+docs/measurements/**/*.stdout linguist-generated=true
