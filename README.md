@@ -410,10 +410,10 @@ changed.
 
 ### Paged attention
 
-Batching cannot make attention cheaper. Every other operand in a decode step is
-shared — one weight matrix serves the whole batch — but the KV cache is not:
-each sequence has its own history, its own position, its own scattered blocks.
-There is nothing to amortize.
+Unrelated histories need independent attention. Physically shared prefixes can
+reuse KV loads across queries; the optional [shared-prefix prototype](docs/shared-prefix-attention.md)
+does this with SIMD query tiles. The default kernel described below groups GQA
+heads within each sequence and handles arbitrary ragged batches.
 
 What it can do is stop attention costing more than it has to. Two costs in the
 obvious implementation are pure overhead:
@@ -860,9 +860,10 @@ blocks.
 
 ## Honest limitations
 
-- **Attention still cannot amortize across sequences**, because there is no
-  shared operand to amortize — each sequence has its own KV. The kernel removes
-  the redundant work (see *Paged attention*), but the floor it leaves is real.
+- **Shared-prefix attention is experimental and off by default.** The prototype
+  supports one physical prefix common to a decode batch, with private suffixes
+  and per-query windows. It retains the existing fallback and full-window score
+  storage. See [the measurement and activation gate](docs/shared-prefix-attention.md).
 - **The batched matmul is tiled across the batch but not across output rows.**
   Tiling rows as well would cut activation loads the way tiling the batch cut
   weight loads, but `4 * TILE` accumulators per output already crowd the AVX2
@@ -922,11 +923,14 @@ src/
     kv_cache_manager.rs  admission, copy-on-write, eviction
     layout.rs        physical KV addressing
   attention.rs       paged attention: GQA head grouping, block-wise addressing
+  attention/shared.rs optional cross-sequence KV load reuse
   detokenizer.rs     incremental token → text for streaming
   speculative.rs     drafters and lossless greedy verification
   bin/
     http_server.rs         environment → ServeConfig; the logic is in serve.rs
     attention_benchmark.rs lane-width sweep for the paged attention kernel
+    shared_attention_benchmark.rs shared-prefix kernel sweep with JSONL evidence
+    shared_decode_benchmark.rs real-history full-model steady-state decode
     benchmark.rs           kernel attribution ladder
     batch_benchmark.rs     batched vs sequential decode
     prefix_cache_benchmark.rs
@@ -936,7 +940,7 @@ scripts/
   gen_golden_fixture.py    reference model + logits (NumPy)
   gen_tokenizer_fixture.py Llama-shaped tokenizer fixture (stdlib)
   download_model.py        fetch TinyLlama 1.1B
-tests/                     217 tests; fixtures/ holds the reference checkpoint
+tests/                     correctness and integration tests; fixtures/ holds the reference checkpoint
                            and tokenizer
 ```
 

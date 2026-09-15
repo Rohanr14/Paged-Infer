@@ -91,6 +91,9 @@ pub struct EngineConfig {
     /// prefill work bound, not a bound on total decode work or elapsed time.
     /// Separate from `prefill_chunk_size`, which controls matrix batching.
     pub max_prefill_tokens_per_step: usize,
+    /// Experimental shared-prefix decode attention; unrelated batches fall back.
+    /// Disabled by default pending the end-to-end performance gate.
+    pub shared_prefix_attention: bool,
     /// Draft tokens to propose per step. `0` disables speculative decoding.
     ///
     /// Only greedy sequences speculate: acceptance is defined as "the model
@@ -125,6 +128,7 @@ impl Default for EngineConfig {
             max_batch_size: 32,
             prefill_chunk_size: 32,
             max_prefill_tokens_per_step: 32,
+            shared_prefix_attention: false,
             draft_tokens: 0,
             stream_tokens: false,
         }
@@ -443,7 +447,8 @@ impl<'a> Engine<'a> {
         let kv = KvCacheManager::new(engine.total_blocks, engine.block_size)
             .with_prefix_cache(engine.enable_prefix_cache);
         let batch_capacity = engine.max_batch_size.max(engine.prefill_chunk_size).max(1);
-        let batch_scratch = BatchScratch::new(&config, batch_capacity);
+        let mut batch_scratch = BatchScratch::new(&config, batch_capacity);
+        batch_scratch.set_shared_prefix_attention(engine.shared_prefix_attention);
 
         Self {
             weights,
@@ -631,6 +636,10 @@ impl<'a> Engine<'a> {
         self.spec
     }
 
+    pub fn shared_attention_stats(&self) -> crate::model::SharedAttentionStats {
+        self.batch_scratch.shared_attention_stats()
+    }
+
     /// Change the depth used by active drafters. A fresh greedy sequence gets
     /// a drafter when its prefill completes if this depth is nonzero; changing
     /// it later does not add a drafter to an existing non-speculating sequence.
@@ -652,6 +661,7 @@ impl<'a> Engine<'a> {
         self.kv.clear();
         self.stats = RunStats::default();
         self.spec = SpecStats::default();
+        self.batch_scratch.reset_shared_attention_stats();
         self.tick = 0;
     }
 

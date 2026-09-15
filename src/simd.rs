@@ -84,6 +84,37 @@ pub fn axpy_scalar(out: &mut [f32], weight: f32, v: &[f32]) {
     }
 }
 
+#[inline]
+fn validate_axpy_multi<const BT: usize>(out_len: usize, n: usize, stride: usize) {
+    if BT == 0 {
+        return;
+    }
+    assert!(stride >= n, "axpy_multi output rows must not overlap");
+    let required = (BT - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(n))
+        .expect("axpy_multi output layout overflow");
+    assert!(out_len >= required, "axpy_multi output is too short");
+}
+
+/// Portable multi-output reference, with the arithmetic of [`axpy_scalar`].
+///
+/// The output layout and bounds are the same as [`axpy_multi`].
+#[inline]
+pub fn axpy_multi_scalar<const BT: usize>(
+    out: &mut [f32],
+    weights: [f32; BT],
+    v: &[f32],
+    stride: usize,
+) {
+    validate_axpy_multi::<BT>(out.len(), v.len(), stride);
+    for (i, &value) in v.iter().enumerate() {
+        for (b, &weight) in weights.iter().enumerate() {
+            out[b * stride + i] += weight * value;
+        }
+    }
+}
+
 // ── x86_64: AVX2 + FMA ───────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -347,6 +378,78 @@ pub mod x86 {
             i += 1;
         }
     }
+
+    /// Add a weighted value vector to each output row, loading each value
+    /// vector once. Each row uses the same FMA and scalar tail as [`axpy`].
+    ///
+    /// # Safety
+    /// Caller must have checked [`available`] and the output layout required
+    /// by [`super::axpy_multi`].
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn axpy_multi<const BT: usize>(
+        out: &mut [f32],
+        weights: [f32; BT],
+        v: &[f32],
+        stride: usize,
+    ) {
+        let po = out.as_mut_ptr();
+        let pv = v.as_ptr();
+        let broadcast = weights.map(|weight| _mm256_set1_ps(weight));
+        let mut i = 0;
+        while i + 8 <= v.len() {
+            let value = _mm256_loadu_ps(pv.add(i));
+            for (b, &weight) in broadcast.iter().enumerate() {
+                let output = po.add(b * stride + i);
+                _mm256_storeu_ps(
+                    output,
+                    _mm256_fmadd_ps(weight, value, _mm256_loadu_ps(output)),
+                );
+            }
+            i += 8;
+        }
+        while i < v.len() {
+            let value = *pv.add(i);
+            for (b, &weight) in weights.iter().enumerate() {
+                *po.add(b * stride + i) += weight * value;
+            }
+            i += 1;
+        }
+    }
+    /// Accumulate a block of values while each output vector stays in registers.
+    ///
+    /// # Safety
+    /// AVX2/FMA must be available and all layouts must have been validated by
+    /// `weighted_sum_multi`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn weighted_sum_multi<const BT: usize>(
+        out: &mut [f32],
+        stride: usize,
+        weights: [&[f32]; BT],
+        values: &[f32],
+        value_stride: usize,
+        dim: usize,
+    ) {
+        let mut i = 0;
+        while i + 8 <= dim {
+            let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+                _mm256_loadu_ps(out.as_ptr().add(b * stride + i))
+            });
+            for (t, _) in weights[0].iter().enumerate() {
+                let value = _mm256_loadu_ps(values.as_ptr().add(t * value_stride + i));
+                for b in 0..BT {
+                    let weight = weights[b][t];
+                    if weight != 0.0 {
+                        sums[b] = _mm256_fmadd_ps(_mm256_set1_ps(weight), value, sums[b]);
+                    }
+                }
+            }
+            for (b, sum) in sums.into_iter().enumerate() {
+                _mm256_storeu_ps(out.as_mut_ptr().add(b * stride + i), sum);
+            }
+            i += 8;
+        }
+        super::weighted_sum_tail(out, stride, weights, values, value_stride, i, dim);
+    }
 }
 
 // ── aarch64: NEON (Apple Silicon, Graviton) ──────────────────────────────────
@@ -575,6 +678,71 @@ pub mod neon {
             i += 1;
         }
     }
+
+    /// Add a weighted value vector to each output row, loading each value
+    /// vector once. Each row uses the same FMA and scalar tail as [`axpy`].
+    ///
+    /// # Safety
+    /// Safe on any aarch64 target; caller must have checked the output layout
+    /// required by [`super::axpy_multi`].
+    pub unsafe fn axpy_multi<const BT: usize>(
+        out: &mut [f32],
+        weights: [f32; BT],
+        v: &[f32],
+        stride: usize,
+    ) {
+        let po = out.as_mut_ptr();
+        let pv = v.as_ptr();
+        let broadcast = weights.map(|weight| vdupq_n_f32(weight));
+        let mut i = 0;
+        while i + 4 <= v.len() {
+            let value = vld1q_f32(pv.add(i));
+            for (b, &weight) in broadcast.iter().enumerate() {
+                let output = po.add(b * stride + i);
+                vst1q_f32(output, vfmaq_f32(vld1q_f32(output), weight, value));
+            }
+            i += 4;
+        }
+        while i < v.len() {
+            let value = *pv.add(i);
+            for (b, &weight) in weights.iter().enumerate() {
+                *po.add(b * stride + i) += weight * value;
+            }
+            i += 1;
+        }
+    }
+    /// Accumulate a block of values while each output vector stays in registers.
+    ///
+    /// # Safety
+    /// All layouts must have been validated by `weighted_sum_multi`.
+    pub unsafe fn weighted_sum_multi<const BT: usize>(
+        out: &mut [f32],
+        stride: usize,
+        weights: [&[f32]; BT],
+        values: &[f32],
+        value_stride: usize,
+        dim: usize,
+    ) {
+        let mut i = 0;
+        while i + 4 <= dim {
+            let mut sums =
+                std::array::from_fn::<_, BT, _>(|b| vld1q_f32(out.as_ptr().add(b * stride + i)));
+            for (t, _) in weights[0].iter().enumerate() {
+                let value = vld1q_f32(values.as_ptr().add(t * value_stride + i));
+                for b in 0..BT {
+                    let weight = weights[b][t];
+                    if weight != 0.0 {
+                        sums[b] = vfmaq_f32(sums[b], vdupq_n_f32(weight), value);
+                    }
+                }
+            }
+            for (b, sum) in sums.into_iter().enumerate() {
+                vst1q_f32(out.as_mut_ptr().add(b * stride + i), sum);
+            }
+            i += 4;
+        }
+        super::weighted_sum_tail(out, stride, weights, values, value_stride, i, dim);
+    }
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
@@ -667,6 +835,126 @@ pub fn axpy(out: &mut [f32], weight: f32, v: &[f32]) {
     }
     #[allow(unreachable_code)]
     axpy_scalar(out, weight, v)
+}
+
+/// `out[b * stride + i] += weights[b] * v[i]`, for every row `b` in `0..BT`.
+///
+/// Loads each value vector once and reuses it across the output rows. Each
+/// row uses the same arithmetic as [`axpy`] on the selected backend, including
+/// the non-fused scalar tail. Padding between rows is left untouched.
+///
+/// # Panics
+/// Panics if `stride < v.len()`, if the output cannot hold the final row, or
+/// if the output layout overflows `usize`. The final row does not need trailing
+/// padding: `(BT - 1) * stride + v.len()` elements suffice. `BT == 0` is a no-op.
+#[inline]
+pub fn axpy_multi<const BT: usize>(out: &mut [f32], weights: [f32; BT], v: &[f32], stride: usize) {
+    validate_axpy_multi::<BT>(out.len(), v.len(), stride);
+    if BT == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::available() {
+            unsafe { x86::axpy_multi(out, weights, v, stride) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon::axpy_multi(out, weights, v, stride) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    axpy_multi_scalar(out, weights, v, stride)
+}
+
+/// Add a token block's weighted values to multiple output rows.
+///
+/// Each output coordinate accumulates tokens in order, with the same backend
+/// FMA/scalar-tail arithmetic as `axpy`. Zero weights are skipped. Output vectors
+/// stay in registers across the block, reducing repeated output loads/stores.
+/// All weight rows must have equal length; value rows are `value_stride` apart.
+/// Output rows are `stride` apart. Panics on overlapping or out-of-bounds layouts.
+#[inline]
+pub fn weighted_sum_multi<const BT: usize>(
+    out: &mut [f32],
+    stride: usize,
+    weights: [&[f32]; BT],
+    values: &[f32],
+    value_stride: usize,
+    dim: usize,
+) {
+    if BT == 0 {
+        return;
+    }
+    validate_axpy_multi::<BT>(out.len(), dim, stride);
+    let tokens = weights[0].len();
+    assert!(
+        weights.iter().all(|w| w.len() == tokens),
+        "weight rows must have equal lengths"
+    );
+    assert!(value_stride >= dim, "value rows must not overlap");
+    let required = if tokens == 0 {
+        0
+    } else {
+        (tokens - 1)
+            .checked_mul(value_stride)
+            .and_then(|n| n.checked_add(dim))
+            .expect("value layout overflow")
+    };
+    assert!(values.len() >= required, "value block is too short");
+    if tokens == 0 || dim == 0 {
+        return;
+    }
+    if tokens == 1 {
+        let w = std::array::from_fn::<_, BT, _>(|b| weights[b][0]);
+        if w.contains(&0.0) {
+            for (b, weight) in w.into_iter().enumerate() {
+                if weight != 0.0 {
+                    axpy(&mut out[b * stride..][..dim], weight, &values[..dim]);
+                }
+            }
+        } else {
+            axpy_multi(out, w, &values[..dim], stride);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        unsafe { x86::weighted_sum_multi(out, stride, weights, values, value_stride, dim) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon::weighted_sum_multi(out, stride, weights, values, value_stride, dim) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    weighted_sum_tail(out, stride, weights, values, value_stride, 0, dim);
+}
+
+#[inline]
+fn weighted_sum_tail<const BT: usize>(
+    out: &mut [f32],
+    stride: usize,
+    weights: [&[f32]; BT],
+    values: &[f32],
+    value_stride: usize,
+    start: usize,
+    dim: usize,
+) {
+    for i in start..dim {
+        for (t, _) in weights[0].iter().enumerate() {
+            let value = values[t * value_stride + i];
+            for b in 0..BT {
+                let weight = weights[b][t];
+                if weight != 0.0 {
+                    out[b * stride + i] += weight * value;
+                }
+            }
+        }
+    }
 }
 
 // ── one weight row against several activation vectors ────────────────────────

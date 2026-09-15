@@ -263,6 +263,10 @@ pub struct EngineCounters {
     #[serde(default)]
     pub last_prefill_tokens: usize,
     pub recomputed_tokens: usize,
+    #[serde(default)]
+    pub shared_attention_layer_calls: usize,
+    #[serde(default)]
+    pub shared_attention_query_tokens: usize,
     pub deferred_steps: usize,
     pub prefix_hits: u64,
     pub prefix_lookups: u64,
@@ -278,6 +282,9 @@ pub struct EngineCounters {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStats {
+    /// Additional packed-attention scratch capacity; excludes other scratch/RSS.
+    #[serde(default)]
+    pub shared_attention_scratch_bytes: usize,
     pub kv_reserved_bytes: usize,
     pub total_blocks: usize,
     /// Exact allocator high water, including allocations freed inside a step.
@@ -636,7 +643,9 @@ pub fn run(
     let stats = engine.stats();
     let prefix = engine.prefix_stats();
     let peak = engine.peak_allocated_blocks();
+    let shared_attention = engine.shared_attention_stats();
     let memory = MemoryStats {
+        shared_attention_scratch_bytes: shared_attention.scratch_bytes,
         kv_reserved_bytes: engine.kv_cache_bytes(),
         total_blocks: engine.total_blocks(),
         peak_allocated_blocks: peak,
@@ -663,6 +672,8 @@ pub fn run(
             prefill_chunks: stats.prefill_chunks,
             last_prefill_tokens: stats.last_prefill_tokens,
             recomputed_tokens: stats.recomputed_tokens,
+            shared_attention_layer_calls: shared_attention.layer_calls,
+            shared_attention_query_tokens: shared_attention.query_tokens,
             deferred_steps: stats.deferred_steps,
             prefix_hits: prefix.hits,
             prefix_lookups: prefix.hits + prefix.misses,
