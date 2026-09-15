@@ -1,0 +1,63 @@
+{
+  "primary_case": {
+    "query_heads": 32,
+    "kv_heads": 8,
+    "head_dim": 64,
+    "context": 4096,
+    "batch": 8,
+    "sharing_percentage": 90
+  },
+  "secondary_kv_heads": 4,
+  "threads": 4,
+  "kernel_repeats": 21,
+  "warmup_pairs": 2,
+  "source_order_per_pair": [
+    [
+      "retained",
+      "candidate"
+    ],
+    [
+      "candidate",
+      "retained"
+    ],
+    [
+      "retained",
+      "candidate"
+    ]
+  ],
+  "shape_order_per_pair": [
+    [
+      8,
+      4
+    ],
+    [
+      4,
+      8
+    ],
+    [
+      8,
+      4
+    ]
+  ],
+  "sweep": {
+    "batches": [
+      1,
+      4,
+      8,
+      16
+    ],
+    "contexts": [
+      256,
+      1024,
+      4096
+    ],
+    "sharing_percentages": [
+      0,
+      50,
+      90
+    ]
+  },
+  "decision": "Require consistent improvement in the primary complete-attention case across alternating source pairs before promoting the score tile to full-model timing. Inspect no-sharing controls and secondary cases; a small difference within their noise is insufficient. All samples are retained, including rejected experiments.",
+  "full_model_gate": "At least 15% paired median throughput improvement versus ordinary attention in the existing Llama 3.2 1B int8 context4096/batch8/90% case; <=5% no-sharing regression, output parity, latency and lifecycle validation still required.",
+  "profiling": "Separate diagnostic build; never timing-gate evidence."
+}

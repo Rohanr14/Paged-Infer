@@ -291,8 +291,8 @@ fn shared_key_pairs_cover_odd_blocks_windows_and_query_tile_tails() {
         let views: Vec<_> = mappings.iter().map(Vec::as_slice).collect();
         let positions: Vec<_> = (0..batch).map(|row| 16 + row % 3).collect();
         for dim in [17, 64] {
-            // Eight KV heads at dim64 exercises the measured paired-key path;
-            // the other shapes retain the ordinary shared-score schedule.
+            // Short prefixes retain the ordinary shared-score schedule,
+            // including the Llama shape used by the long-prefix test below.
             for kv_heads in [2, 8] {
                 let case = Case::new(kv_heads, 4, dim, 5, &views);
                 for common_start in [0usize, 2, 4, 12, 13, 14] {

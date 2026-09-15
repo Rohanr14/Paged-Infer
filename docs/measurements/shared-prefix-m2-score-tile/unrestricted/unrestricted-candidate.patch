@@ -1,0 +1,251 @@
+diff --git a/src/attention/shared.rs b/src/attention/shared.rs
+index 58daf3e..05f1499 100644
+--- a/src/attention/shared.rs
++++ b/src/attention/shared.rs
+@@ -159,7 +159,53 @@ impl<'a> SharedPrefixPlan<'a> {
+                         kv_h,
+                         false,
+                     );
+-                    for i in 0..take {
++                    #[cfg(target_arch = "aarch64")]
++                    let first_single_key = {
++                        let mut i = 0;
++                        if count > 1 {
++                            // Pair keys only inside this physical block. Each
++                            // 2-query tile reuses its query loads across both
++                            // keys while retaining independent dot reductions.
++                            while i + 1 < take {
++                                let keys =
++                                    &kv_cache[base + i * token_stride..][..token_stride + dim];
++                                for g in 0..d {
++                                    for row0 in (0..count).step_by(2) {
++                                        let query_pair =
++                                            &queries[(g * TILE + row0) * dim..][..2 * dim];
++                                        let dots = crate::simd::neon::dot_queries2_keys2(
++                                            query_pair,
++                                            dim,
++                                            keys,
++                                            token_stride,
++                                            dim,
++                                        );
++                                        for (key_offset, key_dots) in dots.iter().enumerate() {
++                                            for (query_offset, dot) in key_dots
++                                                .iter()
++                                                .take((count - row0).min(2))
++                                                .enumerate()
++                                            {
++                                                let row = row0 + query_offset;
++                                                let offset = self.start
++                                                    - self.entries[b0 + row].start
++                                                    + si
++                                                    + i
++                                                    + key_offset;
++                                                scores[(g * TILE + row) * stride + offset] =
++                                                    dot * scale;
++                                            }
++                                        }
++                                    }
++                                }
++                                i += 2;
++                            }
++                        }
++                        i
++                    };
++                    #[cfg(not(target_arch = "aarch64"))]
++                    let first_single_key = 0;
++                    for i in first_single_key..take {
+                         let k = &kv_cache[base + i * token_stride..][..dim];
+                         for g in 0..d {
+                             let query_group = &queries[g * TILE * dim..][..TILE * dim];
+diff --git a/src/simd.rs b/src/simd.rs
+index bf84345..ebb5fff 100644
+--- a/src/simd.rs
++++ b/src/simd.rs
+@@ -579,6 +579,86 @@ pub mod neon {
+         })
+     }
+ 
++    /// Two keys against two queries, returned as `[key][query]`.
++    ///
++    /// Rows may have padding; the final row only needs `dim` elements.
++    /// Zero-dimensional dots return zeros without accessing either buffer.
++    /// Other layouts panic on overlapping rows, overflow, or short buffers.
++    #[inline]
++    pub(crate) fn dot_queries2_keys2(
++        queries: &[f32],
++        query_stride: usize,
++        keys: &[f32],
++        key_stride: usize,
++        dim: usize,
++    ) -> [[f32; 2]; 2] {
++        if dim == 0 {
++            return [[0.0; 2]; 2];
++        }
++        assert!(query_stride >= dim, "query rows must not overlap");
++        assert!(key_stride >= dim, "key rows must not overlap");
++        let query_len = query_stride
++            .checked_add(dim)
++            .expect("query layout overflow");
++        let key_len = key_stride.checked_add(dim).expect("key layout overflow");
++        assert!(queries.len() >= query_len, "query block is too short");
++        assert!(keys.len() >= key_len, "key block is too short");
++        // NEON is part of the aarch64 baseline, and every row span is checked.
++        unsafe { dot_queries2_keys2_impl(queries, query_stride, keys, key_stride, dim) }
++    }
++
++    #[inline]
++    unsafe fn dot_queries2_keys2_impl(
++        queries: &[f32],
++        query_stride: usize,
++        keys: &[f32],
++        key_stride: usize,
++        dim: usize,
++    ) -> [[f32; 2]; 2] {
++        let pq = queries.as_ptr();
++        let pk = keys.as_ptr();
++        // Four independent dot products, with exactly dot_multi's four
++        // accumulators each. Reuse both query loads across the two keys.
++        let mut acc = [[[vdupq_n_f32(0.0); 4]; 2]; 2];
++        let mut i = 0;
++        while i + 16 <= dim {
++            for (j, off) in [0usize, 4, 8, 12].into_iter().enumerate() {
++                let q0 = vld1q_f32(pq.add(i + off));
++                let q1 = vld1q_f32(pq.add(query_stride + i + off));
++                let k0 = vld1q_f32(pk.add(i + off));
++                let k1 = vld1q_f32(pk.add(key_stride + i + off));
++                acc[0][0][j] = vfmaq_f32(acc[0][0][j], k0, q0);
++                acc[0][1][j] = vfmaq_f32(acc[0][1][j], k0, q1);
++                acc[1][0][j] = vfmaq_f32(acc[1][0][j], k1, q0);
++                acc[1][1][j] = vfmaq_f32(acc[1][1][j], k1, q1);
++            }
++            i += 16;
++        }
++        while i + 4 <= dim {
++            let q0 = vld1q_f32(pq.add(i));
++            let q1 = vld1q_f32(pq.add(query_stride + i));
++            let k0 = vld1q_f32(pk.add(i));
++            let k1 = vld1q_f32(pk.add(key_stride + i));
++            acc[0][0][0] = vfmaq_f32(acc[0][0][0], k0, q0);
++            acc[0][1][0] = vfmaq_f32(acc[0][1][0], k0, q1);
++            acc[1][0][0] = vfmaq_f32(acc[1][0][0], k1, q0);
++            acc[1][1][0] = vfmaq_f32(acc[1][1][0], k1, q1);
++            i += 4;
++        }
++        std::array::from_fn(|key| {
++            std::array::from_fn(|query| {
++                let a = acc[key][query];
++                let sum = vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3]));
++                let mut total = vaddvq_f32(sum);
++                for t in i..dim {
++                    // Keep key * query operand order, including scalar tails.
++                    total += *pk.add(key * key_stride + t) * *pq.add(query * query_stride + t);
++                }
++                total
++            })
++        })
++    }
++
+     /// # Safety
+     /// Safe on any aarch64 target; `unsafe` only because the intrinsics are.
+     pub unsafe fn dot_i8(w: &[i8], x: &[f32]) -> f32 {
+@@ -1084,3 +1164,100 @@ pub fn dot_i8_multi<const BT: usize>(w: &[i8], x_block: &[f32], stride: usize) -
+     #[allow(unreachable_code)]
+     std::array::from_fn(|j| dot_i8_scalar(w, &x_block[j * stride..(j + 1) * stride]))
+ }
++
++#[cfg(all(test, target_arch = "aarch64"))]
++mod score_tile_tests {
++    use super::{dot_multi, neon::dot_queries2_keys2};
++
++    fn populated_rows(dim: usize, stride: usize, seed: usize) -> Vec<f32> {
++        // The second row has no trailing padding; padding between rows must
++        // never enter a reduction, so fill it with NaNs.
++        let mut data = vec![f32::NAN; stride + dim];
++        for row in 0..2 {
++            for i in 0..dim {
++                data[row * stride + i] = ((i * 37 + row * 101 + seed) % 251) as f32 * 0.013 - 1.6;
++            }
++        }
++        data
++    }
++
++    #[test]
++    fn two_keys_reuse_queries_with_exact_dot_multi_arithmetic() {
++        for dim in (0..80).chain([96, 127, 128, 129]) {
++            for query_padding in [0, 3] {
++                let query_stride = dim + query_padding;
++                let queries = populated_rows(dim, query_stride, 17);
++                // dot_multi's public contract requests full trailing padding.
++                let mut reference_queries = queries.clone();
++                reference_queries.resize(2 * query_stride, f32::NAN);
++                for key_stride in [dim, dim + 5, 1024] {
++                    let keys = populated_rows(dim, key_stride, 71);
++                    let actual = dot_queries2_keys2(&queries, query_stride, &keys, key_stride, dim);
++                    for (key, actual_row) in actual.iter().enumerate() {
++                        let expected = dot_multi::<2>(
++                            &keys[key * key_stride..][..dim],
++                            &reference_queries,
++                            query_stride,
++                        );
++                        for (query, (&actual, &expected)) in
++                            actual_row.iter().zip(&expected).enumerate()
++                        {
++                            assert!(actual.is_finite() && expected.is_finite());
++                            assert_eq!(
++                                actual.to_bits(),
++                                expected.to_bits(),
++                                "dim={dim}, query_stride={query_stride}, key_stride={key_stride}, key={key}, query={query}"
++                            );
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn two_key_tile_preserves_nonfinite_classification() {
++        for dim in [3, 4, 16, 17, 64, 128] {
++            for special in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
++                let queries = vec![1.0; 2 * dim];
++                let mut keys = vec![1.0; 1024 + dim];
++                keys[dim - 1] = special;
++                keys[1024] = -special;
++                let actual = dot_queries2_keys2(&queries, dim, &keys, 1024, dim);
++                for (key, actual_row) in actual.iter().enumerate() {
++                    let expected = dot_multi::<2>(&keys[key * 1024..][..dim], &queries, dim);
++                    for (&actual, expected) in actual_row.iter().zip(expected) {
++                        if expected.is_nan() {
++                            assert!(actual.is_nan());
++                        } else {
++                            assert_eq!(actual.to_bits(), expected.to_bits());
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn two_key_tile_checks_layouts_before_unsafe_reads() {
++        for (query_len, query_stride, key_len, key_stride, dim) in [
++            (16, 7, 16, 8, 8),
++            (16, 8, 16, 7, 8),
++            (15, 8, 16, 8, 8),
++            (16, 8, 15, 8, 8),
++            (16, usize::MAX, 16, 8, 8),
++            (16, 8, 16, usize::MAX, 8),
++        ] {
++            let queries = vec![1.0; query_len];
++            let keys = vec![1.0; key_len];
++            assert!(std::panic::catch_unwind(|| {
++                dot_queries2_keys2(&queries, query_stride, &keys, key_stride, dim)
++            })
++            .is_err());
++        }
++        assert_eq!(
++            dot_queries2_keys2(&[], usize::MAX, &[], usize::MAX, 0),
++            [[0.0f32; 2]; 2]
++        );
++    }
++}

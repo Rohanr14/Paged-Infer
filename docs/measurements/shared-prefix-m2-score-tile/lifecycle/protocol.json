@@ -1,0 +1,26 @@
+{
+  "description": "Two step-dispatched bursts of eight2049-token synthetic prompts with2048shared content tokens, cancellationat72, secondburst at88. Each run starts with empty prefix cache; secondburst can reuse the firstburst cache.",
+  "configs": [
+    "baseline.json",
+    "shared.json"
+  ],
+  "repeats": 2,
+  "threads": 4,
+  "quantization": "int8",
+  "max_steps": 256,
+  "timeout_seconds": 300,
+  "fixed_before_first_run": true,
+  "required_observations": [
+    "Complete exact output/finish verification across all four runs",
+    "Every request settles once; cold-7 cancellation exercised",
+    "Shared attention counters positive in shared variant and zero in baseline",
+    "Actual peak batch occupancy, cache hits, TTFT/ITL tails, useful throughput and KV use reported"
+  ],
+  "limitations": [
+    "Step arrivals are deterministic scheduler traffic, not wall-clock arrival deadlines",
+    "Synthetic tokenids are not a language quality test",
+    "192blocks bound capacity but do not force preemption; no claim of a pressure test",
+    "Model loading and initial engine warmup excluded; cold request prefill included",
+    "Two repeats provide descriptive lifecycle checks rather than a reliable speed confidence bound"
+  ]
+}

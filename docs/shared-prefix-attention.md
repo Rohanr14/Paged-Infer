@@ -26,6 +26,15 @@ physical block, preserving per-coordinate token order. Private histories keep
 GQA heads together so grouping across requests retains the existing locality.
 Task width narrows when needed to retain parallel work for the configured threads.
 
+On NEON, the measured Llama shape (32 query heads, eight KV heads, dimension 64)
+also pairs adjacent shared keys when the attended common prefix is at least
+2,048 tokens long. A two-query by two-key tile reuses query vectors while keeping
+four independent dot products, each with the existing accumulator and reduction
+order. Pairs stay inside physical blocks; odd keys and single-query tile tails
+use the established score loop. Other shapes and shorter common prefixes keep
+that loop because broader score tiling regressed those measured cases. This
+restriction is experimental, not a speed guarantee for every qualifying input.
+
 Every query retains its complete score window and its own softmax. Scores are
 written to their original logical positions, and values accumulate in increasing
 token order: private leading interval, common interval, private trailing interval.
@@ -73,6 +82,12 @@ input construction and warmup are outside the timer.
 RAYON_NUM_THREADS=4 SHARED_ATTN_REPS=21 \
   cargo run --release --bin shared_attention_benchmark > /tmp/shared-kernel.jsonl
 ```
+
+The default shape has 32 query heads, four KV heads and head dimension 64.
+Set `SHARED_ATTN_KV_HEADS=8` for the Llama 3.2 1B attention shape. This control
+accepts one positive divisor of 32; the manifest records the actual shape.
+Use both shapes when evaluating changes so a gain for one does not hide a
+regression for the other.
 
 For full-model steady-state decode, the second benchmark computes genuine prompt
 KV once, shares or copies whole blocks to control physical sharing, then appends
@@ -140,7 +155,65 @@ guarantee future gains. Increase `SHARED_DECODE_STEPS` for longer timed runs and
 bootstrap observations. Retain every sample and compare equivalent workloads
 and build fingerprints.
 
-## Latest Apple M2 measurements, 2026-09-15 (`cf7bbe1`)
+## Latest Apple M2 measurements, 2026-09-15 (`1ad58be`)
+
+The score-tile follow-up adds query reuse for the narrow NEON shape and prefix
+range described above. The retained value-loop build was profiled again: shared
+scores occupied about 54% of summed attention-worker elapsed time and shared
+values about 19%. These overlapping diagnostic spans motivated the experiment;
+they do not predict its model-level gain.
+
+Three alternating source comparisons were run for each of two attention shapes,
+first with unrestricted score tiling, then with shape-only dispatch, then with
+the final shape-and-prefix restriction. Every sweep includes all 36 kernel cases
+and 21 timing pairs per case. Short contexts and four-KV-head cases exposed
+regressions, which motivated retaining the previous score loop there. In the
+final primary eight-KV-head/context-4,096/batch-eight/90% case, candidate shared
+attention was faster than the retained build in two comparisons and roughly
+tied in the third. Fallback timing also varied. All samples and intermediate
+patches remain in [the score-tile evidence directory](measurements/shared-prefix-m2-score-tile/README.md).
+
+The final ordinary build then used the unchanged real-model protocol: Llama 3.2
+1B int8, context 4,096, batch eight, four workers, sixteen decode steps and twelve
+paired repeats for each physical-sharing fraction.
+
+| Physical sharing | Median paired speedup | Descriptive bootstrap 95% interval | Baseline / candidate pooled batch-step p95 |
+|---|---:|---:|---:|
+| 90% requested | 1.182x | [1.040, 1.230] | 293 / 401 ms |
+| 0% control | 0.996x | [0.939, 1.032] | 431 / 434 ms |
+
+All 48 timed runs have the same complete 128-token output and final-logit hash.
+The shared point estimate exceeds the 15% target, but the interval includes much
+smaller gains and the candidate's p95 worsens. The control's median slowdown is
+about 0.4%; its interval still includes regressions beyond 5%. Other desktop CPU
+activity was present, with no concurrent project build or benchmark. No samples
+were discarded. These measurements do not yet establish a repeatable gain and
+regression bound sufficient to merge or enable the feature.
+
+The separate real-model request replay completes four runs of two eight-request
+bursts, with a 2,048-token common prefix, private suffixes and one cancellation.
+Every run has identical tokens and finish reasons, 15 successful requests and
+one cancellation after eight emitted tokens. Each reaches eight active sequences
+and reuses 30,720 prompt tokens. The shared variant executes 608 shared-attention
+layer calls; the baseline executes none.
+
+Across its two repeat pairs, overall useful throughput changes by about -0.9%
+and +0.3%. Cold prefill dominates the run. The warm burst's useful throughput
+improves by about 4.9% and 16.6%, and overall observed inter-token p95 improves from
+207 / 217 ms to 191 / 192 ms. These are descriptive results from two pairs, not
+a reliable speed bound. Warm-burst throughput includes queueing and private
+prefill: successful warm output tokens divided by the interval from the first
+warm submission to the last warm completion. No prefill time is subtracted.
+
+All runs peak at 142 of 192 KV blocks and retain 128 cached prefix blocks after
+completion. The shared variant retains about 4.25 MiB of additional scratch.
+There are no OOMs, rejections, preemptions or COW copies. This validates the
+bounded-memory lifecycle and cancellation path; the pool does not force memory
+pressure. Arrivals follow scheduler steps, not wall-clock deadlines, and model
+loading and initial warmup remain outside the request timer. This 2,048-token
+request case is distinct from the 4,096-position steady-state model benchmark.
+
+## Earlier Apple M2 measurements, 2026-09-15 (`cf7bbe1`)
 
 Profiling the declared Llama 3.2 1B int8 case put attention at 41.4% of
 candidate model wall time. Shared scores and shared value accumulation accounted
@@ -233,18 +306,19 @@ fractions.
 
 ## Focused next step
 
-1. Establish the retained build's throughput and tail behavior on a quiet host,
+1. Establish the current build's throughput and tail behavior on a quiet host,
    using the same declared workload, twelve paired repeats and sixteen steps.
    Retain every sample. Do not change the workload or select a favorable run to
    satisfy the gate; the no-sharing control must also provide a stable baseline.
-2. If another kernel change is warranted, profile the retained build and target
-   shared score calculation. A bounded next experiment is a block score primitive
-   that reuses invariant query vectors across several keys while preserving each
-   dot product's accumulator and reduction order. First measure it against the
-   existing primitive across SIMD tails and batch sizes, then require a clear
-   kernel benefit before repeating the real-model comparisons.
-3. Once the model-level gate is established, use workload replay for cold and
-   cached prompt bursts, cancellation and bounded KV capacity. Compare complete
-   outputs, useful throughput, TTFT/streaming tails and memory pressure. These
-   request costs are excluded from the steady-state benchmark; they must pass
-   before merging or enabling the feature.
+2. Profile cold prefill before choosing another implementation change. The
+   completed lifecycle trace spends most of its time there, so another decode
+   optimization alone cannot produce a comparable total-request improvement.
+   Keep cold-start, warm-cache and steady-state results separate.
+3. Extend lifecycle evidence to timed mixed arrivals and a pool that actually
+   forces eviction/recompute. Preserve complete outputs, cancellation behavior
+   and competing-stream latency. The completed 192-block trace has spare capacity
+   and cannot establish behavior under pressure.
+4. Keep the feature off and the PR in draft until repeatable model improvement,
+   the no-sharing bound and request-latency evidence justify merging. The source
+   and measurement record are ready for review; the performance decision remains
+   unresolved.
