@@ -1,0 +1,112 @@
+diff --git a/src/bin/shared_attention_benchmark.rs b/src/bin/shared_attention_benchmark.rs
+index 7b23047..e31eb4f 100644
+--- a/src/bin/shared_attention_benchmark.rs
++++ b/src/bin/shared_attention_benchmark.rs
+@@ -270,10 +270,7 @@ fn main() -> Result<()> {
+         output,
+         "{}",
+         json!({
+-            "type": "manifest", "version": 1,
+-            "profiling_enabled": paged_infer::profiling::enabled(),
+-            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+-            "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.", "benchmark": "shared_attention", "environment": environment(),
++            "type": "manifest", "version": 1, "benchmark": "shared_attention", "environment": environment(),
+             "shape": {"layers": 1, "heads": 32, "kv_heads": 4, "head_dim": 64, "block_size": BLOCK_SIZE},
+             "batches": batches, "contexts": contexts, "requested_shared_percentages": percentages,
+             "repeats": reps, "warmup_pairs": warmup, "timing_unit": "microseconds",
+diff --git a/src/bin/workload_replay.rs b/src/bin/workload_replay.rs
+index 3dcdc81..f4b52d6 100644
+--- a/src/bin/workload_replay.rs
++++ b/src/bin/workload_replay.rs
+@@ -524,9 +524,6 @@ fn main() -> Result<()> {
+         &mut writer,
+         &json!({
+             "type": "manifest", "version": 1,
+-            "profiling_enabled": paged_infer::profiling::enabled(),
+-            "performance_gate_eligible": !paged_infer::profiling::enabled(),
+-            "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.",
+             "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+             "identity": identity, "model_path": model_path, "workload_path": args.workload,
+             "workload": workload, "configs": configs, "repeats": args.repeats,
+diff --git a/src/simd.rs b/src/simd.rs
+index bf84345..1321fd3 100644
+--- a/src/simd.rs
++++ b/src/simd.rs
+@@ -430,38 +430,6 @@ pub mod x86 {
+         dim: usize,
+     ) {
+         let mut i = 0;
+-        // Two vectors per row keep at most eight output sums live. Reuse
+-        // each weight load, zero check and broadcast across both vectors,
+-        // leaving room for operands in AVX2's sixteen vector registers.
+-        if BT <= 4 {
+-            while i + 16 <= dim {
+-                let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+-                    std::array::from_fn::<_, 2, _>(|j| {
+-                        _mm256_loadu_ps(out.as_ptr().add(b * stride + i + j * 8))
+-                    })
+-                });
+-                for (t, _) in weights[0].iter().enumerate() {
+-                    let value = std::array::from_fn::<_, 2, _>(|j| {
+-                        _mm256_loadu_ps(values.as_ptr().add(t * value_stride + i + j * 8))
+-                    });
+-                    for (b, row) in sums.iter_mut().enumerate() {
+-                        let weight = weights[b][t];
+-                        if weight != 0.0 {
+-                            let weight = _mm256_set1_ps(weight);
+-                            for (sum, value) in row.iter_mut().zip(value) {
+-                                *sum = _mm256_fmadd_ps(weight, value, *sum);
+-                            }
+-                        }
+-                    }
+-                }
+-                for (b, row) in sums.into_iter().enumerate() {
+-                    for (j, sum) in row.into_iter().enumerate() {
+-                        _mm256_storeu_ps(out.as_mut_ptr().add(b * stride + i + j * 8), sum);
+-                    }
+-                }
+-                i += 16;
+-            }
+-        }
+         while i + 8 <= dim {
+             let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+                 _mm256_loadu_ps(out.as_ptr().add(b * stride + i))
+@@ -756,38 +724,6 @@ pub mod neon {
+         dim: usize,
+     ) {
+         let mut i = 0;
+-        // NEON's thirty-two vector registers fit four vectors per row and
+-        // their operands. Each coordinate retains its own token-ordered FMA
+-        // chain; only weight loads, zero checks and broadcasts are shared.
+-        if BT <= 4 {
+-            while i + 16 <= dim {
+-                let mut sums = std::array::from_fn::<_, BT, _>(|b| {
+-                    std::array::from_fn::<_, 4, _>(|j| {
+-                        vld1q_f32(out.as_ptr().add(b * stride + i + j * 4))
+-                    })
+-                });
+-                for (t, _) in weights[0].iter().enumerate() {
+-                    let value = std::array::from_fn::<_, 4, _>(|j| {
+-                        vld1q_f32(values.as_ptr().add(t * value_stride + i + j * 4))
+-                    });
+-                    for (b, row) in sums.iter_mut().enumerate() {
+-                        let weight = weights[b][t];
+-                        if weight != 0.0 {
+-                            let weight = vdupq_n_f32(weight);
+-                            for (sum, value) in row.iter_mut().zip(value) {
+-                                *sum = vfmaq_f32(*sum, weight, value);
+-                            }
+-                        }
+-                    }
+-                }
+-                for (b, row) in sums.into_iter().enumerate() {
+-                    for (j, sum) in row.into_iter().enumerate() {
+-                        vst1q_f32(out.as_mut_ptr().add(b * stride + i + j * 4), sum);
+-                    }
+-                }
+-                i += 16;
+-            }
+-        }
+         while i + 4 <= dim {
+             let mut sums =
+                 std::array::from_fn::<_, BT, _>(|b| vld1q_f32(out.as_ptr().add(b * stride + i)));

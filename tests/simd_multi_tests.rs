@@ -242,6 +242,29 @@ fn single_token_value_sums_cover_nonzero_and_mixed_zero_paths() {
 }
 
 #[test]
+fn multi_token_value_sums_cover_all_nonzero_weights() {
+    for tokens in [2, 3, 16, 17, 31] {
+        let weights: [Vec<f32>; 4] = std::array::from_fn(|b| {
+            (0..tokens)
+                .map(|t| {
+                    let magnitude = (b * 13 + t + 1) as f32 * 0.021 + 0.001;
+                    if (b + t).is_multiple_of(2) {
+                        magnitude
+                    } else {
+                        -magnitude
+                    }
+                })
+                .collect()
+        });
+        assert!(weights.iter().all(|row| row.iter().all(|&w| w != 0.0)));
+        check_independent_weight_rows::<1>(std::array::from_fn(|b| weights[b].as_slice()));
+        check_independent_weight_rows::<2>(std::array::from_fn(|b| weights[b].as_slice()));
+        check_independent_weight_rows::<3>(std::array::from_fn(|b| weights[b].as_slice()));
+        check_independent_weight_rows::<4>(std::array::from_fn(|b| weights[b].as_slice()));
+    }
+}
+
+#[test]
 fn block_value_sums_apply_zero_masks_independently_to_each_row() {
     // Every token contributes to some rows and is masked in others. In
     // particular, a zero in row 0 must not suppress the other rows' updates.

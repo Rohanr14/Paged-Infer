@@ -12,8 +12,10 @@ controlled. See [the design and decision](../../shared-prefix-attention.md).
 `51922b002c6a1930a0ad96c97cbd9fbdd1d7f062660c9000c187a72871efd40a`.
 The reports were generated before committing that source, so their Git head is
 its base and `git_dirty` is true. The complete compiled-source hash was verified
-against the committed implementation. Later changes only move/clarify tests and
-document measurements; those files are outside the compiled-source hash.
+against the committed implementation. The initial draft through `799e915` only
+moved/clarified tests and documented these measurements after that snapshot.
+The later profiling and dimension-tile follow-up has different implementation
+fingerprints and is [recorded separately](../shared-prefix-m2-followup/README.md).
 
 - [Kernel sweep](kernel-m2-verified.jsonl): 36 cases, 21 pairs each, every finite
   output checked bitwise. TinyLlama attention shape (32 query / 4 KV heads).

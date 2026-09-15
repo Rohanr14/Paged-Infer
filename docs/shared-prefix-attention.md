@@ -140,6 +140,43 @@ guarantee future gains. Increase `SHARED_DECODE_STEPS` for longer timed runs and
 bootstrap observations. Retain every sample and compare equivalent workloads
 and build fingerprints.
 
+## Latest Apple M2 measurements, 2026-09-15 (`cf7bbe1`)
+
+Profiling the declared Llama 3.2 1B int8 case put attention at 41.4% of
+candidate model wall time. Shared scores and shared value accumulation accounted
+for 46.3% and 28.5% of summed attention-worker elapsed spans. These overlapping
+diagnostic scopes motivated a value-loop change: retain sixteen coordinates per
+output row in SIMD registers and reuse each weight load, mask check and broadcast
+across them. Token-order FMA arithmetic remains unchanged.
+
+The ordinary build then measured twelve paired repeats of sixteen decode steps
+at context 4,096, batch eight and four workers. Both sharing fractions use the
+same model and input histories; the shared case has 3,680 common positions.
+
+| Physical sharing | Median paired speedup | Descriptive bootstrap 95% interval | Baseline / candidate pooled batch-step p95 |
+|---|---:|---:|---:|
+| 90% requested | 1.135x | [1.107, 1.158] | 332 / 377 ms |
+| 0% control | 0.990x | [0.950, 1.027] | 410 / 478 ms |
+
+All 48 timed runs pass complete output and final-logit checks. All 36 kernel
+cases also retain finite bit-identical outputs; kernel speedups at context 4,096
+and 90% sharing are 1.580x / 1.582x / 1.538x for batches 4 / 8 / 16.
+
+The shared workload's paired median gain of 13.5% is below the 15% target.
+The control's median slowdown is about 1%, but its interval and the worsened
+tails do not establish a reliable regression bound. Other desktop processes
+were consuming CPU during these measurements. No concurrent project builds or
+benchmarks ran, and no samples were discarded. The PR remains a draft and the
+feature remains off; full request-lifecycle validation is still pending.
+
+A second experiment scanned each weight block once and skipped repeated zero
+checks only when every weight was nonzero. It preserved all numerical checks,
+but its kernel sweep showed no consistent improvement. That specialization was
+reverted before full-model testing. Its patch and all measurements remain in
+[the follow-up evidence directory](measurements/shared-prefix-m2-followup/README.md),
+alongside exact source fingerprints, process memory reports and reproduction
+instructions for both retained and rejected implementations.
+
 ## Historical Apple M2 measurements, 2026-09-15 (`017c3e8`)
 
 The declared real-model case is Llama 3.2 1B with int8 projections, 4,096 prompt
@@ -196,12 +233,18 @@ fractions.
 
 ## Focused next step
 
-1. Profile the declared eight-sequence, 4,096-position case to separate shared
-   score calculation, value accumulation, packing/scatter and model projections.
-   Use that breakdown to choose one further optimization.
-2. Repeat longer paired runs on a quiet machine, retaining every sample and
-   reporting paired ratios as well as ratios of medians. Establish both the
-   shared-workload gain and the no-sharing bound before merging or enabling.
-3. If the model-level result clears that gate, verify the actual request workload
-   with replay, including prompt preparation, throughput, delivery tails and
-   memory pressure. The current steady-state benchmark excludes those effects.
+1. Establish the retained build's throughput and tail behavior on a quiet host,
+   using the same declared workload, twelve paired repeats and sixteen steps.
+   Retain every sample. Do not change the workload or select a favorable run to
+   satisfy the gate; the no-sharing control must also provide a stable baseline.
+2. If another kernel change is warranted, profile the retained build and target
+   shared score calculation. A bounded next experiment is a block score primitive
+   that reuses invariant query vectors across several keys while preserving each
+   dot product's accumulator and reduction order. First measure it against the
+   existing primitive across SIMD tails and batch sizes, then require a clear
+   kernel benefit before repeating the real-model comparisons.
+3. Once the model-level gate is established, use workload replay for cold and
+   cached prompt bursts, cancellation and bounded KV capacity. Compare complete
+   outputs, useful throughput, TTFT/streaming tails and memory pressure. These
+   request costs are excluded from the steady-state benchmark; they must pass
+   before merging or enabling the feature.
