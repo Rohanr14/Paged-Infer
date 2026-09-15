@@ -281,6 +281,28 @@ fn shared_prefix_and_private_suffix_match_both_references() {
 }
 
 #[test]
+fn shared_key_pairs_cover_odd_blocks_windows_and_query_tile_tails() {
+    let mut scratch = SharedPrefixScratch::default();
+    // Five-token blocks expose paired keys followed by an odd tail. Starts
+    // near the prefix end leave just three, two, or one shared key; batches
+    // five through eight exercise every final query-tile size after a full tile.
+    for batch in 2..=8 {
+        let mappings: Vec<Vec<_>> = (0..batch).map(|row| vec![0, 1, 2, 3 + row]).collect();
+        let views: Vec<_> = mappings.iter().map(Vec::as_slice).collect();
+        let positions: Vec<_> = (0..batch).map(|row| 16 + row % 3).collect();
+        for dim in [17, 64] {
+            let case = Case::new(2, 4, dim, 5, &views);
+            for common_start in [0usize, 2, 4, 12, 13, 14] {
+                let starts: Vec<_> = (0..batch)
+                    .map(|row| common_start.saturating_sub(row % 3))
+                    .collect();
+                case.check(&positions, &starts, Some(15 - common_start), &mut scratch);
+            }
+        }
+    }
+}
+
+#[test]
 fn ragged_windows_keep_private_leading_and_trailing_tokens_in_one_softmax() {
     let case = Case::new(
         2,

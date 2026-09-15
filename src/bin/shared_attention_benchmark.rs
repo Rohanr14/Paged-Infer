@@ -21,9 +21,11 @@ Environment controls (space- or comma-separated lists):
   SHARED_ATTN_BATCHES       Default: 1 4 8 16
   SHARED_ATTN_CONTEXTS      Previous tokens per entry; default: 256 1024 4096
   SHARED_ATTN_PERCENTAGES   Requested shared prefix percentages; default: 0 50 90
+  SHARED_ATTN_KV_HEADS      One positive divisor of 32, at most 32; default: 4
   SHARED_ATTN_REPS          Timed pairs per case; default: 9
   SHARED_ATTN_WARMUP        Untimed pairs per case; default: 2
   RAYON_NUM_THREADS        Worker count, following the usual Rayon setting
+Query heads remain 32 and head dimension remains 64 for every KV-head setting.
 The shared prefix is rounded down to whole blocks. Each entry also attends to
 its current token. Baseline/candidate order alternates by case and repetition.
 Every run checks finite, bit-identical output. No measured samples are discarded.";
@@ -73,11 +75,7 @@ struct Case {
 }
 
 impl Case {
-    fn new(batch: usize, context: usize, percentage: usize) -> Result<Self> {
-        let config = LlamaConfig {
-            num_hidden_layers: 1,
-            ..LlamaConfig::default()
-        };
+    fn new(batch: usize, context: usize, percentage: usize, config: &LlamaConfig) -> Result<Self> {
         let used = context.checked_add(1).context("context overflow")?;
         let blocks = used.div_ceil(BLOCK_SIZE);
         let shared_blocks =
@@ -265,6 +263,17 @@ fn main() -> Result<()> {
     );
     let reps = count("SHARED_ATTN_REPS", "9")?;
     let warmup = count("SHARED_ATTN_WARMUP", "2")?;
+    let kv_heads = count("SHARED_ATTN_KV_HEADS", "4")?;
+    let config = LlamaConfig {
+        num_hidden_layers: 1,
+        num_key_value_heads: kv_heads,
+        ..LlamaConfig::default()
+    };
+    ensure!(
+        kv_heads <= config.num_attention_heads
+            && config.num_attention_heads.is_multiple_of(kv_heads),
+        "SHARED_ATTN_KV_HEADS must be at most 32 and divide 32 query heads"
+    );
     let mut output = BufWriter::new(io::stdout().lock());
     writeln!(
         output,
@@ -274,7 +283,8 @@ fn main() -> Result<()> {
             "profiling_enabled": paged_infer::profiling::enabled(),
             "performance_gate_eligible": !paged_infer::profiling::enabled(),
             "profiling_note": "Instrumented builds contain diagnostic timer/counter overhead; exclude their timings from performance gates.", "benchmark": "shared_attention", "environment": environment(),
-            "shape": {"layers": 1, "heads": 32, "kv_heads": 4, "head_dim": 64, "block_size": BLOCK_SIZE},
+            "shape": {"layers": config.num_hidden_layers, "heads": config.num_attention_heads,
+                "kv_heads": config.num_key_value_heads, "head_dim": config.head_dim(), "block_size": BLOCK_SIZE},
             "batches": batches, "contexts": contexts, "requested_shared_percentages": percentages,
             "repeats": reps, "warmup_pairs": warmup, "timing_unit": "microseconds",
             "candidate_includes_plan_construction": true, "scratch_allocation": "reused after warmup",
@@ -285,7 +295,7 @@ fn main() -> Result<()> {
     for &context in &contexts {
         for &batch in &batches {
             for &percentage in &percentages {
-                let mut case = Case::new(batch, context, percentage)?;
+                let mut case = Case::new(batch, context, percentage, &config)?;
                 let entries: Vec<_> = case
                     .tables
                     .iter()
